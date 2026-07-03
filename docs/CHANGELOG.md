@@ -171,3 +171,18 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
       same unconditional pattern as `byTool`) plus a `tools` = Σ`byTool`, both summed across days and exposed on
       `repoTotals`; `byTool`/`SubagentStart` now invalidate `repoTotalsCache`. Like chats/active, these are
       live-only (no backfill). Reverses the earlier spec non-goal that the total row carried no Agents/Tools cell.
+
+22. Fixed the default pricing table: `claude-opus-4-8` was at the retired Opus 4.1/4.0 tier ($15/$75) — a 3x
+    cost overestimate on the most-used model — now Opus 4.5+ pricing ($5/$25). Added the other shipping models
+    (Fable 5, Opus 4.7/4.6/4.5, Sonnet 4.6/4.5) so they price out of the box instead of `—`. Sonnet 5 kept at
+    standard $3/$15 (its $2/$10 intro rate lapses 2026-08-31). Defaults only — a saved custom `rates` map still
+    overrides these, and there is no live pricing fetch, so a new/unlisted model shows unpriced until added.
+
+23. The running→idle "done" pulse changed from sky-blue to a bright CYAN (rgba(34,211,238)); the mid accent
+    blue washed out against the dark blue-tinted backdrop. Its ring/glow treatment from entry 21 is unchanged.
+
+24. One-time config migration: `readConfig` stamps a `configVersion` and, for a config from before the
+    entry-22 fix, upgrades any rate still equal to its pre-v1 default to the current one — so the Opus 4.8
+    $15/$75 → $5/$25 correction reaches users who persisted a `rates` map (authoritative per entry 5, so it
+    otherwise shadows the fix). Match is by value; a changed/removed rate is untouched. Persisted once as the
+    minimal RAW config (omitted fields still inherit live defaults, not frozen), version-gated so it never re-runs.

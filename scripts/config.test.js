@@ -6,7 +6,18 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { DEFAULT_CONFIG, readConfig, writeConfig, validateConfig, mergeConfig } = require('./config');
+const {
+  DEFAULT_CONFIG,
+  CONFIG_VERSION,
+  readConfig,
+  writeConfig,
+  validateConfig,
+  migrateRawConfig,
+  mergeConfig,
+} = require('./config');
+
+const OLD_OPUS_48 = { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 };
+const NEW_OPUS_48 = DEFAULT_CONFIG.cost.rates['claude-opus-4-8'];
 
 // ---- mergeConfig -------------------------------------------------------
 
@@ -164,6 +175,99 @@ test('readConfig/writeConfig: round-trip through a temp dir', () => {
     assert.strictEqual(bad.ok, false);
     assert.ok(Array.isArray(bad.errors));
     assert.strictEqual(readConfig().port, 5555);
+  } finally {
+    for (const k of envKeys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// ---- one-time migration (migrateRawConfig) ----------------------------
+
+test('migrateRawConfig: stale Opus 4.8 default is corrected and version stamped', () => {
+  const raw = {
+    cost: { rates: { 'claude-opus-4-8': { ...OLD_OPUS_48 }, 'claude-haiku-4-5': { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 } } },
+  };
+  const { config, changed } = migrateRawConfig(raw);
+  assert.strictEqual(changed, true);
+  assert.strictEqual(config.configVersion, CONFIG_VERSION);
+  assert.deepStrictEqual(config.cost.rates['claude-opus-4-8'], NEW_OPUS_48);
+  // A rate that didn't change value is left exactly as-is.
+  assert.deepStrictEqual(config.cost.rates['claude-haiku-4-5'], { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 });
+});
+
+test('migrateRawConfig: detects the stale default even when numbers are quoted', () => {
+  const raw = { cost: { rates: { 'claude-opus-4-8': { input: '15', output: '75', cacheRead: '1.5', cacheWrite: '18.75' } } } };
+  assert.deepStrictEqual(migrateRawConfig(raw).config.cost.rates['claude-opus-4-8'], NEW_OPUS_48);
+});
+
+test('migrateRawConfig: a customized Opus 4.8 rate is preserved (only version stamped)', () => {
+  const custom = { input: 12, output: 60, cacheRead: 1.2, cacheWrite: 15 };
+  const { config, changed } = migrateRawConfig({ cost: { rates: { 'claude-opus-4-8': { ...custom } } } });
+  assert.strictEqual(changed, true);
+  assert.deepStrictEqual(config.cost.rates['claude-opus-4-8'], custom);
+});
+
+test('migrateRawConfig: a removed Opus 4.8 stays removed (never re-added)', () => {
+  const raw = { cost: { rates: { 'claude-sonnet-5': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } } } };
+  const { config } = migrateRawConfig(raw);
+  assert.strictEqual(config.cost.rates['claude-opus-4-8'], undefined);
+});
+
+test('migrateRawConfig: already at current version is a no-op (one-time guarantee)', () => {
+  const raw = { configVersion: CONFIG_VERSION, cost: { rates: { 'claude-opus-4-8': { ...OLD_OPUS_48 } } } };
+  const { config, changed } = migrateRawConfig(raw);
+  assert.strictEqual(changed, false);
+  // Once stamped, migration never touches the value again — even the old one.
+  assert.deepStrictEqual(config.cost.rates['claude-opus-4-8'], OLD_OPUS_48);
+});
+
+test('migrateRawConfig: config without a rates map just gets the version stamp', () => {
+  const { config, changed } = migrateRawConfig({ port: 5000 });
+  assert.strictEqual(changed, true);
+  assert.strictEqual(config.configVersion, CONFIG_VERSION);
+});
+
+test('readConfig: migrates a pre-version config on disk, persists once, then is idempotent', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cockpit-cfg-'));
+  const envKeys = ['XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'APPDATA', 'LOCALAPPDATA', 'HOME', 'USERPROFILE'];
+  const saved = {};
+  for (const k of envKeys) saved[k] = process.env[k];
+  try {
+    process.env.XDG_CONFIG_HOME = path.join(tmp, 'config');
+    process.env.XDG_STATE_HOME = path.join(tmp, 'state');
+    process.env.APPDATA = path.join(tmp, 'appdata');
+    process.env.LOCALAPPDATA = path.join(tmp, 'localappdata');
+    process.env.HOME = tmp;
+    process.env.USERPROFILE = tmp;
+
+    // A config saved before v0.6.3: no configVersion, stale Opus 4.8 rate.
+    const cfgDir = path.join(tmp, 'config', 'claude-code-cockpit');
+    fs.mkdirSync(cfgDir, { recursive: true });
+    const file = path.join(cfgDir, 'config.json');
+    fs.writeFileSync(file, JSON.stringify({ port: 5555, cost: { rates: { 'claude-opus-4-8': OLD_OPUS_48 } } }));
+
+    const read = readConfig();
+    assert.strictEqual(read.port, 5555); // unrelated settings survive
+    assert.deepStrictEqual(read.cost.rates['claude-opus-4-8'], NEW_OPUS_48);
+    assert.strictEqual(read.configVersion, CONFIG_VERSION);
+
+    // Unspecified fields still inherit live defaults (not frozen in memory).
+    assert.strictEqual(read.retentionDays, DEFAULT_CONFIG.retentionDays);
+
+    // The correction was persisted to disk (not just applied in memory)...
+    const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.strictEqual(onDisk.configVersion, CONFIG_VERSION);
+    assert.deepStrictEqual(onDisk.cost.rates['claude-opus-4-8'], NEW_OPUS_48);
+    // ...but the persisted file keeps its MINIMAL shape: omitted fields are not
+    // materialized, so a future default change still reaches this user.
+    assert.strictEqual(onDisk.retentionDays, undefined);
+    assert.strictEqual(onDisk.cost.rates['claude-haiku-4-5'], undefined);
+
+    // Second read is a stamped no-op — the value is stable, not re-touched.
+    assert.deepStrictEqual(readConfig().cost.rates['claude-opus-4-8'], NEW_OPUS_48);
   } finally {
     for (const k of envKeys) {
       if (saved[k] === undefined) delete process.env[k];

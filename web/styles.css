@@ -299,8 +299,8 @@ body {
    Disabled under prefers-reduced-motion by the global rule at the bottom of this file. */
 .card--flash { animation: cardPulse 0.7s ease-in-out 1; }
 /* Important transitions: longer (5 pulses), equal length, distinct colours. `done`
-   uses a BRIGHT sky-blue (the mid accent blue blended into the dark-blue backdrop). */
-.card--flash-done { --flash-color: rgba(96, 180, 255, 0.9); animation-iteration-count: 5; }    /* running→idle */
+   uses a bright CYAN — it pops against the dark blue-tinted backdrop where blue washed out. */
+.card--flash-done { --flash-color: rgba(34, 211, 238, 0.9); animation-iteration-count: 5; }    /* running→idle */
 .card--flash-waiting { --flash-color: rgba(245, 177, 32, 0.85); animation-iteration-count: 5; } /* running→waiting */
 /* Everyday transitions: one short pulse in the new status's colour. */
 .card--flash-running { --flash-color: rgba(51, 193, 122, 0.7); }
