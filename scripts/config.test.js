@@ -75,19 +75,25 @@ test('validateConfig: non-object input -> invalid, defaults returned', () => {
 });
 
 test('validateConfig: clamps negatives to 0 (still valid)', () => {
-  const res = validateConfig({ longRunningThresholdMs: -1000, retentionDays: -5, idleShutdownHours: -2 });
+  const res = validateConfig({ longRunningThresholdMs: -1000, idleShutdownHours: -2 });
   assert.strictEqual(res.valid, true);
   assert.strictEqual(res.config.longRunningThresholdMs, 0);
-  assert.strictEqual(res.config.retentionDays, 0);
   assert.strictEqual(res.config.idleShutdownHours, 0);
 });
 
+test('validateConfig: retentionDays is now an unknown key and is dropped', () => {
+  // retentionDays and its auto-prune were removed; a stored value goes inert.
+  const res = validateConfig({ retentionDays: 30 });
+  assert.strictEqual(res.valid, true);
+  assert.ok(!('retentionDays' in res.config));
+});
+
 test('validateConfig: coerces safe types (numeric strings, "true"/"false")', () => {
-  const res = validateConfig({ port: '8080', sound: 'false', retentionDays: '30' });
+  const res = validateConfig({ port: '8080', sound: 'false', idleShutdownHours: '30' });
   assert.strictEqual(res.valid, true);
   assert.strictEqual(res.config.port, 8080);
   assert.strictEqual(res.config.sound, false);
-  assert.strictEqual(res.config.retentionDays, 30);
+  assert.strictEqual(res.config.idleShutdownHours, 30);
 });
 
 test('validateConfig: a provided rates map is authoritative — it replaces defaults', () => {
@@ -168,7 +174,7 @@ test('readConfig/writeConfig: round-trip through a temp dir', () => {
     const read = readConfig();
     assert.strictEqual(read.port, 5555);
     assert.strictEqual(read.events.longRunning, true);
-    assert.strictEqual(read.retentionDays, DEFAULT_CONFIG.retentionDays); // defaults filled
+    assert.strictEqual(read.idleShutdownHours, DEFAULT_CONFIG.idleShutdownHours); // defaults filled
 
     // Invalid write is rejected and leaves disk untouched.
     const bad = writeConfig({ port: 'nope' });
@@ -255,7 +261,7 @@ test('readConfig: migrates a pre-version config on disk, persists once, then is 
     assert.strictEqual(read.configVersion, CONFIG_VERSION);
 
     // Unspecified fields still inherit live defaults (not frozen in memory).
-    assert.strictEqual(read.retentionDays, DEFAULT_CONFIG.retentionDays);
+    assert.strictEqual(read.idleShutdownHours, DEFAULT_CONFIG.idleShutdownHours);
 
     // The correction was persisted to disk (not just applied in memory)...
     const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -263,7 +269,7 @@ test('readConfig: migrates a pre-version config on disk, persists once, then is 
     assert.deepStrictEqual(onDisk.cost.rates['claude-opus-4-8'], NEW_OPUS_48);
     // ...but the persisted file keeps its MINIMAL shape: omitted fields are not
     // materialized, so a future default change still reaches this user.
-    assert.strictEqual(onDisk.retentionDays, undefined);
+    assert.strictEqual(onDisk.idleShutdownHours, undefined);
     assert.strictEqual(onDisk.cost.rates['claude-haiku-4-5'], undefined);
 
     // Second read is a stamped no-op — the value is stable, not re-touched.

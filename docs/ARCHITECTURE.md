@@ -46,6 +46,9 @@ This design deliberately reuses the mechanisms proven in [`claude-code-notifier`
                               │   ├─ GET  /api/history?range=…          │
                               │   ├─ GET  /api/config    read config    │
                               │   ├─ PUT  /api/config    update config  │
+                              │   ├─ GET  /api/storage   store size     │
+                              │   ├─ POST /api/data/cleanup  prune old  │
+                              │   ├─ POST /api/repos/delete  del a repo │
                               │   ├─ POST /internal/event  (hook ping)  │
                               │   └─ GET  /health        (singleton)    │
                               └──────────────┬──────────────────────────┘
@@ -165,12 +168,18 @@ The daemon is *not* on the hook's critical path: the log is the durable source o
 
 > **This deliberately avoids the `claude-code-notifier` bug.** The notifier derives its title with `path.basename(cwd)` alone, so launching Claude Code from a **subdirectory** of a repo (e.g. `cwd = /me/acme-api/packages/worker`) shows the subfolder name (`worker`) instead of the repository (`acme-api`). Walking up to the git root fixes this. Fallback: if **no** `.git` is found on the way up (the session isn't in a git repo), `repo_root = cwd` and `repo_name = basename(cwd)` — matching the notifier's behavior only in the case where there is genuinely no repo to name. `repo.js` is the canonical implementation of this rule; see the note at the end of this document about back-porting it to the notifier.
 
-**Retention & rotation:** events are written to per-day files, which rotate naturally at midnight. The daemon prunes only **inactive past-day** files older than `retentionDays` (default 90); it **never truncates or renames the current day's file**, which hook processes may be appending to concurrently — doing so would race the writers and drop lines. There is deliberately no active-file size cap.
+**Retention & rotation:** events are written to per-day files, which rotate naturally at midnight. **The daemon never deletes anything automatically** — there is no retention timer and no size cap. Cleanup is entirely manual: `POST /api/data/cleanup` unlinks whole **inactive past-day** files older than a user-chosen age, and `POST /api/repos/delete` removes one repository's data (see *Manual data management* below). The automatic pruner **never truncated or renamed the current day's file**, which hook processes may be appending to concurrently (doing so races the writers and drops lines); that invariant is now bent only by the deliberate, one-shot per-repo delete, which drains the tail and resets the byte offset before rewriting today's event log (see below).
 
 **Derived time-series & rollups (daemon-owned).** The event log above is hook-written (many short-lived processes appending concurrently — see the append-safety note above). The daemon owns two further stores, so each has exactly **one writer** and there is no cross-process contention:
 
 - `stateDir/usage/YYYY-MM-DD.jsonl` — one **timestamped token-usage record per closed turn**: `{ ts, session_id, repo_root, model, input, output, cacheRead, cacheWrite }`, written when the daemon computes a turn's token delta at `Stop`. This is what makes *tokens-over-time* graphs possible; the live totals alone hold only current sums. (Tokens/prompts/cost derive from this log; **active time does not** — see *Active-time accounting*.)
 - `stateDir/rollups/YYYY-MM-DD.json` — a **materialized daily aggregate** per repo (active ms, prompt/session counts, tokens by model, estimated cost), updated incrementally as events and usage records arrive.
+
+**Manual data management (daemon-owned deletes).** Three authenticated endpoints let the dashboard report and reclaim disk, replacing the removed auto-pruner:
+
+- `GET /api/storage` — the store's on-disk size (the `events`/`usage`/`rollups` dirs + `snapshot.json`, excluding `daemon.log`) plus its day span, computed synchronously per request and **never** on the SSE broadcast path (`buildStatePayload`), so it can't slow live updates.
+- `POST /api/data/cleanup {olderThanDays:N}` — unlinks every whole day-file older than *today − N* (never today's), across the three dirs; the safe subset of the old pruner (whole-file unlinks, no concurrent writers). Clears the rollup and all-time caches.
+- `POST /api/repos/delete {repoRoot}` — hard-deletes one repo across every usage/event/rollup day-file (unlinking any emptied file so the store actually shrinks). Refuses with **409** if a live session still owns the repo (its in-flight events would otherwise re-populate it). For today's event log — the one file hooks append to — it drains the tail (`tailOnce`), rewrites the file without the repo, then **resets `offsets[currentDate]` to the shrunk size** and persists it, so the next tail can't mistake the smaller file for a truncation-restart and re-read every surviving line (which would double-count the other repos' live state).
 
 Together the event log (timing, activity, status) and the usage log (tokens) are the complete **timestamped time-series**; the daily rollups are the fast read path over it, so a `GET /api/history` chart query is O(days-in-range) rather than a full-log replay. Everything is plain JSON — no database — preserving the zero-native-dependency, zero-build property. If range queries ever outgrow this (very long histories, ad-hoc SQL), the same structured records migrate cleanly into SQLite (`node:sqlite` built-in, or `better-sqlite3`) behind the store interface without touching the rest of the daemon.
 
@@ -267,7 +276,7 @@ Static files served by the daemon. The SPA loads an initial snapshot from `GET /
 - **Live:** a card grid, one card per active session — repo name, branch, path (click-to-copy), status badge, current activity, the ticking prompt timer, session age, tokens so far, the session's **active time** (see *Active-time accounting* below — engaged wall-clock, excluding permission/idle waits, including background-workflow time; distinct from wall-clock age), and `permission_mode` / `effort` chips. Each card also shows the **repo's all-time cumulative total** (prompts + tokens + active time + estimated cost) as a muted second row aligned under the per-session stat columns, distinct from the per-session numbers above — the daemon supplies it as a `repoTotals` map (keyed by `repoRoot`) on `/api/state`. `waiting` sessions sort to the top and are highlighted.
 - **Per-repo:** a sortable table — repo, active time, prompts, sessions, tokens (in / out / cache), estimated $, last active — with a range filter (today / 7d / 30d / all).
 - **History:** inline-SVG charts — tokens and time per day, activity by hour, top repos — served from the pre-bucketed daily rollups via `GET /api/history?range=…` (no full-log scan).
-- **Settings:** the **single place all configuration is edited** — sound selection, the OS-notification master toggle, OS vs. in-browser sound toggles, per-event notification toggles, the activity-detail level (`activityDetail`: tool name only vs. arguments), the long-running threshold, the pricing table, and retention. Editing a control issues `PUT /api/config`; the daemon validates it, persists it via `config.js`, hot-reloads its in-memory config, and broadcasts the new config over SSE so every open dashboard reflects the change immediately.
+- **Settings:** the **single place all configuration is edited** — sound selection, the OS-notification master toggle, OS vs. in-browser sound toggles, per-event notification toggles, the activity-detail level (`activityDetail`: tool name only vs. arguments), the long-running threshold, and the pricing table. It also hosts a **Data** section (not config-backed) showing the on-disk store size + day span from `GET /api/storage` and a manual "clean up data older than N days" control (`POST /api/data/cleanup`) whose confirm previews the scope — there is no automatic retention. Editing a *config* control issues `PUT /api/config`; the daemon validates it, persists it via `config.js`, hot-reloads its in-memory config, and broadcasts the new config over SSE so every open dashboard reflects the change immediately.
 
 ## Configuration
 
@@ -294,7 +303,6 @@ Reuses the notifier's `paths.js` / `config.js` pattern with `APP_NAME = "claude-
       "claude-sonnet-5": { "input": 3, "output": 15, "cacheRead": 0.3, "cacheWrite": 3.75 }
     }
   },
-  "retentionDays": 90,
   "idleShutdownHours": 0
 }
 ```

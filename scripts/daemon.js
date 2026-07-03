@@ -39,7 +39,6 @@ const LONGRUN_MS = 5000;
 const REAPER_MS = 10000;
 const HEARTBEAT_MS = 15000;
 const SNAPSHOT_MS = 5000;
-const PRUNE_MS = 3600000;
 const IDLE_CHECK_MS = 60000;
 const SSE_COALESCE_MS = 250; // ≤ ~4 state pushes / second
 const REAP_IDLE_FALLBACK_MS = 6 * 3600 * 1000; // reap PID-less sessions after 6h idle
@@ -266,8 +265,8 @@ function loadSnapshot() {
     for (const sid of Object.keys(snap.extra)) extra.set(sid, snap.extra[sid]);
   }
   // Restore the counted-message-id sets so ingestion stays idempotent across a
-  // restart independently of usage-log retention — a session older than
-  // retentionDays whose early usage logs were pruned would otherwise have its old
+  // restart independently of usage-log pruning — a session whose early usage logs
+  // were manually cleaned up (POST /api/data/cleanup) would otherwise have its old
   // transcript messages look "new" to catchUpIngest and be double-counted.
   if (snap.seenIds && typeof snap.seenIds === 'object') {
     for (const sid of Object.keys(snap.seenIds)) {
@@ -995,8 +994,8 @@ function reposSummary() {
 // Per-repo all-time totals (tokens + estimated cost) keyed by repoRoot, so a Live
 // card can show its repo's cumulative total beside the session's own. The two are
 // different scopes — one session vs. every session + backfill for the repo — and are
-// easy to mistake for a bug when they differ. Bounded by retained history
-// (retentionDays), like every other range view.
+// easy to mistake for a bug when they differ. Covers all retained history, which is
+// now unbounded until the user manually cleans up (POST /api/data/cleanup).
 // Memoized: buildStatePayload runs on the SSE broadcast hot path, so this must NOT
 // re-scan the log dirs (listRollupDates) or re-aggregate every frame. The cache is
 // invalidated wherever tokens, rollups, or cost config change.
@@ -1344,6 +1343,293 @@ function handleBackfill(req, res) {
   });
 }
 
+// ---- data management (storage / cleanup / delete-repo) ----------------------
+
+// A day-file basename: YYYY-MM-DD.json (rollups) or .jsonl (events/usage). The
+// extension check also excludes an interrupted atomic write's `*.tmp` leftover,
+// which would otherwise match a bare date-prefix test.
+const DATE_FILE_RE = /^(\d{4}-\d{2}-\d{2})\.(?:json|jsonl)$/;
+
+// Sum the byte size of every file directly under `dir` (non-recursive); a missing
+// dir counts as 0. A file that vanishes between readdir and stat is skipped.
+function dirBytes(dir) {
+  let files;
+  try {
+    files = fs.readdirSync(dir);
+  } catch (_e) {
+    return 0;
+  }
+  let total = 0;
+  for (const f of files) {
+    try {
+      total += fs.statSync(path.join(dir, f)).size;
+    } catch (_e) {
+      /* vanished */
+    }
+  }
+  return total;
+}
+
+function fileBytes(p) {
+  try {
+    return fs.statSync(p).size;
+  } catch (_e) {
+    return 0;
+  }
+}
+
+// Byte size of the three day-file dirs — the space a delete/cleanup actually frees
+// (the snapshot delta is noise, so freedBytes is measured over these dirs only).
+function storeBytes() {
+  return dirBytes(paths.eventsDir()) + dirBytes(paths.usageDir()) + dirBytes(paths.rollupsDir());
+}
+
+// The 'YYYY-MM-DD' N days before today (local time). YYYY-MM-DD strings sort
+// lexicographically by date, so a plain `date < cutoff` selects strictly-older days.
+function cutoffDate(n) {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return paths.dateStr(d);
+}
+
+// Run `fn(fullPath, date)` for each YYYY-MM-DD.{json,jsonl} day file under `dir` (the
+// only shape DATE_FILE_RE matches — tmp files and other names are skipped). Tolerant of
+// a missing dir; a throw in `fn` propagates to the caller.
+function forEachDateFile(dir, fn) {
+  let files;
+  try {
+    files = fs.readdirSync(dir);
+  } catch (_e) {
+    return;
+  }
+  for (const f of files) {
+    const m = f.match(DATE_FILE_RE);
+    if (!m) continue; // DATE_FILE_RE already restricts to YYYY-MM-DD.{json,jsonl}; tmp files don't match
+    fn(path.join(dir, f), m[1]);
+  }
+}
+
+// Atomically replace a jsonl day file with `kept` (tmp write + same-dir rename, the
+// persistRollup/saveSnapshot pattern), or UNLINK it when nothing remains — so an
+// emptied file stops counting toward the store's size and day span rather than
+// lingering as a 0-byte file. Throws on I/O failure (caller's try/catch handles it).
+function rewriteOrUnlinkJsonl(file, kept) {
+  if (kept.length === 0) {
+    try {
+      fs.unlinkSync(file);
+    } catch (_e) {
+      /* already gone */
+    }
+    return;
+  }
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, kept.map((o) => JSON.stringify(o)).join('\n') + '\n');
+  fs.renameSync(tmp, file);
+}
+
+// Remove one repo from a persisted rollup file; unlink the file if it then holds no
+// repos. A file without this repo (or unreadable/malformed) is left untouched — its
+// content is never trusted anyway (past days derive from the usage log).
+function deleteRepoFromRollupFile(file, repoRoot) {
+  let rollup;
+  try {
+    rollup = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (_e) {
+    return;
+  }
+  if (!rollup || typeof rollup !== 'object' || !rollup.repos || !(repoRoot in rollup.repos)) return;
+  delete rollup.repos[repoRoot];
+  if (Object.keys(rollup.repos).length === 0) {
+    try {
+      fs.unlinkSync(file);
+    } catch (_e) {
+      /* already gone */
+    }
+    return;
+  }
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(rollup));
+  fs.renameSync(tmp, file);
+}
+
+// GET /api/storage — on-disk size of the cockpit's accounting store, computed
+// synchronously per request (a stat of a few dozen small files is cheap) and NEVER
+// memoized or called from buildStatePayload, so it can't touch the SSE hot path.
+// daemon.log lives in stateDir's root (not these dirs) and is deliberately excluded —
+// it's a log, not accounting data. `days` is the count of DISTINCT YYYY-MM-DD dates
+// present across the three dirs (their union); oldest/newest are the min/max of that
+// union — a file count, not a calendar span (a gap day simply isn't counted).
+function computeStorage() {
+  const daySet = new Set();
+  // One pass per dir: sum every file's size AND record the day-file dates together, so a
+  // GET /api/storage does one readdir per dir, not two. Size counts all files present
+  // (matching storeBytes/dirBytes); dates come only from YYYY-MM-DD.{json,jsonl} names.
+  const scan = (dir) => {
+    let files;
+    try {
+      files = fs.readdirSync(dir);
+    } catch (_e) {
+      return 0;
+    }
+    let total = 0;
+    for (const f of files) {
+      try {
+        total += fs.statSync(path.join(dir, f)).size;
+      } catch (_e) {
+        /* vanished */
+      }
+      const m = f.match(DATE_FILE_RE);
+      if (m) daySet.add(m[1]);
+    }
+    return total;
+  };
+  const dirs = {
+    events: scan(paths.eventsDir()),
+    usage: scan(paths.usageDir()),
+    rollups: scan(paths.rollupsDir()),
+    snapshot: fileBytes(paths.snapshotPath()),
+  };
+  const bytes = dirs.events + dirs.usage + dirs.rollups + dirs.snapshot;
+  const sorted = [...daySet].sort();
+  return {
+    bytes,
+    dirs,
+    days: sorted.length,
+    dates: sorted, // the exact day list, so the cleanup UI can preview precisely which days a cutoff removes
+    oldestDate: sorted[0] || null,
+    newestDate: sorted[sorted.length - 1] || null,
+  };
+}
+
+// POST /api/data/cleanup — body { olderThanDays: N } (N>=1). Unlinks every whole
+// YYYY-MM-DD.* file whose date is < (today - N) AND != today, across the three day-file
+// dirs. This is the safe subset of the removed auto-prune: whole-file unlinks of
+// inactive past days only — never today's file (hooks may be appending to it), no
+// line-level rewrites, no concurrent writers. N is entered at click-time, not persisted.
+function handleDataCleanup(req, res) {
+  readBody(req, (raw) => {
+    let body;
+    try {
+      body = JSON.parse(raw || '');
+    } catch (_e) {
+      return json(res, { ok: false, error: 'invalid JSON body' }, 400);
+    }
+    const v = body && body.olderThanDays;
+    const n = typeof v === 'number' ? v : Number(v);
+    if (!Number.isInteger(n) || n < 1) {
+      return json(res, { ok: false, error: 'olderThanDays must be an integer >= 1' }, 400);
+    }
+    try {
+      const before = storeBytes();
+      const cutoff = cutoffDate(n);
+      const deletedDays = new Set();
+      for (const dir of [paths.eventsDir(), paths.usageDir(), paths.rollupsDir()]) {
+        forEachDateFile(dir, (file, date) => {
+          if (date >= cutoff || date === currentDate) return; // keep recent days + today
+          try {
+            fs.unlinkSync(file);
+            deletedDays.add(date);
+          } catch (_e) {
+            /* best effort */
+          }
+        });
+      }
+      // A pruned day drops out of every range aggregate — clear the memoized rollups
+      // and the all-time totals so they no longer count the deleted days.
+      rollupCache.clear();
+      repoTotalsCache = null;
+      markDirty();
+      json(res, { ok: true, deletedDays: deletedDays.size, freedBytes: Math.max(0, before - storeBytes()) });
+    } catch (e) {
+      log('cleanup failed ' + ((e && e.stack) || e));
+      json(res, { ok: false, error: String((e && e.message) || e) }, 500);
+    }
+  });
+}
+
+// POST /api/repos/delete — body { repoRoot }. Hard-deletes one repo's accounting from
+// the store. Refuses with 409 if a live session still has this repoRoot (the delete
+// would be immediately re-populated by its in-flight events), then removes every trace,
+// unlinking any file left empty so it stops counting toward the store.
+function handleReposDelete(req, res) {
+  readBody(req, (raw) => {
+    let body;
+    try {
+      body = JSON.parse(raw || '');
+    } catch (_e) {
+      return json(res, { ok: false, error: 'invalid JSON body' }, 400);
+    }
+    const repoRoot = body && typeof body.repoRoot === 'string' ? body.repoRoot : '';
+    if (!repoRoot) return json(res, { ok: false, error: 'repoRoot (string) is required' }, 400);
+
+    try {
+      // Drain today's event log BEFORE the live-session guard, so a SessionStart that
+      // emit.js appended after this request arrived is reflected in state.sessions — else
+      // the guard could miss a session just now starting in this repo, this very tailOnce
+      // would then ingest it, and the "deleted" repo would immediately reappear. Draining
+      // first also performs any pending day rollover up front, so the day we pin stays put.
+      tailOnce();
+      const today = currentDate; // pin the day: the second tailOnce below can't shift which files we filter
+
+      // Refuse while a live session still owns this repo (Resolved decisions: 409) — its
+      // in-flight events would immediately re-populate whatever we delete.
+      for (const sid of Object.keys(state.sessions)) {
+        const s = state.sessions[sid];
+        if (s && s.repoRoot === repoRoot) {
+          return json(res, { ok: false, error: 'a live session exists for this repo; close it first' }, 409);
+        }
+      }
+
+      const before = storeBytes();
+
+      // (a) usage logs: drop this repo's lines from every day file (daemon is the
+      // sole writer of usage, so this is race-free).
+      forEachDateFile(paths.usageDir(), (file) => {
+        rewriteOrUnlinkJsonl(file, readJsonl(file).filter((u) => u.repo_root !== repoRoot));
+      });
+
+      // (b) rollups: delete .repos[repoRoot]; unlink a rollup left with no repos.
+      forEachDateFile(paths.rollupsDir(), (file) => {
+        deleteRepoFromRollupFile(file, repoRoot);
+      });
+
+      // (c) PAST-day event logs (no writers, so race-free): line-filter + atomic rename.
+      forEachDateFile(paths.eventsDir(), (file, date) => {
+        if (date === today) return; // the hot current day is handled below
+        rewriteOrUnlinkJsonl(file, readJsonl(file).filter((ev) => ev.repo_root !== repoRoot));
+      });
+
+      // (d) CURRENT-day event log — the sharp edge. The daemon tails this hottest file by a
+      // persisted byte offset; readNewLines treats size<offset as truncation and restarts
+      // from 0. So: (i) tailOnce() again to drain any appends that landed during (a)-(c),
+      // so offsets[today] equals the file's size; (ii) read -> drop this repo's lines ->
+      // atomic rewrite (unlink if empty); (iii) reset offsets[today] to the NEW (shrunk)
+      // size, so the next tail sees "fully processed" rather than "truncated -> restart
+      // from 0", which would re-read every surviving line and double-count the OTHER repos'
+      // live state. A concurrent emit.js append landing in the read->rename window is lost —
+      // a bounded, accepted cost of this rare, deliberate action. Offset persistence is
+      // deferred to the saveSnapshot in step (e) so one write persists it with the rollup.
+      tailOnce(); // (i)
+      const todayLog = paths.eventLogPath(today);
+      rewriteOrUnlinkJsonl(todayLog, readJsonl(todayLog).filter((ev) => ev.repo_root !== repoRoot)); // (ii)
+      offsets[today] = fileBytes(todayLog); // (iii) 0 if the file was unlinked
+
+      // (e) re-derive in-memory state from the now-filtered logs, then persist the new
+      // offset + corrected rollup together (saveSnapshot), and refresh open dashboards.
+      rebuildTodayRollup();
+      rollupCache.clear();
+      repoTotalsCache = null;
+      saveSnapshot();
+      markDirty();
+
+      json(res, { ok: true, repoRoot, freedBytes: Math.max(0, before - storeBytes()) });
+    } catch (e) {
+      log('repo delete failed ' + ((e && e.stack) || e));
+      json(res, { ok: false, error: String((e && e.message) || e) }, 500);
+    }
+  });
+}
+
 function handleRequest(req, res) {
   try {
     const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
@@ -1372,8 +1658,11 @@ function handleRequest(req, res) {
     if (req.method === 'GET' && pathname === '/api/state') return json(res, buildStatePayload());
     if (req.method === 'GET' && pathname === '/api/stream') return serveStream(req, res);
     if (req.method === 'GET' && pathname === '/api/history') return json(res, buildHistory(url.searchParams.get('range')));
+    if (req.method === 'GET' && pathname === '/api/storage') return json(res, computeStorage());
     if (req.method === 'GET' && pathname === '/api/config') return json(res, cfg);
     if (req.method === 'PUT' && pathname === '/api/config') return handlePutConfig(req, res);
+    if (req.method === 'POST' && pathname === '/api/data/cleanup') return handleDataCleanup(req, res);
+    if (req.method === 'POST' && pathname === '/api/repos/delete') return handleReposDelete(req, res);
     if (req.method === 'POST' && pathname === '/internal/event') return handleInternalEvent(req, res);
     if (req.method === 'POST' && pathname === '/internal/backfill') return handleBackfill(req, res);
 
@@ -1547,41 +1836,6 @@ function heartbeat() {
   }
 }
 
-function pruneOld() {
-  if (!(cfg.retentionDays > 0)) return; // 0 / unset = keep forever; never wipe history
-  const cutoff = Date.now() - cfg.retentionDays * 86400000;
-  const dirs = [paths.eventsDir(), paths.usageDir(), paths.rollupsDir()];
-  let pruned = false;
-  for (const dir of dirs) {
-    let files;
-    try {
-      files = fs.readdirSync(dir);
-    } catch (_e) {
-      continue;
-    }
-    for (const f of files) {
-      const m = f.match(/^(\d{4}-\d{2}-\d{2})\./);
-      if (!m) continue;
-      if (m[1] === currentDate) continue; // never touch the day hooks may be appending to
-      const t = Date.parse(m[1]);
-      if (Number.isFinite(t) && t < cutoff) {
-        try {
-          fs.unlinkSync(path.join(dir, f));
-          pruned = true;
-        } catch (_e) {
-          /* best effort */
-        }
-      }
-    }
-  }
-  if (pruned) {
-    // A pruned past day drops out of every range aggregate — clear the memoized
-    // rollups and the all-time totals so they no longer count the deleted days.
-    rollupCache.clear();
-    repoTotalsCache = null;
-  }
-}
-
 function checkIdleShutdown() {
   if (cfg.idleShutdownHours <= 0 || ephemeral) return; // only on the stable port
   const active = Object.keys(state.sessions).length;
@@ -1603,7 +1857,6 @@ function startLoops() {
   setInterval(reapStale, REAPER_MS);
   setInterval(heartbeat, HEARTBEAT_MS);
   setInterval(saveSnapshot, SNAPSHOT_MS);
-  setInterval(pruneOld, PRUNE_MS);
   setInterval(checkIdleShutdown, IDLE_CHECK_MS);
 }
 

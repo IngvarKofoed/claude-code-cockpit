@@ -18,6 +18,7 @@ const App = {
   liveSort: "status", // "status" (server waiting-first) | "name" (alpha); set from localStorage in init
   repoRows: [], // normalized rows currently shown in the per-repo table
   repoSort: { key: "activeMs", dir: -1 }, // dir: 1 asc, -1 desc
+  storage: null, // last GET /api/storage snapshot (Settings > Data), for the cleanup preview
   prevStatus: {}, // sessionId -> last status, for sound-cue transition detection
   soundsPrimed: false, // suppress cues on first snapshot / after a reconnect gap
   flash: {}, // sessionId -> { until: epoch ms window ends, cls: variant class } for the status-change pulse
@@ -101,6 +102,39 @@ function fmtTokens(n) {
   if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
   if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
   return String(Math.round(n));
+}
+
+// Human-readable file size (binary units). Used by the Data section + delete toasts.
+function fmtBytes(n) {
+  n = num(n);
+  if (n < 1024) return Math.round(n) + " B";
+  const units = ["KB", "MB", "GB", "TB"];
+  let i = -1;
+  do {
+    n /= 1024;
+    i++;
+  } while (n >= 1024 && i < units.length - 1);
+  return (n >= 100 ? n.toFixed(0) : n.toFixed(1)) + " " + units[i];
+}
+
+// Local YYYY-MM-DD for a Date (matches the daemon's per-day file naming, which is local).
+function ymd(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+// Whole days from date string a to date string b (b - a); negative if b precedes a.
+function daysBetween(a, b) {
+  const ta = Date.parse(a + "T00:00:00");
+  const tb = Date.parse(b + "T00:00:00");
+  if (!Number.isFinite(ta) || !Number.isFinite(tb)) return 0;
+  return Math.round((tb - ta) / 86400000);
+}
+
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
 }
 
 const CURRENCY_SYM = { USD: "$", EUR: "€", GBP: "£", JPY: "¥", CAD: "$", AUD: "$" };
@@ -411,7 +445,7 @@ function cardHTML(s) {
   // tooltip explains it. Cells auto-flow in the same column order as the stats row.
   const rt = App.state && App.state.repoTotals && s.repoRoot ? App.state.repoTotals[s.repoRoot] : null;
   const repoTok = rt && rt.tokens != null ? sumTokens(rt.tokens) : null;
-  const atTitle = "This repo's cumulative total across every session in retained history (all time, up to the retention limit), including backfilled sessions. Chats, active time, agents and tools come from live sessions only — backfilled history contributes tokens/cost but not those.";
+  const atTitle = "This repo's cumulative total across every session on record (all time), including backfilled sessions. Chats, active time, agents and tools come from live sessions only — backfilled history contributes tokens/cost but not those.";
   const rtCells = [
     `<span class="card__at-v" title="${atTitle}">${rt && rt.prompts != null ? num(rt.prompts) : "—"}</span>`,
     `<span class="card__at-v" title="${atTitle}">${repoTok == null ? "—" : esc(fmtTokens(repoTok))}</span>`,
@@ -581,6 +615,7 @@ function sortRepoRows(rows) {
 
 function renderReposTable(rows) {
   const panel = $("repoPanel");
+  closeMenu(); // any open ⋯ menu points at a button this re-render is about to discard
   const cols = REPO_COLS.filter((c) => c.key !== "cost" || costEnabled());
   if (!rows.length) {
     panel.innerHTML =
@@ -610,10 +645,20 @@ function renderReposTable(rows) {
           return `<td${muted}${title}>${esc(val)}</td>`;
         })
         .join("");
-      return `<tr>${cells}</tr>`;
+      // Trailing action cell: a ⋯ button opening the per-repo menu (Delete repo data…).
+      // Only rendered when we have a repoRoot to target the delete at.
+      const canDelete = r.repoRoot != null && r.repoRoot !== "";
+      const action = `<td class="col-action">${
+        canDelete
+          ? `<button class="repo-menu-btn" type="button" data-repo-root="${esc(r.repoRoot)}" data-repo-name="${esc(
+              r.repoName || basename(r.repoRoot)
+            )}" title="Actions" aria-label="Repository actions">⋯</button>`
+          : ""
+      }</td>`;
+      return `<tr>${cells}${action}</tr>`;
     })
     .join("");
-  panel.innerHTML = `<table class="table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+  panel.innerHTML = `<table class="table"><thead><tr>${head}<th class="col-action" aria-hidden="true"></th></tr></thead><tbody>${body}</tbody></table>`;
 }
 
 function setRepoSort(key) {
@@ -668,6 +713,222 @@ function loadRepos() {
       App.repoRows = [];
       renderReposTable([]);
     });
+}
+
+// ---- Data management (⋯ menu · confirm modal · storage) --------------------
+
+// A single floating ⋯ menu at a time; positioned fixed against the clicked button
+// (so the panel's overflow can't clip it). Closed on outside click, scroll, resize,
+// or any table re-render (renderReposTable calls closeMenu).
+let activeMenu = null;
+
+function onDocClickForMenu(e) {
+  if (activeMenu && !activeMenu.contains(e.target) && !e.target.closest(".repo-menu-btn")) closeMenu();
+}
+
+function closeMenu() {
+  if (!activeMenu) return;
+  activeMenu.remove();
+  activeMenu = null;
+  document.removeEventListener("click", onDocClickForMenu);
+  window.removeEventListener("resize", closeMenu);
+  window.removeEventListener("scroll", closeMenu, true);
+}
+
+function openRepoMenu(btn) {
+  closeMenu();
+  const repoRoot = btn.dataset.repoRoot;
+  if (!repoRoot) return;
+  const repoName = btn.dataset.repoName || basename(repoRoot);
+  const menu = document.createElement("div");
+  menu.className = "menu";
+  menu.innerHTML = '<button class="menu__item menu__item--danger" type="button">Delete repo data…</button>';
+  document.body.appendChild(menu);
+  activeMenu = menu;
+  // Anchor under the button, right edges aligned, clamped into the viewport.
+  const r = btn.getBoundingClientRect();
+  const mw = menu.offsetWidth;
+  const left = clamp(r.right - mw, 8, Math.max(8, window.innerWidth - mw - 8));
+  menu.style.top = Math.round(r.bottom + 4) + "px";
+  menu.style.left = Math.round(left) + "px";
+  menu.querySelector(".menu__item--danger").addEventListener("click", () => {
+    closeMenu();
+    confirmDeleteRepo(repoRoot, repoName);
+  });
+  // Defer so the click that opened the menu doesn't immediately close it.
+  setTimeout(() => document.addEventListener("click", onDocClickForMenu), 0);
+  window.addEventListener("resize", closeMenu);
+  window.addEventListener("scroll", closeMenu, true);
+}
+
+// In-app confirm (never a native confirm()). Resolves true on confirm, false on
+// cancel / Escape / overlay click. `bodyHTML` is caller-built — escape dynamic parts.
+function showConfirm({ title, bodyHTML, confirmLabel = "Delete", cancelLabel = "Cancel", danger = true }) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+        <h3 class="modal__title">${esc(title)}</h3>
+        <div class="modal__body">${bodyHTML}</div>
+        <div class="modal__actions">
+          <button class="btn modal__btn-cancel" type="button">${esc(cancelLabel)}</button>
+          <button class="btn ${danger ? "btn--danger" : ""} modal__btn-confirm" type="button">${esc(confirmLabel)}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const close = (result) => {
+      document.removeEventListener("keydown", onKey);
+      overlay.remove();
+      resolve(result);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") close(false);
+    };
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) close(false);
+    });
+    overlay.querySelector(".modal__btn-cancel").addEventListener("click", () => close(false));
+    overlay.querySelector(".modal__btn-confirm").addEventListener("click", () => close(true));
+    document.addEventListener("keydown", onKey);
+    overlay.querySelector(".modal__btn-confirm").focus();
+  });
+}
+
+async function confirmDeleteRepo(repoRoot, repoName) {
+  const ok = await showConfirm({
+    title: "Delete repo data",
+    bodyHTML:
+      `<p>Permanently delete all cockpit accounting for <b>${esc(repoName)}</b>?</p>` +
+      `<p class="modal__warn">This removes <b>every</b> token, cost, active-time and history record for this repository from the store. It cannot be undone.</p>`,
+    confirmLabel: "Delete repo data",
+  });
+  if (!ok) return;
+  try {
+    const res = await api("/api/repos/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repoRoot }),
+    });
+    toast(`Deleted ${repoName} — freed ${fmtBytes(res && res.freedBytes)}`);
+    await refreshState();
+    loadRepos(); // reflect the removal in the current range's table (state only covers "today")
+    loadStorage();
+  } catch (e) {
+    // 409 = a live session still owns this repo; the daemon refuses so it can't be re-populated.
+    if (e && e.status === 409) toast("Close the session in this repo first", true);
+    else toast("Could not delete repo data", true);
+  }
+}
+
+async function onCleanupClick() {
+  const input = $("set-cleanup-days");
+  if (!input) return;
+  const raw = String(input.value).trim();
+  const n = Math.floor(Number(raw));
+  if (raw === "" || !Number.isFinite(n) || n < 1) {
+    toast("Enter how many days to keep (1 or more)", true);
+    return;
+  }
+  const st = App.storage;
+  const days = num(st && st.days);
+  // Match the daemon's calendar arithmetic (cutoffDate: setDate(getDate()-n)) rather than
+  // fixed-ms subtraction, so the previewed cutoff can't drift a day from what's deleted
+  // across a DST transition. Everything strictly before `cutoff` is removed.
+  const cd = new Date();
+  cd.setDate(cd.getDate() - n);
+  const cutoff = ymd(cd);
+  // Preview the concrete scope so a mistyped N on an irreversible whole-store delete
+  // is catchable. The exact per-day list isn't in /api/storage, so the day/byte counts
+  // are an estimate (labelled "about" / "~") scaled from the day span; the daemon is
+  // authoritative and the toast reports the actual counts.
+  let preview;
+  if (!st || !days) {
+    preview = "<p>The store has no data to clean up yet.</p>";
+  } else {
+    // Exact deleted-day count from the day list (the daemon deletes whole day-files
+    // strictly before the cutoff; today is never < cutoff so it's never counted). Fall
+    // back to a proportional estimate only for an older daemon that omits `dates`.
+    let deletedCount;
+    let exact = false;
+    if (Array.isArray(st.dates)) {
+      deletedCount = st.dates.filter((d) => d < cutoff).length;
+      exact = true;
+    } else {
+      const spanDays = st.oldestDate && st.newestDate ? daysBetween(st.oldestDate, st.newestDate) + 1 : days;
+      const beforeCutoff = st.oldestDate ? clamp(daysBetween(st.oldestDate, cutoff), 0, spanDays) : 0;
+      deletedCount = spanDays > 0 ? clamp(Math.round((days * beforeCutoff) / spanDays), 0, days) : 0;
+    }
+    // Per-day bytes aren't known, so freed size stays an estimate (average × deleted days).
+    const freedEst = days > 0 ? (num(st.bytes) * deletedCount) / days : 0;
+    preview =
+      `<p>Delete all cockpit data recorded before <b>${esc(cutoff)}</b> (older than <b>${n}</b> day${n === 1 ? "" : "s"}); everything from <b>${esc(cutoff)}</b> onward is kept.</p>` +
+      `<p>Store now: <b>${days}</b> day${days === 1 ? "" : "s"}` +
+      (st.oldestDate && st.newestDate ? ` (${esc(st.oldestDate)} – ${esc(st.newestDate)})` : "") +
+      `, <b>${fmtBytes(num(st.bytes))}</b>. ${exact ? "Removes" : "Estimated to remove about"} <b>${deletedCount}</b> day-file${deletedCount === 1 ? "" : "s"} (~<b>${fmtBytes(freedEst)}</b>).</p>`;
+  }
+  const ok = await showConfirm({
+    title: "Clean up old data",
+    bodyHTML:
+      preview +
+      `<p class="modal__warn">Whole-day files older than the cutoff are permanently removed (today is never touched). This cannot be undone.</p>`,
+    confirmLabel: "Clean up",
+  });
+  if (!ok) return;
+  try {
+    const res = await api("/api/data/cleanup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ olderThanDays: n }),
+    });
+    const dd = num(res && res.deletedDays);
+    toast(`Cleaned up ${dd} day${dd === 1 ? "" : "s"} — freed ${fmtBytes(res && res.freedBytes)}`);
+    loadStorage();
+    await refreshState();
+  } catch (_e) {
+    toast("Could not clean up data", true);
+  }
+}
+
+// Fill the Data section's size + span from GET /api/storage (Settings-only; safe to
+// call when the section isn't mounted — renderStorageInfo no-ops if elements are absent).
+function loadStorage() {
+  api("/api/storage")
+    .then((st) => {
+      App.storage = st;
+      renderStorageInfo(st);
+    })
+    .catch(() => {
+      App.storage = null;
+      renderStorageInfo(null);
+    });
+}
+
+function renderStorageInfo(st) {
+  const sizeEl = $("storage-size");
+  const spanEl = $("storage-span");
+  if (!sizeEl || !spanEl) return; // Data section not currently rendered
+  if (!st) {
+    sizeEl.textContent = "—";
+    sizeEl.removeAttribute("title");
+    spanEl.textContent = "storage unavailable";
+    return;
+  }
+  sizeEl.textContent = fmtBytes(num(st.bytes));
+  const d = st.dirs || {};
+  sizeEl.title =
+    `events ${fmtBytes(num(d.events))} · usage ${fmtBytes(num(d.usage))} · ` +
+    `rollups ${fmtBytes(num(d.rollups))} · snapshot ${fmtBytes(num(d.snapshot))}`;
+  const days = num(st.days);
+  if (!days) {
+    spanEl.textContent = "no data yet";
+    return;
+  }
+  const span =
+    st.oldestDate && st.newestDate && st.oldestDate !== st.newestDate
+      ? `${st.oldestDate} – ${st.newestDate}`
+      : st.newestDate || st.oldestDate || "";
+  spanEl.textContent = `${days} day${days === 1 ? "" : "s"}${span ? " · " + span : ""}`;
 }
 
 // ---- History view ----------------------------------------------------------
@@ -769,7 +1030,7 @@ function settingsHTML(cfg) {
   );
 
   const behavior = section(
-    "Thresholds & retention",
+    "Thresholds",
     null,
     fieldRow(
       "Long-running threshold",
@@ -777,15 +1038,27 @@ function settingsHTML(cfg) {
       `<input class="input" id="set-longRunningSec" type="number" min="0" step="1" value="${Math.round(num(cfg.longRunningThresholdMs) / 1000)}"><span class="chip">sec</span>`
     ) +
       fieldRow(
-        "Retention",
-        "Days of history to keep",
-        `<input class="input" id="set-retentionDays" type="number" min="0" step="1" value="${num(cfg.retentionDays)}"><span class="chip">days</span>`
-      ) +
-      fieldRow(
         "Idle shutdown",
         "Hours idle before the daemon exits (0 = stay resident)",
         `<input class="input" id="set-idleShutdownHours" type="number" min="0" step="1" value="${num(cfg.idleShutdownHours)}"><span class="chip">hrs</span>`
       )
+  );
+
+  // Data: on-disk store size + manual cleanup. Size/span are filled from GET /api/storage
+  // by loadStorage() after render (and after any mutation) — the markup carries placeholders.
+  // Wrapped in #data-section so its controls are excluded from the config auto-save handler.
+  const data = section(
+    "Data",
+    "Cockpit stores its accounting on disk and never deletes it automatically. Clean up old data to reclaim space — deletions are permanent.",
+    `<div id="data-section">` +
+      `<div class="field"><div class="field__label"><b>Store size</b><small id="storage-span">…</small></div>` +
+      `<div class="field__control"><span class="data-size" id="storage-size">…</span></div></div>` +
+      fieldRow(
+        "Clean up old data",
+        "Permanently delete whole days older than the entered age (today is never touched)",
+        `<input class="input" id="set-cleanup-days" type="number" min="1" step="1" placeholder="90"><span class="chip">days</span><button class="btn btn--inline" id="btn-cleanup" type="button">Clean up</button>`
+      ) +
+      `</div>`
   );
 
   const costSection = section(
@@ -796,7 +1069,7 @@ function settingsHTML(cfg) {
       ratesTableHTML(cost.rates)
   );
 
-  return notifications + dashboard + behavior + costSection;
+  return notifications + dashboard + behavior + costSection + data;
 }
 
 function renderSettings() {
@@ -809,6 +1082,7 @@ function renderSettings() {
   }
   host.innerHTML = settingsHTML(App.cfg);
   App.settingsRendered = true;
+  loadStorage(); // populate the Data section's size + span (and refresh App.storage for the preview)
 }
 
 // Re-render settings on external config change, but never while the user is
@@ -823,7 +1097,7 @@ function readSettingsForm() {
   const cb = (id) => $(id).checked;
   const nv = (id, def) => {
     // A cleared/blank field means "use the default", NOT 0 — Number("") === 0,
-    // and a 0 here would e.g. persist retentionDays=0 and wipe all history.
+    // so a blank threshold would otherwise persist 0 instead of its intended default.
     const raw = String($(id).value).trim();
     if (raw === "") return def;
     const n = Number(raw);
@@ -855,7 +1129,6 @@ function readSettingsForm() {
       turnFailed: cb("set-ev-turnFailed"),
     },
     longRunningThresholdMs: Math.round(nv("set-longRunningSec", 300) * 1000),
-    retentionDays: Math.round(nv("set-retentionDays", 90)),
     idleShutdownHours: nv("set-idleShutdownHours", 0),
     cost: {
       enabled: cb("set-cost-enabled"),
@@ -893,6 +1166,10 @@ async function saveSettings() {
 }
 
 function onSettingsClick(e) {
+  if (e.target.closest("#btn-cleanup")) {
+    onCleanupClick();
+    return;
+  }
   const rm = e.target.closest(".rm");
   if (rm) {
     const tr = rm.closest("tr");
@@ -920,7 +1197,7 @@ function applyState(state) {
   if (typeof state.now === "number") App.clockOffset = state.now - Date.now();
   detectSoundCues(state.sessions || []);
   renderLive();
-  if (App.view === "repos" && App.repoRange === "today") renderReposFromState();
+  if (App.view === "repos" && App.repoRange === "today" && !activeMenu) renderReposFromState(); // skip while a ⋯ menu is open (re-render would close it)
   if (App.view === "settings" && !App.settingsRendered) renderSettings();
 }
 
@@ -928,7 +1205,7 @@ function applyState(state) {
 // visible view. Settings is only re-rendered when the user isn't mid-edit.
 function onConfigChanged() {
   renderLive();
-  if (App.view === "repos" && App.repoRange === "today") renderReposFromState();
+  if (App.view === "repos" && App.repoRange === "today" && !activeMenu) renderReposFromState(); // skip while a ⋯ menu is open (re-render would close it)
   if (App.view === "settings") maybeRenderSettings();
 }
 
@@ -1077,13 +1354,23 @@ function init() {
   });
 
   $("repoPanel").addEventListener("click", (e) => {
+    const menuBtn = e.target.closest(".repo-menu-btn");
+    if (menuBtn) {
+      openRepoMenu(menuBtn);
+      return;
+    }
     const th = e.target.closest("th[data-key]");
     if (th) setRepoSort(th.dataset.key);
   });
 
   // Delegated on the static #settings container so listeners survive innerHTML swaps.
   const sh = $("settings");
-  sh.addEventListener("change", scheduleSave);
+  sh.addEventListener("change", (e) => {
+    // The Data section (store size + cleanup) isn't part of the config, so its inputs
+    // must not trigger a config PUT / "Settings saved" toast.
+    if (e.target.closest("#data-section")) return;
+    scheduleSave();
+  });
   sh.addEventListener("click", onSettingsClick);
 
   // Browsers gate audio until a user gesture; resume the context on interaction.

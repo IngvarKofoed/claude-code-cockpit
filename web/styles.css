@@ -766,6 +766,107 @@ body {
   margin-top: 10px;
 }
 .btn:hover { background: var(--surface-3); }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.btn--inline { margin-top: 0; }
+/* Destructive action (delete / cleanup confirm). */
+.btn--danger {
+  border-color: rgba(226, 86, 79, 0.5);
+  background: rgba(226, 86, 79, 0.16);
+  color: #f4b7b4;
+}
+.btn--danger:hover { background: rgba(226, 86, 79, 0.26); color: #fff; }
+
+/* ---------- Per-repo row action (⋯ menu) ---------- */
+
+/* Trailing action column: not sortable, so it opts out of the header's pointer cursor. */
+.table th.col-action, .table td.col-action { width: 44px; text-align: center; cursor: default; }
+.table th.col-action:hover { color: var(--ink-muted); }
+.repo-menu-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--ink-muted);
+  font-family: var(--font-ui);
+  font-size: 18px;
+  line-height: 1;
+  padding: 2px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.repo-menu-btn:hover { background: var(--surface-3); color: var(--ink); }
+.repo-menu-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Floating menu — fixed-positioned in JS against the clicked button. */
+.menu {
+  position: fixed;
+  z-index: 150;
+  min-width: 170px;
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  box-shadow: var(--shadow);
+}
+.menu__item {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.menu__item:hover { background: var(--surface-3); }
+.menu__item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.menu__item--danger { color: #f0a6a2; }
+.menu__item--danger:hover { background: rgba(226, 86, 79, 0.15); color: #f4b7b4; }
+
+/* ---------- Confirm modal ---------- */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(5, 7, 11, 0.62);
+  backdrop-filter: blur(2px);
+}
+.modal {
+  width: 100%;
+  max-width: 430px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r);
+  box-shadow: var(--shadow);
+  padding: 20px 22px;
+}
+.modal__title { margin: 0 0 12px; font-size: 15px; font-weight: 650; }
+.modal__body { color: var(--ink-2); font-size: 13px; line-height: 1.5; }
+.modal__body p { margin: 0 0 10px; }
+.modal__body p:last-child { margin-bottom: 0; }
+.modal__body b { color: var(--ink); font-weight: 600; }
+.modal__warn { color: #f0a6a2; }
+.modal__warn b { color: #f4b7b4; }
+.modal__actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+.modal__actions .btn { margin-top: 0; }
+
+/* ---------- Settings: Data section ---------- */
+
+.data-size {
+  font-family: var(--font-mono);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+}
 
 /* ---------- Toast ---------- */
 

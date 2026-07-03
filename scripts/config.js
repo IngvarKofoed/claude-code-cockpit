@@ -42,7 +42,6 @@ const DEFAULT_CONFIG = {
       'claude-haiku-4-5': { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 },
     },
   },
-  retentionDays: 90,
   idleShutdownHours: 0,
 };
 
@@ -208,10 +207,10 @@ function validateConfig(input) {
     }
   }
 
-  // Thresholds / retention: numeric, negatives clamped to 0.
-  for (const key of ['longRunningThresholdMs', 'retentionDays', 'idleShutdownHours']) {
+  // Thresholds: numeric, negatives clamped to 0.
+  for (const key of ['longRunningThresholdMs', 'idleShutdownHours']) {
     if (key in input) {
-      const n = key === 'retentionDays' ? toInt(input[key]) : toNum(input[key]);
+      const n = toNum(input[key]);
       if (n === null) errors.push(`${key} must be a number`);
       else cfg[key] = clampMin(n, 0);
     }

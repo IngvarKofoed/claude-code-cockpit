@@ -207,3 +207,22 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     Known limit: a DROPPED SubagentStop leaves the session "engaged" (a lingering "working" timer, no finished
     ping) until the next turn's Stop re-reports the count — bounded and self-healing, unlike the old counter's
     permanent drift.
+
+27. Automatic retention pruning is gone: the `retentionDays` config field and the `pruneOld` timer are removed.
+    Chosen because the user wants the store cleaned only on demand, never behind their back. History now grows
+    unbounded until a manual cleanup. A persisted `retentionDays` goes inert (dropped as an unknown key by
+    `validateConfig`; no migration). Behavior flip worth noting: anyone who had set `retentionDays` to bound
+    disk now keeps everything until they clean up.
+
+28. Manual data management added. `GET /api/storage` reports the store's on-disk size (events+usage+rollups
+    +snapshot, excluding daemon.log) and day span, computed per-request and never on the SSE hot path.
+    `POST /api/data/cleanup {olderThanDays:N}` deletes whole day-files older than today−N (never today's) — the
+    safe subset of the old auto-prune: whole-file unlinks, no concurrent writers. Surfaced in a new Settings
+    "Data" section: store size + an N-days cleanup whose confirm previews the scope before committing.
+
+29. Delete-a-repo. `POST /api/repos/delete {repoRoot}` hard-deletes one repo's accounting across every
+    usage/event/rollup day-file, unlinking emptied files so the store actually shrinks. Refuses with `409` if a
+    live session owns the repo (its in-flight events would otherwise re-populate it). The current-day event log
+    is rewritten too, and its tail byte-offset reset to the shrunk size, so the next tail can't re-read and
+    double-count the OTHER repos' live state (the sharp edge — a naive shrink would trip the size<offset
+    "truncated→restart-from-0" path). Triggered from a ⋯ menu on the Per-repo page behind an in-app confirm.
