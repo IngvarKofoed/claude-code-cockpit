@@ -18,6 +18,7 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 
 const paths = require('./paths');
 const config = require('./config');
@@ -25,6 +26,7 @@ const aggregate = require('./aggregate');
 const transcript = require('./transcript');
 const pricing = require('./pricing');
 const notify = require('./notify');
+const repoLib = require('./repo');
 
 const VERSION = require('../package.json').version;
 const PLUGIN_PATH = process.env.CLAUDE_PLUGIN_ROOT || path.join(__dirname, '..');
@@ -66,6 +68,8 @@ const seenIds = new Map(); // session_id -> Set(transcript message id) already i
 const extra = new Map(); // session_id -> { transcriptPath, longRunPromptId }
 const ingesting = new Set(); // session_ids with an in-flight ingestTurn retry chain
 const pendingIngest = new Map(); // session_id -> { stopEvent, promptStart } queued mid-ingest
+const primedSeen = new Set(); // session_ids whose seenIds have been seeded from the usage logs
+const rollupCache = new Map(); // dateStr -> memoized derived past-day rollup (fast History reads)
 
 let replaying = false; // true while replaying the log on boot: suppress side effects
 
@@ -91,6 +95,13 @@ function addTokens(dst, t) {
   dst.output += num(t && t.output);
   dst.cacheRead += num(t && t.cacheRead);
   dst.cacheWrite += num(t && t.cacheWrite);
+}
+
+// Local calendar day ('YYYY-MM-DD') for an ISO timestamp, or null if unparseable.
+function dayOf(ts) {
+  const t = Date.parse(ts);
+  if (!Number.isFinite(t)) return null;
+  return paths.dateStr(new Date(t));
 }
 
 function log(msg) {
@@ -253,33 +264,34 @@ function loadSnapshot() {
   }
 }
 
-// Re-derive TODAY's rollup fresh from today's durable logs (usage + events),
-// per the crash-safety rule: never trust a possibly mid-write rollup for the
-// open day. Also seeds seenIds from the usage log so live ingestion stays
-// idempotent across restarts.
+// Apply one persisted usage record to a rollup. A `backfill` record (historical
+// tokens attributed to a past day) contributes tokens/cost only; a normal turn
+// record also counts as a turn (prompt + active time).
+function applyUsageRecord(rollup, u) {
+  const byModel = u.byModel && typeof u.byModel === 'object'
+    ? u.byModel
+    : { [u.model || 'unknown']: { input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite } };
+  const arg = { repoRoot: u.repo_root, repoName: u.repo_name, byModel, ts: u.ts };
+  if (u.backfill) aggregate.accumulateTokensByModel(rollup, arg);
+  else aggregate.accumulateTurnByModel(rollup, { ...arg, durationMs: u.durationMs });
+}
+
+// A day's rollup, derived PURELY from its durable usage log — the single source
+// of truth. This is what keeps accounting crash-safe and idempotent: a past day
+// is never trusted as a frozen file nor amended in place; it is recomputed from
+// the log (which backfill only ever appends to), so a crash, a corrupt rollup
+// file, or a re-ingest can neither double-count nor lose tokens.
+function deriveRollupFromUsage(date) {
+  const rollup = aggregate.createRollup(date);
+  for (const u of readJsonl(paths.usageLogPath(date))) applyUsageRecord(rollup, u);
+  return rollup;
+}
+
+// Rebuild TODAY's rollup from today's usage log, plus per-repo session counts from
+// today's event log (only the today card table shows session counts). Never trusts
+// a possibly mid-write rollup file for the open day.
 function rebuildTodayRollup() {
-  todayRollup = aggregate.createRollup(currentDate);
-
-  for (const u of readJsonl(paths.usageLogPath(currentDate))) {
-    // Prefer the per-model split; fall back to a single-model record (older logs).
-    const byModel = u.byModel && typeof u.byModel === 'object'
-      ? u.byModel
-      : { [u.model || 'unknown']: { input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite } };
-    aggregate.accumulateTurnByModel(todayRollup, {
-      repoRoot: u.repo_root,
-      repoName: u.repo_name,
-      byModel,
-      durationMs: u.durationMs,
-      ts: u.ts,
-    });
-    if (u.session_id && Array.isArray(u.ids)) {
-      let s = seenIds.get(u.session_id);
-      if (!s) seenIds.set(u.session_id, (s = new Set()));
-      for (const id of u.ids) s.add(id);
-    }
-  }
-
-  // Register every session seen today so repos with no completed turn still show.
+  todayRollup = deriveRollupFromUsage(currentDate);
   for (const ev of readJsonl(paths.eventLogPath(currentDate))) {
     if (ev.session_id != null && ev.repo_root != null) {
       aggregate.accumulateSession(todayRollup, {
@@ -292,28 +304,27 @@ function rebuildTodayRollup() {
   }
 }
 
-// After a restart, a session that is still open may carry transcript messages
-// already counted on a PRIOR day (recorded in that day's usage log). Since
-// rebuildTodayRollup only seeds seenIds from TODAY's usage log, seed the rest
-// from the retention window's usage logs — for currently-active sessions only —
-// so the next Stop can't re-count (and double-count into today) yesterday's tokens.
-function seedSeenIdsHistory() {
-  const active = new Set(Object.keys(state.sessions));
-  if (active.size === 0) return;
+// Seed a session's counted-message-id set from the DURABLE usage logs (the source
+// of truth for what has already been billed), once per session per daemon lifetime.
+// This keeps ingestion idempotent however the session got here — fresh daemon,
+// restart, or a RESUME that reuses a session_id after its in-memory seenIds was
+// dropped — so a whole-transcript re-read never re-appends a record or double-counts.
+function ensureSeenSeeded(sid) {
+  if (sid == null || primedSeen.has(sid)) return;
+  primedSeen.add(sid);
   let files = [];
   try {
     files = fs.readdirSync(paths.usageDir());
   } catch (_e) {
     return;
   }
+  let set = seenIds.get(sid);
+  if (!set) seenIds.set(sid, (set = new Set()));
   for (const f of files) {
     const m = f.match(/^(\d{4}-\d{2}-\d{2})\.jsonl$/);
-    if (!m || m[1] === currentDate) continue; // today's ids are seeded by rebuildTodayRollup
+    if (!m) continue;
     for (const u of readJsonl(paths.usageLogPath(m[1]))) {
-      if (!active.has(u.session_id) || !Array.isArray(u.ids)) continue;
-      let s = seenIds.get(u.session_id);
-      if (!s) seenIds.set(u.session_id, (s = new Set()));
-      for (const id of u.ids) s.add(id);
+      if (u.session_id === sid && Array.isArray(u.ids)) for (const id of u.ids) set.add(id);
     }
   }
 }
@@ -329,6 +340,7 @@ function catchUpIngest() {
     const x = extra.get(sid);
     const tpath = x && x.transcriptPath;
     if (!tpath) continue;
+    ensureSeenSeeded(sid); // seed from durable logs before deciding what's "fresh"
     let usage;
     try {
       usage = transcript.readUsage(tpath);
@@ -347,6 +359,143 @@ function catchUpIngest() {
     const stopEvent = { ts: s.lastActivityAt, repo_root: s.repoRoot, repo_name: s.repoName };
     recordTurn(sid, stopEvent, null, usage, fresh, seen);
   }
+}
+
+// ---- historical backfill (/internal/backfill) --------------------------------
+
+// Where Claude Code keeps per-session transcripts (honoring CLAUDE_CONFIG_DIR):
+// <base>/projects/<encoded-cwd>/<session_id>.jsonl.
+function claudeProjectsDir() {
+  const base = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+  return path.join(base, 'projects');
+}
+
+// Build, in ONE pass over the usage logs, a map of session_id -> Set(message ids
+// already counted). Backfill dedups against this instead of the live seenIds/
+// ensureSeenSeeded (which would be O(sessions x all-logs) and would bloat the live
+// maps with historical sessions). The usage log is the durable source of truth, so
+// this makes backfill idempotent and re-runnable.
+function countedIdsBySession() {
+  const map = new Map();
+  let files;
+  try {
+    files = fs.readdirSync(paths.usageDir());
+  } catch (_e) {
+    return map;
+  }
+  for (const f of files) {
+    const m = f.match(/^(\d{4}-\d{2}-\d{2})\.jsonl$/);
+    if (!m) continue;
+    for (const u of readJsonl(paths.usageLogPath(m[1]))) {
+      if (!u.session_id || !Array.isArray(u.ids)) continue;
+      let s = map.get(u.session_id);
+      if (!s) map.set(u.session_id, (s = new Set()));
+      for (const id of u.ids) s.add(id);
+    }
+  }
+  return map;
+}
+
+// Ingest token usage from EXISTING transcripts on disk — every past session for a
+// repo (filterRepoRoot set) or across all repos (null), not just the sessions the
+// daemon has observed live. Each transcript is read once, attributed to its repo
+// (resolved from the transcript's own recorded cwd), bucketed by the day each
+// message was spent, and deduped by message id (against a one-pass index of the
+// durable usage logs) — so it is idempotent, re-runnable, and never double-counts
+// against live ingestion. Sessions the daemon is tracking live are skipped by both
+// session id and transcript PATH (a resume/fork reusing an old transcript file).
+// Runs synchronously; a very large "all" scan can pause the daemon briefly.
+function backfillTranscripts(filterRepoRoot) {
+  const summary = {
+    scope: filterRepoRoot ? 'repo' : 'all',
+    transcripts: 0,
+    sessionsIngested: 0,
+    skippedActive: 0,
+    newMessages: 0,
+    tokens: emptyTokens(),
+    byModel: {},
+    repos: {}, // repoName -> { repoRoot, tokens, byModel }
+    days: [],
+  };
+  const daySet = new Set();
+  const counted = countedIdsBySession(); // one pass over the usage logs
+  const liveTranscripts = new Set();
+  for (const s of Object.keys(state.sessions)) {
+    const x = extra.get(s);
+    if (x && x.transcriptPath) liveTranscripts.add(x.transcriptPath);
+  }
+  let projects;
+  try {
+    projects = fs.readdirSync(claudeProjectsDir());
+  } catch (_e) {
+    return summary;
+  }
+
+  for (const proj of projects) {
+    const dir = path.join(claudeProjectsDir(), proj);
+    let files;
+    try {
+      files = fs.readdirSync(dir);
+    } catch (_e) {
+      continue; // not a directory / unreadable
+    }
+    for (const f of files) {
+      if (!f.endsWith('.jsonl')) continue;
+      const sid = f.slice(0, -6);
+      const tpath = path.join(dir, f);
+      if (state.sessions[sid] || liveTranscripts.has(tpath)) {
+        summary.skippedActive++;
+        continue; // handled by live ingestion (by id, or by reused transcript path)
+      }
+      let usage;
+      try {
+        usage = transcript.readUsage(tpath);
+      } catch (_e) {
+        continue;
+      }
+      if (!usage.ok || usage.messages.length === 0 || !usage.cwd) continue;
+      const repo = repoLib.resolveRepo(usage.cwd);
+      if (filterRepoRoot && repo.repo_root !== filterRepoRoot) continue;
+      summary.transcripts++;
+
+      const seen = counted.get(sid) || new Set();
+      const fresh = usage.messages.filter((m) => !seen.has(m.id));
+      if (fresh.length === 0) continue;
+
+      let maxTs = null;
+      for (const m of fresh) if (m.ts && (!maxTs || m.ts > maxTs)) maxTs = m.ts;
+      const stopEvent = { ts: maxTs, repo_root: repo.repo_root, repo_name: repo.repo_name };
+      const groups = recordTurn(sid, stopEvent, null, usage, fresh, seen, /* allBackfill */ true);
+
+      summary.sessionsIngested++;
+      summary.newMessages += fresh.length;
+      const rs =
+        summary.repos[repo.repo_name] ||
+        (summary.repos[repo.repo_name] = { repoRoot: repo.repo_root, tokens: emptyTokens(), byModel: {} });
+      // Build the summary from the days recordTurn ACTUALLY wrote to, so the reported
+      // date range and totals can never diverge from where the tokens landed.
+      for (const [day, g] of groups) {
+        daySet.add(day);
+        addTokens(summary.tokens, g.totals);
+        addTokens(rs.tokens, g.totals);
+        for (const model of Object.keys(g.byModel)) {
+          addTokens(summary.byModel[model] || (summary.byModel[model] = emptyTokens()), g.byModel[model]);
+          addTokens(rs.byModel[model] || (rs.byModel[model] = emptyTokens()), g.byModel[model]);
+        }
+      }
+    }
+  }
+
+  // Price the summary, then drop the internal byModel maps from the response.
+  summary.cost = cfg.cost.enabled ? pricing.estimateCost(summary.byModel, cfg.cost.rates).total : null;
+  delete summary.byModel;
+  for (const name of Object.keys(summary.repos)) {
+    const rs = summary.repos[name];
+    rs.cost = cfg.cost.enabled ? pricing.estimateCost(rs.byModel, cfg.cost.rates).total : null;
+    delete rs.byModel;
+  }
+  summary.days = [...daySet].sort();
+  return summary;
 }
 
 // ---- event log tail ---------------------------------------------------------
@@ -383,6 +532,7 @@ function rolloverDay(today) {
   currentDate = today;
   offsets[currentDate] = 0;
   todayRollup = aggregate.createRollup(currentDate);
+  rollupCache.clear(); // yesterday is now a past day — re-derive it on demand
 }
 
 // Read and apply any complete lines appended to a given day's event log since its
@@ -476,6 +626,7 @@ function dropSession(sid) {
   delete state.sessions[sid];
   extra.delete(sid);
   seenIds.delete(sid);
+  primedSeen.delete(sid); // a later resume re-seeds seenIds from the durable logs
   ingesting.delete(sid);
   pendingIngest.delete(sid);
 }
@@ -500,6 +651,7 @@ function ingestTurn(sid, stopEvent, promptStart) {
     return;
   }
   ingesting.add(sid);
+  ensureSeenSeeded(sid); // (re)seed counted ids from durable logs so a re-read can't double-count
 
   const finish = () => {
     ingesting.delete(sid);
@@ -535,52 +687,106 @@ function ingestTurn(sid, stopEvent, promptStart) {
   attempt();
 }
 
-function recordTurn(sid, stopEvent, promptStart, usage, fresh, seen) {
+function recordTurn(sid, stopEvent, promptStart, usage, fresh, seen, allBackfill = false) {
   const session = state.sessions[sid];
-  const sum = emptyTokens();
-  const byModel = {}; // per-model token split so a multi-model turn prices correctly
-  for (const m of fresh) {
-    addTokens(sum, m);
-    const model = m.model || (session && session.model) || 'unknown';
-    const bucket = byModel[model] || (byModel[model] = emptyTokens());
-    addTokens(bucket, m);
-    seen.add(m.id);
+  const repoRoot = (session && session.repoRoot) || stopEvent.repo_root || null;
+  const repoName = (session && session.repoName) || stopEvent.repo_name || null;
+
+  // Mark everything seen up front so a retry / re-read can never re-count it — but
+  // ONLY for live sessions. Historical backfill dedups against a local index built
+  // from the durable usage logs, so it must not populate (and unboundedly grow) the
+  // live seenIds map with sessions that will never be ingested live again.
+  if (!allBackfill) {
+    for (const m of fresh) seen.add(m.id);
+    seenIds.set(sid, seen);
   }
-  seenIds.set(sid, seen);
 
   let durationMs = 0;
   const a = Date.parse(promptStart);
   const b = Date.parse(stopEvent.ts);
   if (Number.isFinite(a) && Number.isFinite(b) && b >= a) durationMs = b - a;
 
-  const repoRoot = (session && session.repoRoot) || stopEvent.repo_root || null;
-  const repoName = (session && session.repoName) || stopEvent.repo_name || null;
+  // Attribute each message's tokens to the DAY it was actually spent (from its
+  // transcript timestamp), clamped so a clock-skewed future stamp can't bucket into
+  // a future day. Group the fresh messages by day.
+  const groups = new Map(); // day -> { byModel, totals, ids, latestTs }
+  for (const m of fresh) {
+    let day = dayOf(m.ts) || dayOf(stopEvent.ts) || currentDate;
+    if (day > currentDate) day = currentDate; // never bucket into a future day
+    let g = groups.get(day);
+    if (!g) groups.set(day, (g = { byModel: {}, totals: emptyTokens(), ids: [], latestTs: null }));
+    addTokens(g.totals, m);
+    const model = m.model || (session && session.model) || 'unknown';
+    const bucket = g.byModel[model] || (g.byModel[model] = emptyTokens());
+    addTokens(bucket, m);
+    g.ids.push(m.id);
+    if (m.ts && (!g.latestTs || m.ts > g.latestTs)) g.latestTs = m.ts;
+  }
 
-  // Persist the turn: `ids` make the record idempotent across restarts; `byModel`
-  // lets rebuildTodayRollup re-price each model at its own rate; the top-level
-  // token totals feed the hour histogram.
-  appendUsage({
-    ts: stopEvent.ts,
-    session_id: sid,
-    repo_root: repoRoot,
-    repo_name: repoName,
-    byModel,
-    input: sum.input,
-    output: sum.output,
-    cacheRead: sum.cacheRead,
-    cacheWrite: sum.cacheWrite,
-    durationMs,
-    ids: fresh.map((m) => m.id),
-  });
+  // The just-completed turn is the group holding the MOST RECENT messages; it earns
+  // the prompt count + duration. Every older day is historical backfill (tokens/cost
+  // only). Keying off the latest message — not the Stop's day — keeps the turn's
+  // duration/prompt on a real day even when it straddles midnight (Stop lands on the
+  // new day while the messages are timestamped on the old one).
+  // For a pure historical backfill (a whole pre-existing transcript) there is no
+  // live turn — every group is attributed as backfill (tokens/cost only).
+  let turnDay = null;
+  if (!allBackfill) {
+    let latestTs = null;
+    for (const [day, g] of groups) {
+      const t = g.latestTs || `${day}T00:00:00.000Z`;
+      if (latestTs == null || t > latestTs) {
+        latestTs = t;
+        turnDay = day;
+      }
+    }
+  }
 
-  aggregate.accumulateTurnByModel(todayRollup, { repoRoot, repoName, byModel, durationMs, ts: stopEvent.ts });
+  for (const [day, g] of groups) {
+    const isTurn = day === turnDay;
+    // Always a real timestamp (never null) so the record still lands in the hour
+    // histogram: the Stop time for today's group, else the group's latest message
+    // ts, else noon of that day.
+    const ts = (day === currentDate && stopEvent.ts) || g.latestTs || `${day}T12:00:00.000Z`;
+    // Append ONE record per day into THAT day's usage log — the durable source of
+    // truth. Past days are recomputed from these logs on demand (getRollup), so we
+    // never persist a past-day rollup here; only today's in-memory rollup is updated
+    // live for the dashboard. `ids` keep the record idempotent across re-reads.
+    appendUsage(
+      {
+        ts,
+        session_id: sid,
+        repo_root: repoRoot,
+        repo_name: repoName,
+        byModel: g.byModel,
+        input: g.totals.input,
+        output: g.totals.output,
+        cacheRead: g.totals.cacheRead,
+        cacheWrite: g.totals.cacheWrite,
+        durationMs: isTurn ? durationMs : 0,
+        backfill: isTurn ? undefined : true,
+        ids: g.ids,
+      },
+      day
+    );
+    if (day === currentDate) {
+      if (isTurn) {
+        aggregate.accumulateTurnByModel(todayRollup, { repoRoot, repoName, byModel: g.byModel, durationMs, ts });
+      } else {
+        aggregate.accumulateTokensByModel(todayRollup, { repoRoot, repoName, byModel: g.byModel, ts });
+      }
+    }
+  }
+
   updateSessionTokens(sid, usage);
+  return groups; // day -> { byModel, totals, ids } — the actual attribution, for callers' summaries
 }
 
-function appendUsage(rec) {
+function appendUsage(rec, date = currentDate) {
   try {
     fs.mkdirSync(paths.usageDir(), { recursive: true });
-    fs.appendFileSync(paths.usageLogPath(currentDate), JSON.stringify(rec) + '\n');
+    fs.appendFileSync(paths.usageLogPath(date), JSON.stringify(rec) + '\n');
+    if (date !== currentDate) rollupCache.clear(); // a past day's data changed -> stale cache
   } catch (e) {
     log('usage append failed ' + e);
   }
@@ -682,22 +888,30 @@ function buildStatePayload() {
 
 function getRollup(date) {
   if (date === currentDate) return todayRollup;
-  try {
-    return JSON.parse(fs.readFileSync(paths.rollupPath(date), 'utf8'));
-  } catch (_e) {
-    return null;
-  }
+  // Memoize the derive-from-log for past days — they change only via rare backfill
+  // or day-rollover, both of which clear this cache — so History stays a fast
+  // O(days) read instead of re-parsing every day's usage log on each request.
+  let r = rollupCache.get(date);
+  if (!r) rollupCache.set(date, (r = deriveRollupFromUsage(date)));
+  return r;
 }
 
 function listRollupDates() {
-  let files = [];
-  try {
-    files = fs.readdirSync(paths.rollupsDir());
-  } catch (_e) {
-    files = [];
+  const set = new Set([currentDate]);
+  // A day counts if it has a persisted rollup file OR a usage log — the latter
+  // covers a past day that only ever received historical backfill.
+  for (const dir of [paths.rollupsDir(), paths.usageDir()]) {
+    let files = [];
+    try {
+      files = fs.readdirSync(dir);
+    } catch (_e) {
+      files = [];
+    }
+    for (const f of files) {
+      const m = f.match(/^(\d{4}-\d{2}-\d{2})\.(?:json|jsonl)$/);
+      if (m) set.add(m[1]);
+    }
   }
-  const set = new Set(files.filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5)));
-  set.add(currentDate);
   return [...set].sort();
 }
 
@@ -917,6 +1131,38 @@ function handleInternalEvent(req, res) {
   });
 }
 
+// Historical backfill trigger. Body: { all: true } for every repo, or { cwd }
+// to scope to the repo containing that path (default is the caller's repo).
+function handleBackfill(req, res) {
+  readBody(req, (raw) => {
+    let body = {};
+    try {
+      body = raw ? JSON.parse(raw) : {};
+    } catch (_e) {
+      body = {};
+    }
+    let filterRepoRoot = null;
+    if (body.all === true) {
+      filterRepoRoot = null; // explicit: every repo
+    } else if (typeof body.cwd === 'string' && body.cwd.trim()) {
+      filterRepoRoot = repoLib.resolveRepo(body.cwd).repo_root;
+    } else {
+      // Neither an explicit all nor a usable cwd — refuse rather than silently
+      // backfilling every repo (e.g. when an empty ${CLAUDE_PROJECT_DIR} expands to "").
+      return json(res, { ok: false, error: 'backfill requires {"cwd":"<path>"} for one repo or {"all":true} for everything' }, 400);
+    }
+    let summary;
+    try {
+      summary = backfillTranscripts(filterRepoRoot);
+    } catch (e) {
+      log('backfill failed ' + ((e && e.stack) || e));
+      return json(res, { ok: false, error: String((e && e.message) || e) }, 500);
+    }
+    markDirty(); // surface any today-updates and let open dashboards refresh
+    json(res, { ok: true, summary });
+  });
+}
+
 function handleRequest(req, res) {
   try {
     const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
@@ -948,6 +1194,7 @@ function handleRequest(req, res) {
     if (req.method === 'GET' && pathname === '/api/config') return json(res, cfg);
     if (req.method === 'PUT' && pathname === '/api/config') return handlePutConfig(req, res);
     if (req.method === 'POST' && pathname === '/internal/event') return handleInternalEvent(req, res);
+    if (req.method === 'POST' && pathname === '/internal/backfill') return handleBackfill(req, res);
 
     res.writeHead(404);
     res.end('not found');
@@ -999,6 +1246,8 @@ function startServer(cb) {
 // ---- persistence ------------------------------------------------------------
 
 function persistRollup(date) {
+  // Only the open day is materialized to disk (as a fast-start cache); past days
+  // are recomputed from their usage logs on demand, never persisted incrementally.
   const rollup = date === currentDate ? todayRollup : null;
   if (!rollup) return;
   try {
@@ -1200,10 +1449,9 @@ function main() {
     if (state.sessions[sid].status === 'ended') delete state.sessions[sid];
   }
 
-  // Reconcile token accounting for sessions still open across this restart: seed
-  // the already-counted message ids from history, then back-fill any turns that
-  // completed while the daemon was down. Both are idempotent (message-id keyed).
-  seedSeenIdsHistory();
+  // Back-fill any turns that completed while the daemon was down, for sessions
+  // still open across this restart. catchUpIngest seeds each session's counted-id
+  // set from the durable usage logs first, so this is idempotent (message-id keyed).
   catchUpIngest();
 
   startServer(() => {

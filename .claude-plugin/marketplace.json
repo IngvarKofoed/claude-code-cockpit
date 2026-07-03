@@ -8,7 +8,7 @@
       "name": "cockpit",
       "source": "./",
       "description": "Live, cross-platform dashboard of all running Claude Code sessions — status, timers, and per-repo token/time/cost accounting, with optional OS notifications and sounds.",
-      "version": "0.1.0"
+      "version": "0.2.0"
     }
   ]
 }

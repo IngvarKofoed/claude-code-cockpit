@@ -9,6 +9,7 @@ const {
   createRollup,
   accumulateTurn,
   accumulateTurnByModel,
+  accumulateTokensByModel,
   accumulateSession,
 } = require('./aggregate');
 
@@ -318,6 +319,21 @@ test('accumulateTurnByModel: one turn, tokens split per model, counted once', ()
   // Each model keeps its own bucket, so cost can be priced at each model's rate.
   assert.strictEqual(repo.byModel['claude-opus-4-8'].output, 200);
   assert.strictEqual(repo.byModel['claude-haiku-4-5'].input, 10);
+});
+
+test('accumulateTokensByModel: adds tokens per model WITHOUT counting a turn', () => {
+  const r = accumulateTokensByModel(createRollup('2026-07-02'), {
+    repoRoot: '/code/acme-api',
+    repoName: 'acme-api',
+    byModel: { 'claude-opus-4-8': T({ input: 100, output: 50, cacheRead: 20 }) },
+    ts: '2026-07-02T09:00:00.000Z',
+  });
+  const repo = r.repos['/code/acme-api'];
+  assert.strictEqual(repo.prompts, 0); // NOT a turn — backfill only
+  assert.strictEqual(repo.activeMs, 0); // no duration attributed
+  assert.deepStrictEqual(repo.tokens, { input: 100, output: 50, cacheRead: 20, cacheWrite: 0 });
+  assert.strictEqual(repo.byModel['claude-opus-4-8'].input, 100);
+  assert.strictEqual(repo.lastActive, '2026-07-02T09:00:00.000Z');
 });
 
 // --- fixes locked in ---------------------------------------------------------

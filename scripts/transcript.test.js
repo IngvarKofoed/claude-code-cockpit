@@ -30,12 +30,25 @@ test('parseUsageLine: flat usage shape maps every field', () => {
   });
   assert.deepStrictEqual(out, {
     id: 'a1',
+    ts: null, // no timestamp on this line
     model: 'claude-sonnet-5',
     input: 10,
     output: 20,
     cacheRead: 3,
     cacheWrite: 5,
   });
+});
+
+test('parseUsageLine: extracts per-message timestamp (top-level and nested)', () => {
+  assert.strictEqual(
+    parseUsageLine({ timestamp: '2026-07-02T10:00:00.000Z', usage: { input_tokens: 1 } }).ts,
+    '2026-07-02T10:00:00.000Z',
+  );
+  // Nested message.timestamp is honored when there is no top-level one.
+  assert.strictEqual(
+    parseUsageLine({ message: { timestamp: '2026-07-03T05:00:00.000Z', usage: { input_tokens: 1 } } }).ts,
+    '2026-07-03T05:00:00.000Z',
+  );
 });
 
 test('parseUsageLine: nested message.usage shape', () => {
@@ -72,6 +85,7 @@ test('parseUsageLine: missing token fields default to 0, missing model -> null',
   const out = parseUsageLine({ uuid: 'x', usage: { input_tokens: 7 } });
   assert.deepStrictEqual(out, {
     id: 'x',
+    ts: null,
     model: null,
     input: 7,
     output: 0,
@@ -109,6 +123,20 @@ test('readUsage: parses mixed transcript, skipping malformed and no-usage lines'
   assert.strictEqual(r.byModel['claude-sonnet-5'].input, 100);
   assert.strictEqual(r.byModel['claude-sonnet-5'].cacheWrite, 10);
   assert.strictEqual(r.byModel['claude-opus-4-8'].input, 200);
+});
+
+test('readUsage: captures the first cwd seen (for repo attribution in backfill)', () => {
+  const file = writeFixture([
+    JSON.stringify({ type: 'summary' }), // no cwd on this line
+    JSON.stringify({ cwd: '/Users/me/code/acme-api', message: { id: 'a', usage: { input_tokens: 1 } } }),
+    JSON.stringify({ cwd: '/Users/me/code/OTHER', message: { id: 'b', usage: { input_tokens: 1 } } }),
+  ]);
+  assert.strictEqual(readUsage(file).cwd, '/Users/me/code/acme-api'); // first one wins
+});
+
+test('readUsage: cwd is null when no entry carries one', () => {
+  const file = writeFixture([JSON.stringify({ uuid: 'x', usage: { input_tokens: 1 } })]);
+  assert.strictEqual(readUsage(file).cwd, null);
 });
 
 test('readUsage: duplicate message id counted once', () => {

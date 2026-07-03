@@ -37,9 +37,13 @@ function parseUsageLine(obj) {
   const model = obj.model || (msg && msg.model) || null;
   // id fallback chain (synthetic index-based id is applied by readUsage).
   const id = obj.uuid || (msg && msg.id) || obj.requestId || null;
+  // Per-message wall-clock time, so the daemon can attribute a back-read turn's
+  // tokens to the day they were actually spent (not the ingest time). May be null.
+  const ts = obj.timestamp || (msg && msg.timestamp) || obj.ts || null;
 
   return {
     id,
+    ts,
     model,
     input: num(usage.input_tokens),
     output: num(usage.output_tokens),
@@ -54,7 +58,10 @@ function parseUsageLine(obj) {
 // plus per-model and grand totals. `ok` is false only when the file is
 // unreadable or empty — the daemon then marks tokens unavailable.
 function readUsage(transcriptPath) {
-  const result = { messages: [], byModel: {}, totals: emptyTokens(), ok: false };
+  // `cwd` is the session's working directory, captured from the first entry that
+  // carries it — used by backfill to resolve which repo a whole transcript belongs
+  // to (transcript filenames only carry the session id, not the cwd).
+  const result = { messages: [], byModel: {}, totals: emptyTokens(), cwd: null, ok: false };
 
   let content;
   try {
@@ -77,6 +84,8 @@ function readUsage(transcriptPath) {
     } catch (_err) {
       continue; // skip a malformed / torn line
     }
+
+    if (result.cwd == null && typeof obj.cwd === 'string' && obj.cwd) result.cwd = obj.cwd;
 
     const parsed = parseUsageLine(obj);
     if (!parsed) continue; // no usage on this line

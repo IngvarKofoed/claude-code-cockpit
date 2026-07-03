@@ -263,6 +263,19 @@ function accumulateTurn(rollup, turn) {
   return rollup;
 }
 
+// Fold a per-model token map into a repo's totals and per-model buckets. Shared by
+// the turn and backfill accumulators so token attribution stays identical on both
+// paths (a change here — a new token field, an 'unknown' rule — applies to both).
+function addByModel(repo, byModel) {
+  const bm = byModel && typeof byModel === 'object' ? byModel : {};
+  for (const model of Object.keys(bm)) {
+    const key = model || 'unknown';
+    addTokens(repo.tokens, bm[model]);
+    const bucket = repo.byModel[key] || (repo.byModel[key] = emptyTokens());
+    addTokens(bucket, bm[model]);
+  }
+}
+
 // Like accumulateTurn but attributes a turn's tokens PER MODEL — one turn can span
 // models (e.g. a compaction/summary message in a cheaper model, or a mid-session
 // model switch). Counts the turn once (prompts += 1) while filing each model's
@@ -273,13 +286,19 @@ function accumulateTurnByModel(rollup, turn) {
   const repo = ensureRepo(rollup, turn.repoRoot, turn.repoName);
   repo.activeMs += num(turn.durationMs);
   repo.prompts += 1;
-  const byModel = turn.byModel && typeof turn.byModel === 'object' ? turn.byModel : {};
-  for (const model of Object.keys(byModel)) {
-    const key = model || 'unknown';
-    addTokens(repo.tokens, byModel[model]);
-    const bucket = repo.byModel[key] || (repo.byModel[key] = emptyTokens());
-    addTokens(bucket, byModel[model]);
-  }
+  addByModel(repo, turn.byModel);
+  bumpLastActive(repo, turn.ts);
+  return rollup;
+}
+
+// Add a turn's per-model tokens to a rollup WITHOUT counting it as a turn (no
+// prompts++, no activeMs). Used for historical BACKFILL from a transcript: the
+// tokens belong to a past day, but that day's turn boundaries/durations aren't
+// known when back-reading, so only per-day token/cost totals are attributed.
+function accumulateTokensByModel(rollup, turn) {
+  if (!rollup || !turn || turn.repoRoot == null) return rollup;
+  const repo = ensureRepo(rollup, turn.repoRoot, turn.repoName);
+  addByModel(repo, turn.byModel);
   bumpLastActive(repo, turn.ts);
   return rollup;
 }
@@ -300,5 +319,6 @@ module.exports = {
   createRollup,
   accumulateTurn,
   accumulateTurnByModel,
+  accumulateTokensByModel,
   accumulateSession,
 };
