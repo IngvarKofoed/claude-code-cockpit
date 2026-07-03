@@ -414,8 +414,9 @@ body {
 }
 
 .card__stats {
-  display: flex;
-  gap: 18px;
+  display: grid;
+  column-gap: 18px;
+  row-gap: 5px;
   padding-top: 2px;
   border-top: 1px solid var(--border);
   margin-top: auto;
@@ -431,6 +432,22 @@ body {
   font-family: var(--font-mono);
   font-size: 14px;
   font-variant-numeric: tabular-nums;
+}
+
+/* Repo-wide all-time total: a second grid row under the per-session stats, its
+   cells aligned to the same columns (label under Prompts, tokens/cost under theirs)
+   so the two rows read straight down. Recessive/muted vs. the session values. */
+.card__stats-div {
+  grid-column: 1 / -1;
+  border-top: 1px dashed var(--border);
+  margin: 1px 0;
+}
+.card__at-v {
+  align-self: center;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-muted);
 }
 
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }

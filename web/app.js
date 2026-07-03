@@ -315,6 +315,20 @@ function cardHTML(s) {
     stats.push(`<div class="stat"><span class="stat__k">Cost</span><span class="stat__v">${esc(fmtCost(s.cost))}</span></div>`);
   stats.push(`<div class="stat"><span class="stat__k">Age</span><span class="stat__v" data-timer="age" data-start="${startMs}">—</span></div>`);
 
+  // Repo-wide cumulative total (all sessions, all time), rendered as a second row
+  // that shares the stat grid's columns — prompts/tokens/cost each land under the
+  // matching per-session value so the two rows compare straight down. It carries no
+  // text label: the muted colour + the dashed divider mark it as the repo total; the
+  // tooltip explains it. Cells auto-flow in column order (Age column left empty).
+  const rt = App.state && App.state.repoTotals && s.repoRoot ? App.state.repoTotals[s.repoRoot] : null;
+  const repoTok = rt && rt.tokens != null ? sumTokens(rt.tokens) : null;
+  const atTitle = "This repo's cumulative total across every session in retained history (all time, up to the retention limit), including backfilled sessions. Prompts count live turns only.";
+  const rtCells = [
+    `<span class="card__at-v" title="${atTitle}">${rt && rt.prompts != null ? num(rt.prompts) : "—"}</span>`,
+    `<span class="card__at-v" title="${atTitle}">${repoTok == null ? "—" : esc(fmtTokens(repoTok))}</span>`,
+  ];
+  if (costEnabled()) rtCells.push(`<span class="card__at-v" title="${atTitle}">${esc(fmtCost(rt ? rt.cost : null))}</span>`);
+
   return `
   <article class="card ${waiting ? "card--waiting" : ""}" data-status="${esc(status)}">
     <div class="card__rail"></div>
@@ -333,7 +347,11 @@ function cardHTML(s) {
         <span class="telemetry__label">${status === "running" ? "elapsed" : "prompt"}</span>
       </div>
       ${chips.length ? `<div class="chips">${chips.join("")}</div>` : ""}
-      <div class="card__stats">${stats.join("")}</div>
+      <div class="card__stats" style="grid-template-columns: repeat(${stats.length}, minmax(0, 1fr))">
+        ${stats.join("")}
+        <div class="card__stats-div"></div>
+        ${rtCells.join("")}
+      </div>
     </div>
   </article>`;
 }

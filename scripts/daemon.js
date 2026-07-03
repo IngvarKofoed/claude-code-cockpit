@@ -70,6 +70,7 @@ const ingesting = new Set(); // session_ids with an in-flight ingestTurn retry c
 const pendingIngest = new Map(); // session_id -> { stopEvent, promptStart } queued mid-ingest
 const primedSeen = new Set(); // session_ids whose seenIds have been seeded from the usage logs
 const rollupCache = new Map(); // dateStr -> memoized derived past-day rollup (fast History reads)
+let repoTotalsCache = null; // memoized all-time per-repo totals for /api/state; invalidated on any token/rollup/cost-config change (see repoTotalsAllTime)
 
 let replaying = false; // true while replaying the log on boot: suppress side effects
 
@@ -533,6 +534,7 @@ function rolloverDay(today) {
   offsets[currentDate] = 0;
   todayRollup = aggregate.createRollup(currentDate);
   rollupCache.clear(); // yesterday is now a past day — re-derive it on demand
+  repoTotalsCache = null;
 }
 
 // Read and apply any complete lines appended to a given day's event log since its
@@ -786,6 +788,7 @@ function appendUsage(rec, date = currentDate) {
   try {
     fs.mkdirSync(paths.usageDir(), { recursive: true });
     fs.appendFileSync(paths.usageLogPath(date), JSON.stringify(rec) + '\n');
+    repoTotalsCache = null; // tokens changed -> all-time totals are stale
     if (date !== currentDate) rollupCache.clear(); // a past day's data changed -> stale cache
   } catch (e) {
     log('usage append failed ' + e);
@@ -873,12 +876,38 @@ function reposSummary() {
   return out;
 }
 
+// Per-repo all-time totals (tokens + estimated cost) keyed by repoRoot, so a Live
+// card can show its repo's cumulative total beside the session's own. The two are
+// different scopes — one session vs. every session + backfill for the repo — and are
+// easy to mistake for a bug when they differ. Bounded by retained history
+// (retentionDays), like every other range view.
+// Memoized: buildStatePayload runs on the SSE broadcast hot path, so this must NOT
+// re-scan the log dirs (listRollupDates) or re-aggregate every frame. The cache is
+// invalidated wherever tokens, rollups, or cost config change.
+function repoTotalsAllTime() {
+  if (repoTotalsCache) return repoTotalsCache;
+  const agg = aggregateReposAcrossDates(listRollupDates());
+  const out = {};
+  for (const root of Object.keys(agg)) {
+    out[root] = {
+      // prompts count live turns only (backfill can't reconstruct turn boundaries),
+      // so it under-represents repos with imported history — unlike tokens/cost.
+      prompts: agg[root].prompts,
+      tokens: agg[root].tokens,
+      cost: cfg.cost.enabled ? pricing.estimateCost(agg[root].byModel, cfg.cost.rates).total : null,
+    };
+  }
+  repoTotalsCache = out;
+  return out;
+}
+
 function buildStatePayload() {
   const now = Date.now();
   return {
     now,
     sessions: aggregate.snapshot(state, now).sessions,
     repos: reposSummary(),
+    repoTotals: repoTotalsAllTime(),
     config: cfg,
     daemon: { version: VERSION, pluginPath: PLUGIN_PATH, port: PORT },
   };
@@ -941,12 +970,34 @@ function dayCost(rollup) {
   return pricing.estimateCost(combined, cfg.cost.rates).total;
 }
 
+// Aggregate per-repo tokens (total + per-model) and active time across a set of days,
+// keyed by repoRoot. Shared by the History range view and the Live cards' all-time
+// totals so the two can't diverge. getRollup memoizes past days, so this is O(days).
+function aggregateReposAcrossDates(dates) {
+  const agg = {}; // repoRoot -> { repoRoot, repoName, prompts, activeMs, tokens, byModel }
+  for (const date of dates) {
+    const rollup = getRollup(date);
+    if (!rollup || !rollup.repos) continue;
+    for (const root of Object.keys(rollup.repos)) {
+      const rr = rollup.repos[root];
+      const a = agg[root] || (agg[root] = { repoRoot: root, repoName: rr.repoName, prompts: 0, activeMs: 0, tokens: emptyTokens(), byModel: {} });
+      if (rr.repoName) a.repoName = rr.repoName;
+      a.prompts += num(rr.prompts);
+      a.activeMs += num(rr.activeMs);
+      addTokens(a.tokens, rr.tokens);
+      for (const m of Object.keys(rr.byModel || {})) {
+        addTokens(a.byModel[m] || (a.byModel[m] = emptyTokens()), rr.byModel[m]);
+      }
+    }
+  }
+  return agg;
+}
+
 function buildHistory(rangeRaw) {
   const range = ['today', '7d', '30d', 'all'].includes(rangeRaw) ? rangeRaw : '7d';
   const dates = datesInRange(range);
 
   const perDay = [];
-  const repoAgg = {}; // repoRoot -> aggregate across the range
   for (const date of dates) {
     const rollup = getRollup(date);
     const tokens = emptyTokens();
@@ -956,18 +1007,12 @@ function buildHistory(rangeRaw) {
         const rr = rollup.repos[root];
         addTokens(tokens, rr.tokens);
         activeMs += num(rr.activeMs);
-        const a = repoAgg[root] || (repoAgg[root] = { repoRoot: root, repoName: rr.repoName, activeMs: 0, tokens: emptyTokens(), byModel: {} });
-        a.activeMs += num(rr.activeMs);
-        if (rr.repoName) a.repoName = rr.repoName;
-        addTokens(a.tokens, rr.tokens);
-        for (const m of Object.keys(rr.byModel || {})) {
-          const bm = a.byModel[m] || (a.byModel[m] = emptyTokens());
-          addTokens(bm, rr.byModel[m]);
-        }
       }
     }
     perDay.push({ date, tokens, activeMs, cost: dayCost(rollup) });
   }
+
+  const repoAgg = aggregateReposAcrossDates(dates);
 
   // Hour-of-day histogram from the per-turn usage log (rollups have no hour granularity).
   const byHour = Array.from({ length: 24 }, (_, hour) => ({ hour, activeMs: 0, tokens: 0 }));
@@ -1114,6 +1159,7 @@ function handlePutConfig(req, res) {
       return;
     }
     cfg = result.config; // hot-reload in-memory config
+    repoTotalsCache = null; // rates / currency / cost.enabled may have changed
     broadcastConfig(); // every open dashboard reflects the change
     json(res, { ok: true, config: cfg });
   });
@@ -1370,6 +1416,7 @@ function pruneOld() {
   if (!(cfg.retentionDays > 0)) return; // 0 / unset = keep forever; never wipe history
   const cutoff = Date.now() - cfg.retentionDays * 86400000;
   const dirs = [paths.eventsDir(), paths.usageDir(), paths.rollupsDir()];
+  let pruned = false;
   for (const dir of dirs) {
     let files;
     try {
@@ -1385,11 +1432,18 @@ function pruneOld() {
       if (Number.isFinite(t) && t < cutoff) {
         try {
           fs.unlinkSync(path.join(dir, f));
+          pruned = true;
         } catch (_e) {
           /* best effort */
         }
       }
     }
+  }
+  if (pruned) {
+    // A pruned past day drops out of every range aggregate — clear the memoized
+    // rollups and the all-time totals so they no longer count the deleted days.
+    rollupCache.clear();
+    repoTotalsCache = null;
   }
 }
 
