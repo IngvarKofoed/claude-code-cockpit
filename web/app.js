@@ -265,7 +265,6 @@ const COPY_SVG =
 const STATUS_LABEL = {
   running: "Running",
   waiting: "Waiting",
-  "idle-waiting": "Idle waiting",
   idle: "Idle",
   error: "Error",
   ended: "Ended",
@@ -277,8 +276,6 @@ function activityText(s) {
       return s.currentActivity ? "Running " + s.currentActivity : "Working…";
     case "waiting":
       return "Waiting for your input";
-    case "idle-waiting":
-      return "Idle — awaiting input";
     case "error":
       return "Turn failed" + (s.errorReason ? " · " + s.errorReason : "");
     case "ended":
@@ -313,6 +310,10 @@ function cardHTML(s) {
   ];
   if (costEnabled())
     stats.push(`<div class="stat"><span class="stat__k">Cost</span><span class="stat__v">${esc(fmtCost(s.cost))}</span></div>`);
+  // Active = this session's cumulative working time (sum of closed turns), distinct
+  // from Age (wall-clock since the session started). Uses fmtDuration to match the
+  // Per-repo table and History, which render the same active-time metric.
+  stats.push(`<div class="stat"><span class="stat__k">Active</span><span class="stat__v">${esc(fmtDuration(num(s.activeMs)))}</span></div>`);
   stats.push(`<div class="stat"><span class="stat__k">Age</span><span class="stat__v" data-timer="age" data-start="${startMs}">—</span></div>`);
 
   // Repo-wide cumulative total (all sessions, all time), rendered as a second row
@@ -322,12 +323,16 @@ function cardHTML(s) {
   // tooltip explains it. Cells auto-flow in column order (Age column left empty).
   const rt = App.state && App.state.repoTotals && s.repoRoot ? App.state.repoTotals[s.repoRoot] : null;
   const repoTok = rt && rt.tokens != null ? sumTokens(rt.tokens) : null;
-  const atTitle = "This repo's cumulative total across every session in retained history (all time, up to the retention limit), including backfilled sessions. Prompts count live turns only.";
+  const atTitle = "This repo's cumulative total across every session in retained history (all time, up to the retention limit), including backfilled sessions. Prompts and active time count live turns only.";
   const rtCells = [
     `<span class="card__at-v" title="${atTitle}">${rt && rt.prompts != null ? num(rt.prompts) : "—"}</span>`,
     `<span class="card__at-v" title="${atTitle}">${repoTok == null ? "—" : esc(fmtTokens(repoTok))}</span>`,
   ];
   if (costEnabled()) rtCells.push(`<span class="card__at-v" title="${atTitle}">${esc(fmtCost(rt ? rt.cost : null))}</span>`);
+  // Repo all-time active time — aligns under the per-session Active column (pushed
+  // after cost so column order matches the stats row in both cost/no-cost layouts).
+  // The Age column is intentionally left with no cumulative cell.
+  rtCells.push(`<span class="card__at-v" title="${atTitle}">${rt && rt.activeMs != null ? esc(fmtDuration(num(rt.activeMs))) : "—"}</span>`);
 
   return `
   <article class="card ${waiting ? "card--waiting" : ""}" data-status="${esc(status)}">
@@ -362,7 +367,7 @@ function tile(label, value, alert) {
 
 function renderLiveRibbon(sessions) {
   const running = sessions.filter((s) => s.status === "running").length;
-  const waiting = sessions.filter((s) => s.status === "waiting" || s.status === "idle-waiting").length;
+  const waiting = sessions.filter((s) => s.status === "waiting").length;
   const repos = (App.state && App.state.repos) || [];
   let tok = 0;
   let cost = 0;

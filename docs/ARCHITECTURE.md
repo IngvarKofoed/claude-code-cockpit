@@ -117,7 +117,7 @@ Every command is `node "${CLAUDE_PLUGIN_ROOT}/scripts/emit.js"`, except `Session
 | `UserPromptSubmit` | A prompt begins (has `prompt_id`) | Status → `running`; start prompt timer |
 | `PreToolUse` | Claude is about to use a tool (`tool_name`) | Live activity ("running Bash", "editing…") |
 | `PostToolUse` | Tool finished | Clear/advance activity; refresh `lastActivityAt` |
-| `Notification` | Claude needs input (`notification_type`) | Status → `waiting` (permission) or idle-waiting |
+| `Notification` | Claude needs input (`notification_type`) | Permission prompt → status `waiting`. `idle_prompt` normally leaves status unchanged (turn already `idle` from `Stop`), settling a running session to idle only when nothing's in flight |
 | `Stop` | Turn finished (`stop_reason`) | Close prompt; add duration + tokens to repo rollup |
 | `StopFailure` | Turn ended on an API error | Status → `error`; optional notification |
 | `SubagentStart` / `SubagentStop` | Subagent lifecycle (`agent_type`) | Subagent counters / labels |
@@ -196,7 +196,10 @@ UserPromptSubmit(prompt_id) → status: running; currentPrompt = { promptId, sta
 PreToolUse(tool_name)       → status: running; currentActivity = tool_name; lastActivityAt = now
 PostToolUse                 → advance/clear currentActivity; lastActivityAt = now      (debounced)
 Notification(permission…)   → status: waiting          (blocked on the user)
-Notification(idle…)         → status: idle-waiting
+Notification(idle_prompt)   → "done, awaiting next prompt": normally a no-op (already idle from Stop),
+                              but settles a still-running session to idle when nothing is in flight
+                              (guards a lost Stop; skipped while a subagent/tool is active so a
+                              mid-turn idle_prompt can't falsely idle a working session)
 Stop(stop_reason)           → close currentPrompt; duration = now − promptStartedAt;
                               add duration + token delta to repo rollup; status: idle;
                               refresh tokens; evaluate notifications
@@ -215,7 +218,7 @@ The daemon pushes **state transitions with server timestamps**; the browser comp
 
 ## Token usage ingestion (primary design risk)
 
-**Source:** the session transcript JSONL at `transcript_path`. Assistant messages carry a `usage` object (`input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`) and a per-message `model`.
+**Source:** the session transcript JSONL at `transcript_path`. Assistant messages carry a `usage` object (`input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`) and a per-message `model`. That per-message `model` is also the daemon's fallback for a session's *displayed* model: `SessionStart` is the only hook that carries `model` and it may omit it (so a resumed session, or one first seen after a snapshot loss, would otherwise show no model), so on each usage read the daemon backfills `session.model` from the transcript's most-recent assistant message.
 
 > **Risk — transcript schema is not a stable contract.** Claude Code's own documentation states the transcript entry format is *internal and changes between versions*, and that mid-turn writes may not be flushed. The exact `usage` field names were confirmed by convention but **not** guaranteed by docs. Direct parsing can therefore break on a Claude Code upgrade.
 
@@ -257,7 +260,7 @@ Static files served by the daemon. The SPA loads an initial snapshot from `GET /
 
 **Views:**
 
-- **Live:** a card grid, one card per active session — repo name, branch, path (click-to-copy), status badge, current activity, the ticking prompt timer, session age, tokens so far, and `permission_mode` / `effort` chips. Each card also shows the **repo's all-time cumulative total** (prompts + tokens + estimated cost) as a muted second row aligned under the per-session stat columns, distinct from the per-session numbers above — the daemon supplies it as a `repoTotals` map (keyed by `repoRoot`) on `/api/state`. `waiting` sessions sort to the top and are highlighted.
+- **Live:** a card grid, one card per active session — repo name, branch, path (click-to-copy), status badge, current activity, the ticking prompt timer, session age, tokens so far, the session's **active time** (cumulative wall-clock of its closed turns, distinct from wall-clock age), and `permission_mode` / `effort` chips. Each card also shows the **repo's all-time cumulative total** (prompts + tokens + active time + estimated cost) as a muted second row aligned under the per-session stat columns, distinct from the per-session numbers above — the daemon supplies it as a `repoTotals` map (keyed by `repoRoot`) on `/api/state`. `waiting` sessions sort to the top and are highlighted.
 - **Per-repo:** a sortable table — repo, active time, prompts, sessions, tokens (in / out / cache), estimated $, last active — with a range filter (today / 7d / 30d / all).
 - **History:** inline-SVG charts — tokens and time per day, activity by hour, top repos — served from the pre-bucketed daily rollups via `GET /api/history?range=…` (no full-log scan).
 - **Settings:** the **single place all configuration is edited** — sound selection, the OS-notification master toggle, OS vs. in-browser sound toggles, per-event notification toggles, the activity-detail level (`activityDetail`: tool name only vs. arguments), the long-running threshold, the pricing table, and retention. Editing a control issues `PUT /api/config`; the daemon validates it, persists it via `config.js`, hot-reloads its in-memory config, and broadcasts the new config over SSE so every open dashboard reflects the change immediately.

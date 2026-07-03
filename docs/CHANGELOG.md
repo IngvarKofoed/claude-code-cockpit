@@ -71,3 +71,24 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
    Known limits: all-time PROMPTS count live turns only — backfill imports tokens/cost but no turn count, so
    it under-represents repos with imported history; and cost uses `estimateCost().total` (like every other
    cost figure), silently omitting unpriced/unknown models — uniform partial-cost disclosure is deferred.
+
+10. Dropped the `idle-waiting` status ("Idle — awaiting input"); a finished turn now stays plain `idle`,
+    restoring CONCEPT's four-status model. It flagged Claude Code's `idle_prompt` ("done, awaiting next
+    prompt"), which read as needs-attention on a done turn — and also fires mid-turn while a subagent works,
+    so it's no reliable "awaiting you" signal. Now only a permission `Notification` → `waiting`; `idle_prompt`
+    settles a running session to idle only when nothing's in flight (guards a lost Stop), never as "waiting".
+
+11. Live cards now show "Active" — a session's cumulative working time (Σ closed-turn durations,
+    `session.activeMs`, added on Stop/StopFailure), distinct from the wall-clock Age beside it. The muted
+    repo-total row gains the repo's all-time active time too, and cards widened to fit the extra column.
+    Like prompts, activeMs counts live turns only — backfill can't reconstruct turn boundaries — so it
+    under-represents repos with imported history.
+
+12. The model chip is now reliable. `session.model` is backfilled from the transcript on each usage read,
+    picking the DOMINANT model by output tokens. Before, model came only from `SessionStart` — the sole hook
+    that carries it, and it may omit it — so resumed / post-snapshot-loss sessions showed no model. Dominant-
+    by-output (not the most-recent message) avoids mislabeling a session with a transient compaction/sub-model.
+
+13. Fixed a runaway prompt timer in the `idle_prompt` lost-Stop guard (entry 10): it flipped status to idle
+    but never cleared `currentPrompt`, so the browser ticked the elapsed timer forever under an Idle badge.
+    It now actually closes the turn (clears currentPrompt + records the duration), matching the guard's intent.

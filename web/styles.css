@@ -23,7 +23,6 @@
   --st-running: #33c17a;
   --st-waiting: #f5b120;
   --st-idle: #6b7688;
-  --st-idle-waiting: #c39a52;
   --st-error: #e2564f;
   --st-ended: #566173;
 
@@ -254,7 +253,7 @@ body {
 
 .cards {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
   gap: 16px;
 }
 
@@ -278,7 +277,6 @@ body {
 }
 .card[data-status="running"] .card__rail { background: var(--st-running); }
 .card[data-status="waiting"] .card__rail { background: var(--st-waiting); }
-.card[data-status="idle-waiting"] .card__rail { background: var(--st-idle-waiting); }
 .card[data-status="error"] .card__rail { background: var(--st-error); }
 .card[data-status="ended"] .card__rail { background: var(--st-ended); }
 
@@ -332,7 +330,6 @@ body {
 }
 .card[data-status="running"] .badge { color: var(--st-running); background: rgba(51, 193, 122, 0.12); }
 .card[data-status="waiting"] .badge { color: var(--st-waiting); background: rgba(245, 177, 32, 0.14); }
-.card[data-status="idle-waiting"] .badge { color: var(--st-idle-waiting); }
 .card[data-status="error"] .badge { color: var(--st-error); background: rgba(226, 86, 79, 0.14); }
 
 .card__where {
@@ -415,23 +412,24 @@ body {
 
 .card__stats {
   display: grid;
-  column-gap: 18px;
+  column-gap: 12px;
   row-gap: 5px;
   padding-top: 2px;
   border-top: 1px solid var(--border);
   margin-top: auto;
 }
-.stat { display: flex; flex-direction: column; }
+.stat { display: flex; flex-direction: column; min-width: 0; }
 .stat__k {
-  font-size: 10.5px;
+  font-size: 10px;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.04em;
   color: var(--ink-muted);
 }
 .stat__v {
   font-family: var(--font-mono);
-  font-size: 14px;
+  font-size: 13px;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 /* Repo-wide all-time total: a second grid row under the per-session stats, its

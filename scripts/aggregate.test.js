@@ -102,9 +102,60 @@ test('Notification permission_prompt -> waiting', () => {
   assert.strictEqual(state.sessions.s1.status, 'waiting');
 });
 
-test('Notification idle_prompt -> idle-waiting', () => {
-  const state = run([ev('SessionStart'), ev('Notification', { notification_type: 'idle_prompt' })]);
-  assert.strictEqual(state.sessions.s1.status, 'idle-waiting');
+test('Notification idle_prompt after Stop leaves status idle (not a distinct state)', () => {
+  // idle_prompt means "done, awaiting your next prompt"; the session is already
+  // idle from its Stop, so it stays plain idle rather than "awaiting input".
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { prompt_id: 'p1' }),
+    ev('Stop'),
+    ev('Notification', { notification_type: 'idle_prompt' }),
+  ]);
+  assert.strictEqual(state.sessions.s1.status, 'idle');
+});
+
+test('Notification idle_prompt mid-turn does not clobber running (subagent active)', () => {
+  // idle_prompt can fire while a subagent works and the main loop is quiet;
+  // with a subagent in flight it must not flip the session to idle.
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { prompt_id: 'p1' }),
+    ev('SubagentStart', { agent_type: 'Explore' }),
+    ev('PreToolUse', { tool_name: 'Bash' }),
+    ev('PostToolUse'), // clears currentActivity but subagent still active
+    ev('Notification', { notification_type: 'idle_prompt' }),
+  ]);
+  assert.strictEqual(state.sessions.s1.status, 'running');
+});
+
+test('Notification idle_prompt does not clobber running while a tool is mid-call', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { prompt_id: 'p1' }),
+    ev('PreToolUse', { tool_name: 'Bash' }), // in flight, no PostToolUse yet
+    ev('Notification', { notification_type: 'idle_prompt' }),
+  ]);
+  assert.strictEqual(state.sessions.s1.status, 'running');
+});
+
+test('Notification idle_prompt settles a running session to idle when nothing is in flight (lost Stop)', () => {
+  // If a turn's Stop is somehow missed, idle_prompt with no work in flight is the
+  // done-signal that CLOSES the turn: it must not only flip status but clear
+  // currentPrompt (else the browser ticks the prompt timer forever) and record
+  // the turn's duration.
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:01.000Z', prompt_id: 'p1' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:02.000Z', tool_name: 'Bash' }),
+    ev('PostToolUse', { ts: '2026-07-02T10:00:03.000Z' }), // tool done, currentActivity cleared, still 'running'
+    ev('Notification', { ts: '2026-07-02T10:00:05.000Z', notification_type: 'idle_prompt' }),
+  ]);
+  const s = state.sessions.s1;
+  assert.strictEqual(s.status, 'idle');
+  assert.strictEqual(s.currentPrompt, null); // turn closed — no runaway timer
+  assert.strictEqual(s.activeMs, 4000); // duration recorded (10:00:01 -> 10:00:05)
+  const card = snapshot(state, 0).sessions.find((x) => x.sessionId === 's1');
+  assert.strictEqual(card.currentPromptStartedAt, null);
 });
 
 test('Notification of an unrelated type leaves status unchanged', () => {
@@ -130,6 +181,39 @@ test('StopFailure -> error with errorReason; clears the running prompt', () => {
   assert.strictEqual(state.sessions.s1.currentPrompt, null);
   const card = snapshot(state, 0).sessions.find((s) => s.sessionId === 's1');
   assert.strictEqual(card.currentPromptStartedAt, null);
+});
+
+// --- per-session active time -------------------------------------------------
+
+test('activeMs accumulates each closed turn (Stop and StopFailure)', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:01.000Z', prompt_id: 'p1' }),
+    ev('Stop', { ts: '2026-07-02T10:00:04.000Z' }), // 3s turn
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:10.000Z', prompt_id: 'p2' }),
+    ev('StopFailure', { ts: '2026-07-02T10:00:12.000Z', stop_reason: 'rate_limit' }), // 2s turn
+  ]);
+  // Sums only working time (3s + 2s), not the 6s idle gap between turns.
+  assert.strictEqual(state.sessions.s1.activeMs, 5000);
+});
+
+test('activeMs ignores a Stop with no open prompt or a non-advancing clock', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('Stop', { ts: '2026-07-02T10:00:04.000Z' }), // no currentPrompt -> no-op
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:05.000Z', prompt_id: 'p1' }),
+    ev('Stop', { ts: '2026-07-02T10:00:05.000Z' }), // same instant -> 0
+  ]);
+  assert.strictEqual(state.sessions.s1.activeMs, 0);
+});
+
+test('activeMs is safe when a session lacks the field (restored from old snapshot)', () => {
+  const state = createState();
+  // Simulate a session object rebuilt from a pre-activeMs snapshot: no activeMs key.
+  state.sessions.s1 = { sessionId: 's1', status: 'running', currentPrompt: { promptId: 'p1', startedAt: '2026-07-02T10:00:00.000Z' } };
+  applyEvent(state, ev('Stop', { ts: '2026-07-02T10:00:03.000Z' }));
+  // undefined + 3000 must not poison to NaN.
+  assert.strictEqual(state.sessions.s1.activeMs, 3000);
 });
 
 test('SessionEnd -> ended with endedReason', () => {

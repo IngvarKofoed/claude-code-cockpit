@@ -47,6 +47,8 @@ function newSession(event) {
     currentPrompt: null, // { promptId, startedAt } while a turn is running
     currentActivity: null, // tool name Claude is running right now
     promptCount: 0,
+    activeMs: 0, // cumulative wall-clock of this session's closed turns
+
     subagents: { active: 0, total: 0, byType: {} },
     errorReason: null,
     endedReason: null,
@@ -74,10 +76,18 @@ function updateMeta(session, event) {
   if (event.source != null) session.source = event.source;
 }
 
-// An idle-ish notification (Claude is waiting but not blocking on a decision).
-function isIdleNotification(type) {
-  if (type === 'idle_prompt') return true;
-  return typeof type === 'string' && type.toLowerCase().includes('idle');
+// Add the just-closed turn's wall-clock duration to the session's cumulative
+// active time, using the same prompt-start→stop delta the daemon's recordTurn
+// attributes to the per-repo rollup. The two can still diverge: the rollup only
+// counts turns that produced fresh transcript usage, whereas this counts every
+// closed turn — so per-session active time can slightly exceed the repo's.
+function addTurnDuration(session, event) {
+  if (!session.currentPrompt || !session.currentPrompt.startedAt) return;
+  const a = tsMs(session.currentPrompt.startedAt);
+  const b = tsMs(event.ts);
+  // num() the prior value: a session restored from a pre-activeMs snapshot has no
+  // activeMs field, and `undefined + delta` would poison it to NaN forever.
+  if (a && b && b > a) session.activeMs = num(session.activeMs) + (b - a);
 }
 
 // Fold one event into state, mutating and returning the same object. Unknown
@@ -128,12 +138,36 @@ function applyEvent(state, event) {
       break;
 
     case 'Notification':
-      if (event.notification_type === 'permission_prompt') session.status = 'waiting';
-      else if (isIdleNotification(event.notification_type)) session.status = 'idle-waiting';
+      // Only a permission prompt genuinely blocks on the user.
+      if (event.notification_type === 'permission_prompt') {
+        session.status = 'waiting';
+      } else if (event.notification_type === 'idle_prompt') {
+        // `idle_prompt` = "Claude is done, awaiting your next prompt". On a
+        // normal turn the session is already `idle` (its Stop cleared it), so
+        // this is a no-op — we deliberately do NOT raise a distinct
+        // "awaiting input" state that reads as needs-attention on a turn that
+        // is simply done. But Claude Code also emits idle_prompt mid-turn while
+        // a subagent works and the main loop is quiet, so treat it as a
+        // done-signal only when nothing is in flight (no active subagent, no
+        // tool mid-call); that both avoids falsely idling a working session and
+        // still settles a `running` session whose Stop was somehow missed,
+        // which would otherwise tick a live timer forever.
+        const inFlight = session.subagents.active > 0 || session.currentActivity != null;
+        if (session.status === 'running' && !inFlight) {
+          // Treat this as the missed Stop: actually CLOSE the turn — clear
+          // currentPrompt (else snapshot keeps emitting currentPromptStartedAt and
+          // the browser ticks the prompt timer forever, the exact failure this
+          // guard exists to prevent) and record its duration.
+          addTurnDuration(session, event);
+          session.currentPrompt = null;
+          session.status = 'idle';
+        }
+      }
       // other types (auth_success, …) leave status unchanged
       break;
 
     case 'Stop':
+      addTurnDuration(session, event);
       session.currentPrompt = null;
       session.status = 'idle';
       break;
@@ -142,6 +176,7 @@ function applyEvent(state, event) {
       // StopFailure ends the turn (like Stop) but on an API error — clear the
       // running prompt so the dashboard stops ticking a live timer on a session
       // whose turn is already over.
+      addTurnDuration(session, event);
       session.currentPrompt = null;
       session.status = 'error';
       if (event.stop_reason != null) session.errorReason = event.stop_reason;

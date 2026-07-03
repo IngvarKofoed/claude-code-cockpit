@@ -245,7 +245,17 @@ function loadSnapshot() {
     return; // no/invalid snapshot -> cold start, fully rebuilt from logs
   }
   if (!snap || typeof snap !== 'object') return;
-  if (snap.sessions && typeof snap.sessions === 'object') state.sessions = snap.sessions;
+  if (snap.sessions && typeof snap.sessions === 'object') {
+    state.sessions = snap.sessions;
+    // Migrate the retired 'idle-waiting' status (a pre-upgrade snapshot may
+    // still carry it) to plain 'idle' so an upgraded daemon never surfaces a
+    // status the current dashboard has no label or styling for.
+    for (const sid of Object.keys(state.sessions)) {
+      if (state.sessions[sid] && state.sessions[sid].status === 'idle-waiting') {
+        state.sessions[sid].status = 'idle';
+      }
+    }
+  }
   if (snap.extra && typeof snap.extra === 'object') {
     for (const sid of Object.keys(snap.extra)) extra.set(sid, snap.extra[sid]);
   }
@@ -800,6 +810,27 @@ function updateSessionTokens(sid, usage) {
   if (!session) return;
   session.tokens = usage.totals;
   session.cost = cfg.cost.enabled ? pricing.estimateCost(usage.byModel, cfg.cost.rates).total : null;
+  // Backfill the session's displayed model from the transcript. The SessionStart
+  // hook is the ONLY event that ever carries `model`, and it may omit it (docs:
+  // optional), so a resumed session or one first seen after a snapshot loss shows
+  // no model chip. Pick the DOMINANT model by output tokens — not the most-recent
+  // message, which can be a transient compaction/summary or sub-model turn that
+  // would mislabel an Opus/Sonnet session. Only overwrite when the transcript
+  // actually names a model, never clobbering a known model with a blank.
+  const bm = usage.byModel;
+  if (bm && typeof bm === 'object') {
+    let best = null;
+    let bestOut = -1;
+    for (const m of Object.keys(bm)) {
+      if (m === 'unknown') continue;
+      const out = num(bm[m] && bm[m].output);
+      if (out > bestOut) {
+        bestOut = out;
+        best = m;
+      }
+    }
+    if (best) session.model = best;
+  }
 }
 
 // ---- notifications ----------------------------------------------------------
@@ -890,9 +921,11 @@ function repoTotalsAllTime() {
   const out = {};
   for (const root of Object.keys(agg)) {
     out[root] = {
-      // prompts count live turns only (backfill can't reconstruct turn boundaries),
-      // so it under-represents repos with imported history — unlike tokens/cost.
+      // prompts + activeMs count live turns only (backfill can't reconstruct turn
+      // boundaries), so they under-represent repos with imported history — unlike
+      // tokens/cost.
       prompts: agg[root].prompts,
+      activeMs: agg[root].activeMs,
       tokens: agg[root].tokens,
       cost: cfg.cost.enabled ? pricing.estimateCost(agg[root].byModel, cfg.cost.rates).total : null,
     };
