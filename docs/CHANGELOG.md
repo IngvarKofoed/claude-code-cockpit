@@ -154,3 +154,10 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     per-session `App.flash` = {until, cls} window (not a one-shot set) so the pulse survives the frequent
     card-grid re-renders; finite CSS iteration counts mean a lingering class never pulses forever. New sessions
     pulse once as a new-card cue; disabled under `prefers-reduced-motion`.
+
+20. The big live-card timer now KEEPS COUNTING while a background workflow runs. Before, it showed "— / prompt"
+    once the launching turn's Stop cleared `currentPrompt`, even though the session's subagents were still
+    working. `aggregate` now stamps `session.engagedStartedAt` (start of the current continuous engaged period,
+    persisting across the Stop while subagents stay in flight, cleared when fully idle); the card ticks from it
+    (label "working") when there's no open prompt but a subagent is active. So an open turn still shows its
+    prompt timer, and a background workflow shows a continuous "working" timer instead of a frozen dash.

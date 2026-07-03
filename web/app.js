@@ -346,6 +346,13 @@ function cardHTML(s) {
   const waiting = status === "waiting";
   const promptStart = s.currentPromptStartedAt;
   const promptStartMs = promptStart ? Date.parse(promptStart) : 0;
+  // The big timer ticks for an open prompt (running/waiting) OR — so it keeps counting
+  // while a background workflow runs after the launching turn's Stop — while subagents
+  // are in flight, measured from when the session became engaged (engagedStartedAt).
+  const subActive = !!(s.subagents && s.subagents.active > 0);
+  const engagedMs = subActive && s.engagedStartedAt ? Date.parse(s.engagedStartedAt) : 0;
+  const timerMs = promptStartMs || engagedMs;
+  const timerLabel = status === "running" ? "elapsed" : engagedMs && !promptStartMs ? "working" : "prompt";
   const tokensTotal = s.tokens == null ? null : sumTokens(s.tokens);
 
   const chips = [];
@@ -411,8 +418,8 @@ function cardHTML(s) {
       </div>
       <div class="card__activity"><span class="spark"></span><span>${esc(activityText(s))}</span></div>
       <div class="telemetry">
-        <span class="telemetry__value" ${promptStartMs ? `data-timer="dur" data-start="${promptStartMs}"` : ""}>${promptStartMs ? "0s" : "—"}</span>
-        <span class="telemetry__label">${status === "running" ? "elapsed" : "prompt"}</span>
+        <span class="telemetry__value" ${timerMs ? `data-timer="dur" data-start="${timerMs}"` : ""}>${timerMs ? "0s" : "—"}</span>
+        <span class="telemetry__label">${timerLabel}</span>
       </div>
       ${chips.length ? `<div class="chips">${chips.join("")}</div>` : ""}
       <div class="card__stats" style="grid-template-columns: repeat(${stats.length}, minmax(0, 1fr))">

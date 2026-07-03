@@ -234,6 +234,32 @@ test('activeMs COUNTS a background workflow running after the turn Stop', () => 
   assert.strictEqual(state.sessions.s1.status, 'idle');
 });
 
+test('engagedStartedAt spans the whole engaged period so the card timer keeps counting', () => {
+  const state = run([
+    ev('SessionStart', { ts: '2026-07-02T10:00:00.000Z' }),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:01.000Z', prompt_id: 'p1' }),
+    ev('SubagentStart', { ts: '2026-07-02T10:00:05.000Z', agent_type: 'workflow-subagent' }),
+    ev('Stop', { ts: '2026-07-02T10:00:08.000Z' }), // turn closes; subagent still running
+  ]);
+  const s = state.sessions.s1;
+  // Set at the prompt (engaged began) and UNCHANGED across Stop while the subagent runs,
+  // even though the prompt (and its live timer) is gone — so the timer keeps counting.
+  assert.strictEqual(s.engagedStartedAt, '2026-07-02T10:00:01.000Z');
+  assert.strictEqual(s.currentPrompt, null);
+  // When the background work ends, it clears (timer stops -> "—").
+  applyEvent(state, ev('SubagentStop', { ts: '2026-07-02T10:05:00.000Z' }));
+  assert.strictEqual(s.engagedStartedAt, null);
+});
+
+test('engagedStartedAt clears at Stop when no subagent is in flight (plain turn)', () => {
+  const state = run([
+    ev('SessionStart', { ts: '2026-07-02T10:00:00.000Z' }),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:01.000Z', prompt_id: 'p1' }),
+    ev('Stop', { ts: '2026-07-02T10:00:04.000Z' }),
+  ]);
+  assert.strictEqual(state.sessions.s1.engagedStartedAt, null); // no lingering timer on a normal idle
+});
+
 test('activeMs does not double-count a blocking subagent (running AND subagent active)', () => {
   const state = run([
     ev('SessionStart'),

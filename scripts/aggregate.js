@@ -54,6 +54,10 @@ function newSession(event) {
     activeMs: 0,
     engagedSince: null, // ms epoch the current engaged span began, or null when not engaged
     activeDelta: 0, // engaged ms settled by the LAST applyEvent (the daemon reads this per event)
+    // ISO ts the current CONTINUOUS engaged period began (set on not-engaged→engaged,
+    // cleared when it ends). Surfaced to the card so the big timer keeps counting
+    // while a background workflow's subagents run after the launching turn's Stop.
+    engagedStartedAt: null,
 
     subagents: { active: 0, total: 0, byType: {} },
     errorReason: null,
@@ -229,11 +233,17 @@ function applyEvent(state, event) {
     // clock-skewed ts — that would make the next span over-count. A missing/bad ts
     // (nowMs === 0) leaves the existing anchor intact.
     if (nowMs && (!session.engagedSince || nowMs > session.engagedSince)) session.engagedSince = nowMs;
+    // Stamp the START of this continuous engaged period once (on the not-engaged→
+    // engaged transition, or when restored engaged without the field). It persists
+    // as the session stays engaged — including across a Stop while subagents keep
+    // working — so the card's timer counts the whole engaged period, not just the turn.
+    if (!session.engagedStartedAt && typeof event.ts === 'string') session.engagedStartedAt = event.ts;
   } else {
     // No longer engaged (turn ended / idle): stop the clock. Do this even with a bad
     // ts, so a Stop whose ts is unparseable can't leave a stale anchor that the next
     // event would then settle as one huge idle gap.
     session.engagedSince = null;
+    session.engagedStartedAt = null;
   }
 
   return state;
