@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cockpit — Claude Code mission control</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/styles.css">
+  <!-- Daemon injects the per-session bearer token into the placeholder below so the SPA can auth.
+       Keep this the ONLY occurrence of the placeholder string in this file. -->
+  <script>window.__COCKPIT_TOKEN__="%%TOKEN%%";</script>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand__mark" aria-hidden="true"></div>
+        <div>
+          <div class="brand__name">Cockpit</div>
+          <div class="brand__sub">mission control</div>
+        </div>
+      </div>
+      <nav class="nav" id="nav">
+        <button class="nav__tab is-active" type="button" data-view="live">Live</button>
+        <button class="nav__tab" type="button" data-view="repos">Per-repo</button>
+        <button class="nav__tab" type="button" data-view="history">History</button>
+        <button class="nav__tab" type="button" data-view="settings">Settings</button>
+      </nav>
+      <div class="conn" id="conn" data-state="idle">
+        <span class="conn__dot"></span>
+        <span id="connText">connecting…</span>
+      </div>
+    </header>
+
+    <div class="banner" id="banner">
+      <span>Connection lost — run <code>/cockpit:open</code> to restart the dashboard.</span>
+    </div>
+
+    <main class="main">
+      <!-- Live -->
+      <section class="view is-active" id="view-live">
+        <div class="view__head">
+          <h2 class="view__title">Live sessions</h2>
+          <span class="view__note" id="liveNote"></span>
+        </div>
+        <div class="ribbon" id="liveRibbon"></div>
+        <div class="cards" id="cards"></div>
+      </section>
+
+      <!-- Per-repo -->
+      <section class="view" id="view-repos">
+        <div class="view__head">
+          <h2 class="view__title">Per-repository</h2>
+          <span class="view__note">active time, prompts, tokens, and estimated cost</span>
+          <div class="range" id="repoRange">
+            <button class="range__btn is-active" type="button" data-range="today">Today</button>
+            <button class="range__btn" type="button" data-range="7d">7 days</button>
+            <button class="range__btn" type="button" data-range="30d">30 days</button>
+            <button class="range__btn" type="button" data-range="all">All</button>
+          </div>
+        </div>
+        <div class="panel" id="repoPanel"></div>
+      </section>
+
+      <!-- History -->
+      <section class="view" id="view-history">
+        <div class="view__head">
+          <h2 class="view__title">History &amp; trends</h2>
+          <span class="view__note">from the daily rollups</span>
+          <div class="range" id="histRange">
+            <button class="range__btn" type="button" data-range="today">Today</button>
+            <button class="range__btn is-active" type="button" data-range="7d">7 days</button>
+            <button class="range__btn" type="button" data-range="30d">30 days</button>
+            <button class="range__btn" type="button" data-range="all">All</button>
+          </div>
+        </div>
+        <div class="charts">
+          <div class="chart-card">
+            <div class="chart-card__title">Tokens per day</div>
+            <div class="chart-card__sub">Total tokens across all repositories</div>
+            <div class="chart" id="chartTokens"></div>
+          </div>
+          <div class="chart-card">
+            <div class="chart-card__title">Active time per day</div>
+            <div class="chart-card__sub">Summed prompt durations</div>
+            <div class="chart" id="chartTime"></div>
+          </div>
+          <div class="chart-card">
+            <div class="chart-card__title">Activity by hour</div>
+            <div class="chart-card__sub">When Claude Code is busy</div>
+            <div class="chart" id="chartHour"></div>
+          </div>
+          <div class="chart-card">
+            <div class="chart-card__title">Top repositories</div>
+            <div class="chart-card__sub">By active time</div>
+            <div class="chart" id="chartRepos"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Settings -->
+      <section class="view" id="view-settings">
+        <div class="view__head">
+          <h2 class="view__title">Settings</h2>
+          <span class="view__note">changes save automatically</span>
+        </div>
+        <div class="settings" id="settings"></div>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
