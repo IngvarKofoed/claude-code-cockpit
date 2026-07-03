@@ -47,7 +47,12 @@ function newSession(event) {
     currentPrompt: null, // { promptId, startedAt } while a turn is running
     currentActivity: null, // tool name Claude is running right now
     promptCount: 0,
-    activeMs: 0, // cumulative wall-clock of this session's closed turns
+    // Cumulative "engaged" wall-clock: time the session spent running a turn OR
+    // with a subagent/workflow in flight, EXCLUDING permission/idle waits. Driven
+    // by the incremental clock in applyEvent (see engagedSince), not by turn deltas.
+    activeMs: 0,
+    engagedSince: null, // ms epoch the current engaged span began, or null when not engaged
+    activeDelta: 0, // engaged ms settled by the LAST applyEvent (the daemon reads this per event)
 
     subagents: { active: 0, total: 0, byType: {} },
     errorReason: null,
@@ -76,18 +81,13 @@ function updateMeta(session, event) {
   if (event.source != null) session.source = event.source;
 }
 
-// Add the just-closed turn's wall-clock duration to the session's cumulative
-// active time, using the same prompt-start→stop delta the daemon's recordTurn
-// attributes to the per-repo rollup. The two can still diverge: the rollup only
-// counts turns that produced fresh transcript usage, whereas this counts every
-// closed turn — so per-session active time can slightly exceed the repo's.
-function addTurnDuration(session, event) {
-  if (!session.currentPrompt || !session.currentPrompt.startedAt) return;
-  const a = tsMs(session.currentPrompt.startedAt);
-  const b = tsMs(event.ts);
-  // num() the prior value: a session restored from a pre-activeMs snapshot has no
-  // activeMs field, and `undefined + delta` would poison it to NaN forever.
-  if (a && b && b > a) session.activeMs = num(session.activeMs) + (b - a);
+// A session is "engaged" (accruing active time) while it is running a turn OR has
+// a subagent/workflow agent in flight. NOT while merely `waiting` (a permission
+// prompt) or `idle`. The subagent clause is what lets a background workflow — whose
+// `workflow-subagent` SubagentStart/Stop arrive on this session AFTER the launching
+// turn's Stop — keep accruing while the main status sits idle.
+function isEngaged(session) {
+  return session.status === 'running' || (session.subagents && session.subagents.active > 0);
 }
 
 // Fold one event into state, mutating and returning the same object. Unknown
@@ -104,6 +104,20 @@ function applyEvent(state, event) {
 
   if (typeof event.ts === 'string') session.lastActivityAt = event.ts;
   updateMeta(session, event);
+
+  // --- engaged clock: settle the span that just elapsed under the PRE-event state.
+  // engagedSince is non-null IFF the session was engaged since that instant, so its
+  // presence alone means the [engagedSince, now] interval counts — no need to
+  // re-check isEngaged here. num() guards a session restored from an older snapshot
+  // that lacks the field. activeDelta exposes this event's settled ms to the daemon
+  // (for per-repo/day rollup attribution) and is recomputed every event.
+  const nowMs = tsMs(event.ts);
+  session.activeDelta = 0;
+  if (session.engagedSince && nowMs > session.engagedSince) {
+    const d = nowMs - session.engagedSince;
+    session.activeMs = num(session.activeMs) + d;
+    session.activeDelta = d;
+  }
 
   switch (event.event) {
     case 'SessionStart':
@@ -154,11 +168,11 @@ function applyEvent(state, event) {
         // which would otherwise tick a live timer forever.
         const inFlight = session.subagents.active > 0 || session.currentActivity != null;
         if (session.status === 'running' && !inFlight) {
-          // Treat this as the missed Stop: actually CLOSE the turn — clear
-          // currentPrompt (else snapshot keeps emitting currentPromptStartedAt and
-          // the browser ticks the prompt timer forever, the exact failure this
-          // guard exists to prevent) and record its duration.
-          addTurnDuration(session, event);
+          // Treat this as the missed Stop: CLOSE the turn — clear currentPrompt
+          // (else snapshot keeps emitting currentPromptStartedAt and the browser
+          // ticks the prompt timer forever, the exact failure this guard prevents).
+          // The engaged clock already settled the running span above; going idle
+          // stops further accrual.
           session.currentPrompt = null;
           session.status = 'idle';
         }
@@ -167,7 +181,6 @@ function applyEvent(state, event) {
       break;
 
     case 'Stop':
-      addTurnDuration(session, event);
       session.currentPrompt = null;
       session.status = 'idle';
       break;
@@ -176,7 +189,6 @@ function applyEvent(state, event) {
       // StopFailure ends the turn (like Stop) but on an API error — clear the
       // running prompt so the dashboard stops ticking a live timer on a session
       // whose turn is already over.
-      addTurnDuration(session, event);
       session.currentPrompt = null;
       session.status = 'error';
       if (event.stop_reason != null) session.errorReason = event.stop_reason;
@@ -205,17 +217,31 @@ function applyEvent(state, event) {
       break;
   }
 
+  // Re-anchor the engaged clock based on the POST-event state.
+  if (isEngaged(session)) {
+    // Advance the anchor to now, but NEVER move it backward on an out-of-order or
+    // clock-skewed ts — that would make the next span over-count. A missing/bad ts
+    // (nowMs === 0) leaves the existing anchor intact.
+    if (nowMs && (!session.engagedSince || nowMs > session.engagedSince)) session.engagedSince = nowMs;
+  } else {
+    // No longer engaged (turn ended / idle): stop the clock. Do this even with a bad
+    // ts, so a Stop whose ts is unparseable can't leave a stale anchor that the next
+    // event would then settle as one huge idle gap.
+    session.engagedSince = null;
+  }
+
   return state;
 }
 
 // --- Snapshot for /api/state -------------------------------------------------
 
 function toCard(s) {
-  return {
-    ...s,
-    // ISO the browser uses to tick the live prompt timer, or null when idle.
-    currentPromptStartedAt: s.currentPrompt ? s.currentPrompt.startedAt : null,
-  };
+  // One shallow copy (this is on the SSE broadcast hot path), then drop the internal
+  // engaged-clock anchors — they're daemon bookkeeping, not UI.
+  const card = { ...s, currentPromptStartedAt: s.currentPrompt ? s.currentPrompt.startedAt : null };
+  delete card.engagedSince;
+  delete card.activeDelta;
+  return card;
 }
 
 // Waiting first (needs the user), then running, then everything else; ties
@@ -249,7 +275,10 @@ function snapshot(state, nowMs) {
 // --- Per-day per-repo rollups ------------------------------------------------
 
 function createRollup(dateStr) {
-  return { date: dateStr, repos: {} };
+  // hourActive[0..23]: active ms bucketed by local hour-of-day, populated alongside
+  // per-repo active in accumulateActiveFromEvents so the History by-hour chart reads
+  // it straight off the (cached) rollup instead of re-scanning the event log.
+  return { date: dateStr, repos: {}, hourActive: new Array(24).fill(0) };
 }
 
 function ensureRepo(rollup, repoRoot, repoName) {
@@ -283,12 +312,13 @@ function addTokens(dst, tokens) {
   dst.cacheWrite += num(tokens && tokens.cacheWrite);
 }
 
-// Fold one completed turn's duration + tokens into the repo (and per-model)
-// totals. Cost is intentionally left untouched — the daemon prices rollups.
+// Fold one completed turn's prompt + tokens into the repo (and per-model) totals.
+// Active time is NOT accrued here — it's derived from the event stream (see
+// accumulateActiveFromEvents), so a turn's duration no longer feeds activeMs.
+// Cost is left untouched — the daemon prices rollups.
 function accumulateTurn(rollup, turn) {
   if (!rollup || !turn || turn.repoRoot == null) return rollup;
   const repo = ensureRepo(rollup, turn.repoRoot, turn.repoName);
-  repo.activeMs += num(turn.durationMs);
   repo.prompts += 1;
   addTokens(repo.tokens, turn.tokens);
   const model = turn.model || 'unknown';
@@ -319,8 +349,7 @@ function addByModel(repo, byModel) {
 function accumulateTurnByModel(rollup, turn) {
   if (!rollup || !turn || turn.repoRoot == null) return rollup;
   const repo = ensureRepo(rollup, turn.repoRoot, turn.repoName);
-  repo.activeMs += num(turn.durationMs);
-  repo.prompts += 1;
+  repo.prompts += 1; // active time comes from the event stream, not turn duration
   addByModel(repo, turn.byModel);
   bumpLastActive(repo, turn.ts);
   return rollup;
@@ -347,6 +376,33 @@ function accumulateSession(rollup, s) {
   return rollup;
 }
 
+// Derive per-repo (and per-hour) active time from a day's event stream and fold it
+// into `rollup`. Replays the events through applyEvent on a FRESH state so the exact
+// same engaged clock that drives the live per-session activeMs also produces the
+// rollup — the two can't diverge. Each settled span is attributed to the repo and to
+// the local hour of the event that closed it.
+// A fresh state per day means a span still engaged across midnight is NOT carried
+// into the next day (its pre-boundary portion isn't settled here, its post-boundary
+// portion starts from the day's first event). The live path mirrors this by breaking
+// each session's engaged span at day rollover (and at a stale-day restart), so the
+// two agree — the shared, documented cost is that a span crossing midnight loses the
+// slice between its last pre-midnight and first post-midnight event.
+function accumulateActiveFromEvents(rollup, events) {
+  if (!rollup || !Array.isArray(events)) return rollup;
+  const s = createState();
+  for (const ev of events) {
+    applyEvent(s, ev);
+    const sid = ev && ev.session_id;
+    const sess = sid != null ? s.sessions[sid] : null;
+    if (sess && sess.activeDelta > 0 && sess.repoRoot != null) {
+      ensureRepo(rollup, sess.repoRoot, sess.repoName).activeMs += sess.activeDelta;
+      const t = tsMs(ev.ts);
+      if (t && Array.isArray(rollup.hourActive)) rollup.hourActive[new Date(t).getHours()] += sess.activeDelta;
+    }
+  }
+  return rollup;
+}
+
 module.exports = {
   createState,
   applyEvent,
@@ -356,4 +412,5 @@ module.exports = {
   accumulateTurnByModel,
   accumulateTokensByModel,
   accumulateSession,
+  accumulateActiveFromEvents,
 };

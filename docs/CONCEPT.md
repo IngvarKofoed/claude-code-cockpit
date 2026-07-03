@@ -39,7 +39,7 @@ Plus the notifier's ambient layer: an OS notification and/or a sound when a sess
 
 1. **Live session overview.** Per active session: repository (git root name + full path), branch, status (`running` / `waiting-for-input` / `idle` / `error`), the elapsed time of the current prompt (ticking live), and session age.
 2. **Live activity detail.** What Claude is doing *now* — the current tool (running `Bash`, editing a file, waiting on a permission prompt) derived from tool-use hooks — not just a running/idle flag.
-3. **Per-repository accounting.** Total active time, prompt count, session count, token totals (input / output / cache), and an **estimated dollar cost**, with a time-range filter.
+3. **Per-repository accounting.** Total active time, prompt count, session count, token totals (input / output / cache), and an **estimated dollar cost**, with a time-range filter. *Active time* is engaged wall-clock — time a session spent working a turn or running a background workflow — and deliberately **excludes** time spent waiting on you (a permission prompt) or sitting idle, so it reflects real work rather than elapsed clock.
 4. **History & trends.** Retained aggregates rendered as charts: tokens and time per day, activity by hour of day, and top repositories by time or tokens.
 5. **Notifications & sounds.** OS notifications (opt-in, configurable per event) plus in-dashboard sounds, for: session finished, needs input, prompt running too long, and turn failed.
 6. **Zero-friction, cross-platform, private.** No native build step, works on macOS / Windows / Linux, and all data stays on your machine.

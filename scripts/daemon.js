@@ -67,7 +67,7 @@ const offsets = {}; // dateStr -> processed byte offset in that day's event log
 const seenIds = new Map(); // session_id -> Set(transcript message id) already ingested
 const extra = new Map(); // session_id -> { transcriptPath, longRunPromptId }
 const ingesting = new Set(); // session_ids with an in-flight ingestTurn retry chain
-const pendingIngest = new Map(); // session_id -> { stopEvent, promptStart } queued mid-ingest
+const pendingIngest = new Map(); // session_id -> { stopEvent } queued mid-ingest
 const primedSeen = new Set(); // session_ids whose seenIds have been seeded from the usage logs
 const rollupCache = new Map(); // dateStr -> memoized derived past-day rollup (fast History reads)
 let repoTotalsCache = null; // memoized all-time per-repo totals for /api/state; invalidated on any token/rollup/cost-config change (see repoTotalsAllTime)
@@ -247,13 +247,19 @@ function loadSnapshot() {
   if (!snap || typeof snap !== 'object') return;
   if (snap.sessions && typeof snap.sessions === 'object') {
     state.sessions = snap.sessions;
-    // Migrate the retired 'idle-waiting' status (a pre-upgrade snapshot may
-    // still carry it) to plain 'idle' so an upgraded daemon never surfaces a
-    // status the current dashboard has no label or styling for.
+    // A snapshot saved on a different day carries engaged-clock anchors from that
+    // day. Today's rollup is re-derived fresh (no carried anchor), so a restored
+    // anchor would settle a giant [yesterday, first-event-today] span into the live
+    // per-session activeMs that the rollup never sees — a large divergence. Drop the
+    // anchors so the live clock re-establishes them from today's events, matching the
+    // rollover-reset behavior. (Same-day restart keeps them: the day is replayed
+    // continuously, so the anchor is still valid.)
+    const staleDay = snap.currentDate !== currentDate;
     for (const sid of Object.keys(state.sessions)) {
-      if (state.sessions[sid] && state.sessions[sid].status === 'idle-waiting') {
-        state.sessions[sid].status = 'idle';
-      }
+      const s = state.sessions[sid];
+      if (!s) continue;
+      if (s.status === 'idle-waiting') s.status = 'idle'; // migrate a retired status
+      if (staleDay) s.engagedSince = null;
     }
   }
   if (snap.extra && typeof snap.extra === 'object') {
@@ -284,7 +290,7 @@ function applyUsageRecord(rollup, u) {
     : { [u.model || 'unknown']: { input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite } };
   const arg = { repoRoot: u.repo_root, repoName: u.repo_name, byModel, ts: u.ts };
   if (u.backfill) aggregate.accumulateTokensByModel(rollup, arg);
-  else aggregate.accumulateTurnByModel(rollup, { ...arg, durationMs: u.durationMs });
+  else aggregate.accumulateTurnByModel(rollup, arg); // durationMs is ignored; active time is event-derived
 }
 
 // A day's rollup, derived PURELY from its durable usage log — the single source
@@ -292,9 +298,22 @@ function applyUsageRecord(rollup, u) {
 // is never trusted as a frozen file nor amended in place; it is recomputed from
 // the log (which backfill only ever appends to), so a crash, a corrupt rollup
 // file, or a re-ingest can neither double-count nor lose tokens.
+// Tokens/prompts/cost only — from the usage log. Active time is added separately by
+// the callers from the EVENT log (see addActiveFromEvents), so a caller that already
+// has the day's events in hand doesn't read that log twice.
 function deriveRollupFromUsage(date) {
   const rollup = aggregate.createRollup(date);
   for (const u of readJsonl(paths.usageLogPath(date))) applyUsageRecord(rollup, u);
+  return rollup;
+}
+
+// Fold a day's event-derived active time (engaged-clock replay) into `rollup`. Active
+// excludes permission/idle waits and includes background-workflow time, and — being a
+// pure function of the durable per-day event log — stays crash-safe and matches the
+// live per-session clock exactly (same applyEvent). Pass pre-read `events` to avoid a
+// second read of the log.
+function addActiveFromEvents(rollup, date, events) {
+  aggregate.accumulateActiveFromEvents(rollup, events || readJsonl(paths.eventLogPath(date)));
   return rollup;
 }
 
@@ -303,7 +322,9 @@ function deriveRollupFromUsage(date) {
 // a possibly mid-write rollup file for the open day.
 function rebuildTodayRollup() {
   todayRollup = deriveRollupFromUsage(currentDate);
-  for (const ev of readJsonl(paths.eventLogPath(currentDate))) {
+  const events = readJsonl(paths.eventLogPath(currentDate)); // read once for both passes below
+  addActiveFromEvents(todayRollup, currentDate, events); // active time (engaged clock)
+  for (const ev of events) {
     if (ev.session_id != null && ev.repo_root != null) {
       aggregate.accumulateSession(todayRollup, {
         repoRoot: ev.repo_root,
@@ -366,9 +387,8 @@ function catchUpIngest() {
       continue;
     }
     const s = state.sessions[sid];
-    // Unknown prompt boundary -> promptStart null -> duration 0 for the gap turn.
     const stopEvent = { ts: s.lastActivityAt, repo_root: s.repoRoot, repo_name: s.repoName };
-    recordTurn(sid, stopEvent, null, usage, fresh, seen);
+    recordTurn(sid, stopEvent, usage, fresh, seen);
   }
 }
 
@@ -476,7 +496,7 @@ function backfillTranscripts(filterRepoRoot) {
       let maxTs = null;
       for (const m of fresh) if (m.ts && (!maxTs || m.ts > maxTs)) maxTs = m.ts;
       const stopEvent = { ts: maxTs, repo_root: repo.repo_root, repo_name: repo.repo_name };
-      const groups = recordTurn(sid, stopEvent, null, usage, fresh, seen, /* allBackfill */ true);
+      const groups = recordTurn(sid, stopEvent, usage, fresh, seen, /* allBackfill */ true);
 
       summary.sessionsIngested++;
       summary.newMessages += fresh.length;
@@ -545,6 +565,12 @@ function rolloverDay(today) {
   todayRollup = aggregate.createRollup(currentDate);
   rollupCache.clear(); // yesterday is now a past day — re-derive it on demand
   repoTotalsCache = null;
+  // Break every session's engaged span at the day boundary so the live per-repo
+  // active total matches the fresh per-day re-derivation (which starts each day with
+  // no carried anchor). Without this, a span crossing midnight is folded whole into
+  // the new day live but vanishes when that day is later re-derived — the same day's
+  // active figure would change on rollover/restart.
+  for (const sid of Object.keys(state.sessions)) state.sessions[sid].engagedSince = null;
 }
 
 // Read and apply any complete lines appended to a given day's event log since its
@@ -584,9 +610,6 @@ function tailOnce() {
 
 function handleEvent(ev) {
   const sid = ev.session_id;
-  const pre = sid != null ? state.sessions[sid] : null;
-  // Capture the running prompt's start BEFORE Stop clears it, for turn duration.
-  const promptStart = pre && pre.currentPrompt ? pre.currentPrompt.startedAt : null;
 
   aggregate.applyEvent(state, ev);
 
@@ -608,9 +631,27 @@ function handleEvent(ev) {
 
   if (replaying) return; // boot replay: rebuild live state only, no side effects
 
+  // Fold the engaged-clock span this event just settled into today's per-repo active
+  // total. The boot rebuild (deriveRollupFromUsage → accumulateActiveFromEvents)
+  // already covered events up to startup; this extends it for each live event, using
+  // the SAME delta the live per-session clock produced, so the two never diverge.
+  if (session && session.repoRoot && session.activeDelta > 0) {
+    const r = todayRollup.repos[session.repoRoot];
+    if (r) {
+      r.activeMs += session.activeDelta;
+      repoTotalsCache = null; // all-time active changed
+      // Mirror accumulateActiveFromEvents' by-hour bucketing so the History chart
+      // (which reads todayRollup.hourActive) matches the live per-repo total.
+      const t = Date.parse(ev.ts);
+      if (Number.isFinite(t) && Array.isArray(todayRollup.hourActive)) {
+        todayRollup.hourActive[new Date(t).getHours()] += session.activeDelta;
+      }
+    }
+  }
+
   switch (ev.event) {
     case 'Stop':
-      ingestTurn(sid, ev, promptStart);
+      ingestTurn(sid, ev);
       maybeNotify('sessionFinished', session);
       break;
     case 'Notification':
@@ -619,7 +660,7 @@ function handleEvent(ev) {
     case 'StopFailure':
       // A failed turn still spent tokens; ingest them like Stop so they aren't
       // lost if the session ends (dropSession) before any later Stop sweeps them.
-      ingestTurn(sid, ev, promptStart);
+      ingestTurn(sid, ev);
       maybeNotify('turnFailed', session);
       break;
     case 'SessionEnd':
@@ -649,7 +690,7 @@ function dropSession(sid) {
 // the session totals and the day's rollup as one turn. The transcript is flushed
 // asynchronously, so if no new usage is visible yet we retry with short backoff
 // (total ~1.5s) rather than recording a wrong zero. Fully off the event loop.
-function ingestTurn(sid, stopEvent, promptStart) {
+function ingestTurn(sid, stopEvent) {
   if (sid == null) return;
   const x = extra.get(sid);
   const tpath = x && x.transcriptPath;
@@ -659,7 +700,7 @@ function ingestTurn(sid, stopEvent, promptStart) {
   // retry chain is in flight is queued rather than run in parallel, so two chains
   // can't both pass the !seen filter for the same messages and record them twice.
   if (ingesting.has(sid)) {
-    pendingIngest.set(sid, { stopEvent, promptStart });
+    pendingIngest.set(sid, { stopEvent });
     return;
   }
   ingesting.add(sid);
@@ -670,7 +711,7 @@ function ingestTurn(sid, stopEvent, promptStart) {
     const next = pendingIngest.get(sid);
     if (next) {
       pendingIngest.delete(sid);
-      ingestTurn(sid, next.stopEvent, next.promptStart); // run the queued Stop now
+      ingestTurn(sid, next.stopEvent); // run the queued Stop now
     }
   };
 
@@ -691,7 +732,7 @@ function ingestTurn(sid, stopEvent, promptStart) {
       setTimeout(attempt, schedule[i] - schedule[i - 1]);
       return;
     }
-    if (fresh.length) recordTurn(sid, stopEvent, promptStart, usage, fresh, seen);
+    if (fresh.length) recordTurn(sid, stopEvent, usage, fresh, seen);
     else if (usage.ok) updateSessionTokens(sid, usage); // refresh display even with no new turn
     markDirty();
     finish();
@@ -699,7 +740,7 @@ function ingestTurn(sid, stopEvent, promptStart) {
   attempt();
 }
 
-function recordTurn(sid, stopEvent, promptStart, usage, fresh, seen, allBackfill = false) {
+function recordTurn(sid, stopEvent, usage, fresh, seen, allBackfill = false) {
   const session = state.sessions[sid];
   const repoRoot = (session && session.repoRoot) || stopEvent.repo_root || null;
   const repoName = (session && session.repoName) || stopEvent.repo_name || null;
@@ -712,11 +753,6 @@ function recordTurn(sid, stopEvent, promptStart, usage, fresh, seen, allBackfill
     for (const m of fresh) seen.add(m.id);
     seenIds.set(sid, seen);
   }
-
-  let durationMs = 0;
-  const a = Date.parse(promptStart);
-  const b = Date.parse(stopEvent.ts);
-  if (Number.isFinite(a) && Number.isFinite(b) && b >= a) durationMs = b - a;
 
   // Attribute each message's tokens to the DAY it was actually spent (from its
   // transcript timestamp), clamped so a clock-skewed future stamp can't bucket into
@@ -736,10 +772,11 @@ function recordTurn(sid, stopEvent, promptStart, usage, fresh, seen, allBackfill
   }
 
   // The just-completed turn is the group holding the MOST RECENT messages; it earns
-  // the prompt count + duration. Every older day is historical backfill (tokens/cost
-  // only). Keying off the latest message — not the Stop's day — keeps the turn's
-  // duration/prompt on a real day even when it straddles midnight (Stop lands on the
-  // new day while the messages are timestamped on the old one).
+  // the prompt count. Every older day is historical backfill (tokens/cost only).
+  // Keying off the latest message — not the Stop's day — keeps the turn's prompt on
+  // a real day even when it straddles midnight (Stop lands on the new day while the
+  // messages are timestamped on the old one). (Active time is not turn-attributed —
+  // it's derived from the event stream — so it needs no day-bucketing here.)
   // For a pure historical backfill (a whole pre-existing transcript) there is no
   // live turn — every group is attributed as backfill (tokens/cost only).
   let turnDay = null;
@@ -775,7 +812,6 @@ function recordTurn(sid, stopEvent, promptStart, usage, fresh, seen, allBackfill
         output: g.totals.output,
         cacheRead: g.totals.cacheRead,
         cacheWrite: g.totals.cacheWrite,
-        durationMs: isTurn ? durationMs : 0,
         backfill: isTurn ? undefined : true,
         ids: g.ids,
       },
@@ -783,7 +819,7 @@ function recordTurn(sid, stopEvent, promptStart, usage, fresh, seen, allBackfill
     );
     if (day === currentDate) {
       if (isTurn) {
-        aggregate.accumulateTurnByModel(todayRollup, { repoRoot, repoName, byModel: g.byModel, durationMs, ts });
+        aggregate.accumulateTurnByModel(todayRollup, { repoRoot, repoName, byModel: g.byModel, ts });
       } else {
         aggregate.accumulateTokensByModel(todayRollup, { repoRoot, repoName, byModel: g.byModel, ts });
       }
@@ -954,7 +990,11 @@ function getRollup(date) {
   // or day-rollover, both of which clear this cache — so History stays a fast
   // O(days) read instead of re-parsing every day's usage log on each request.
   let r = rollupCache.get(date);
-  if (!r) rollupCache.set(date, (r = deriveRollupFromUsage(date)));
+  if (!r) {
+    r = deriveRollupFromUsage(date); // tokens/prompts from the usage log
+    addActiveFromEvents(r, date); // active time from the event log (one read, then cached)
+    rollupCache.set(date, r);
+  }
   return r;
 }
 
@@ -1047,15 +1087,18 @@ function buildHistory(rangeRaw) {
 
   const repoAgg = aggregateReposAcrossDates(dates);
 
-  // Hour-of-day histogram from the per-turn usage log (rollups have no hour granularity).
+  // Hour-of-day histogram. Active per hour comes from the rollup's pre-bucketed
+  // hourActive (built once in the same cached event replay that produced the per-repo
+  // active — no extra event-log scan, so this stays O(days)); it therefore matches the
+  // daily/per-repo active figures exactly. Tokens per hour come from the small usage log.
   const byHour = Array.from({ length: 24 }, (_, hour) => ({ hour, activeMs: 0, tokens: 0 }));
   for (const date of dates) {
+    const ha = getRollup(date).hourActive;
+    if (Array.isArray(ha)) for (let h = 0; h < 24; h++) byHour[h].activeMs += num(ha[h]);
     for (const u of readJsonl(paths.usageLogPath(date))) {
       const t = Date.parse(u.ts);
       if (!Number.isFinite(t)) continue;
-      const h = new Date(t).getHours();
-      byHour[h].activeMs += num(u.durationMs);
-      byHour[h].tokens += num(u.input) + num(u.output) + num(u.cacheRead) + num(u.cacheWrite);
+      byHour[new Date(t).getHours()].tokens += num(u.input) + num(u.output) + num(u.cacheRead) + num(u.cacheWrite);
     }
   }
 

@@ -323,7 +323,7 @@ function cardHTML(s) {
   // tooltip explains it. Cells auto-flow in column order (Age column left empty).
   const rt = App.state && App.state.repoTotals && s.repoRoot ? App.state.repoTotals[s.repoRoot] : null;
   const repoTok = rt && rt.tokens != null ? sumTokens(rt.tokens) : null;
-  const atTitle = "This repo's cumulative total across every session in retained history (all time, up to the retention limit), including backfilled sessions. Prompts and active time count live turns only.";
+  const atTitle = "This repo's cumulative total across every session in retained history (all time, up to the retention limit), including backfilled sessions. Prompts and active time come from live sessions only — backfilled history contributes tokens/cost but no prompts or active time.";
   const rtCells = [
     `<span class="card__at-v" title="${atTitle}">${rt && rt.prompts != null ? num(rt.prompts) : "—"}</span>`,
     `<span class="card__at-v" title="${atTitle}">${repoTok == null ? "—" : esc(fmtTokens(repoTok))}</span>`,

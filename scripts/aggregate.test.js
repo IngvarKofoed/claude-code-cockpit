@@ -11,6 +11,7 @@ const {
   accumulateTurnByModel,
   accumulateTokensByModel,
   accumulateSession,
+  accumulateActiveFromEvents,
 } = require('./aggregate');
 
 // Build a normalized event record with sensible defaults; override per case.
@@ -183,7 +184,7 @@ test('StopFailure -> error with errorReason; clears the running prompt', () => {
   assert.strictEqual(card.currentPromptStartedAt, null);
 });
 
-// --- per-session active time -------------------------------------------------
+// --- per-session active time (engaged clock) ---------------------------------
 
 test('activeMs accumulates each closed turn (Stop and StopFailure)', () => {
   const state = run([
@@ -197,23 +198,94 @@ test('activeMs accumulates each closed turn (Stop and StopFailure)', () => {
   assert.strictEqual(state.sessions.s1.activeMs, 5000);
 });
 
-test('activeMs ignores a Stop with no open prompt or a non-advancing clock', () => {
+test('activeMs ignores a Stop with no open turn or a non-advancing clock', () => {
   const state = run([
     ev('SessionStart'),
-    ev('Stop', { ts: '2026-07-02T10:00:04.000Z' }), // no currentPrompt -> no-op
+    ev('Stop', { ts: '2026-07-02T10:00:04.000Z' }), // not engaged -> no-op
     ev('UserPromptSubmit', { ts: '2026-07-02T10:00:05.000Z', prompt_id: 'p1' }),
     ev('Stop', { ts: '2026-07-02T10:00:05.000Z' }), // same instant -> 0
   ]);
   assert.strictEqual(state.sessions.s1.activeMs, 0);
 });
 
-test('activeMs is safe when a session lacks the field (restored from old snapshot)', () => {
+test('activeMs EXCLUDES permission-waiting time within a turn', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:02.000Z', tool_name: 'Bash' }), // +2s running
+    ev('Notification', { ts: '2026-07-02T10:00:03.000Z', notification_type: 'permission_prompt' }), // +1s running, now waiting
+    ev('PostToolUse', { ts: '2026-07-02T10:01:03.000Z' }), // 60s WAIT (approval) -> excluded; back to running
+    ev('Stop', { ts: '2026-07-02T10:01:05.000Z' }), // +2s running
+  ]);
+  // Running spans: 0->2, 2->3, (3->63 waiting excluded), 63->65 => 2+1+2 = 5s.
+  assert.strictEqual(state.sessions.s1.activeMs, 5000);
+});
+
+test('activeMs COUNTS a background workflow running after the turn Stop', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('SubagentStart', { ts: '2026-07-02T10:00:10.000Z', agent_type: 'workflow-subagent' }), // +10s running
+    ev('Stop', { ts: '2026-07-02T10:00:12.000Z' }), // +2s; turn closes but subagent still active
+    ev('SubagentStop', { ts: '2026-07-02T10:05:12.000Z', agent_type: 'workflow-subagent' }), // +5min background (idle but engaged)
+  ]);
+  // 12s in-turn + 300s background = 312s; the workflow time after Stop still counts.
+  assert.strictEqual(state.sessions.s1.activeMs, 312000);
+  assert.strictEqual(state.sessions.s1.status, 'idle');
+});
+
+test('activeMs does not double-count a blocking subagent (running AND subagent active)', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('SubagentStart', { ts: '2026-07-02T10:00:01.000Z', agent_type: 'Explore' }),
+    ev('SubagentStop', { ts: '2026-07-02T10:00:09.000Z' }), // subagent ran during the turn
+    ev('Stop', { ts: '2026-07-02T10:00:10.000Z' }),
+  ]);
+  // One engaged span 0->10s (running throughout); the overlapping subagent is not added again.
+  assert.strictEqual(state.sessions.s1.activeMs, 10000);
+});
+
+test('activeMs: a turn-closing event with a bad ts stops the clock (no idle-gap inflation)', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:02.000Z', tool_name: 'Bash' }), // +2s
+    ev('Stop', { ts: 'not-a-timestamp' }), // unparseable -> can't settle, but must stop the clock
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:30:00.000Z', prompt_id: 'p2' }), // 30min idle gap
+    ev('Stop', { ts: '2026-07-02T10:30:05.000Z' }), // +5s
+  ]);
+  // 2s (first turn, up to the bad Stop) + 5s (second turn); the 30min idle gap is NOT counted.
+  assert.strictEqual(state.sessions.s1.activeMs, 7000);
+});
+
+test('activeMs: a backward/out-of-order ts does not move the anchor back (no over-count)', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:05.000Z', tool_name: 'Bash' }), // anchor -> 10:00:05
+    ev('PostToolUse', { ts: '2026-07-02T10:00:04.000Z' }), // earlier ts: no settle, anchor stays 10:00:05
+    ev('Stop', { ts: '2026-07-02T10:00:10.000Z' }), // settles 10:00:05 -> 10:00:10 = 5s, not 6s
+  ]);
+  assert.strictEqual(state.sessions.s1.activeMs, 10000); // 0->5 (5s) + 5->10 (5s) = 10s
+});
+
+test('activeMs is safe when a session lacks the clock anchor (older snapshot)', () => {
+  // A v0.4.0 snapshot carries activeMs but no engagedSince. The next turn must
+  // accrue on top of the restored total without a NaN.
   const state = createState();
-  // Simulate a session object rebuilt from a pre-activeMs snapshot: no activeMs key.
-  state.sessions.s1 = { sessionId: 's1', status: 'running', currentPrompt: { promptId: 'p1', startedAt: '2026-07-02T10:00:00.000Z' } };
-  applyEvent(state, ev('Stop', { ts: '2026-07-02T10:00:03.000Z' }));
-  // undefined + 3000 must not poison to NaN.
-  assert.strictEqual(state.sessions.s1.activeMs, 3000);
+  state.sessions.s1 = { sessionId: 's1', status: 'idle', subagents: { active: 0 }, activeMs: 1000, currentPrompt: null };
+  applyEvent(state, ev('UserPromptSubmit', { ts: '2026-07-02T10:00:05.000Z', prompt_id: 'p2' }));
+  applyEvent(state, ev('Stop', { ts: '2026-07-02T10:00:08.000Z' }));
+  assert.strictEqual(state.sessions.s1.activeMs, 4000); // 1000 restored + 3000 new
+
+  // Even with NO activeMs field at all, accrual starts from 0 (num guard), never NaN.
+  const st2 = createState();
+  st2.sessions.s2 = { sessionId: 's2', status: 'running', subagents: { active: 0 }, currentPrompt: { promptId: 'p', startedAt: '2026-07-02T10:00:00.000Z' } };
+  applyEvent(st2, { ts: '2026-07-02T10:00:01.000Z', event: 'PreToolUse', session_id: 's2', tool_name: 'Bash' }); // sets the anchor
+  applyEvent(st2, { ts: '2026-07-02T10:00:04.000Z', event: 'Stop', session_id: 's2' }); // settles 3s from 0
+  assert.strictEqual(st2.sessions.s2.activeMs, 3000);
+  assert.ok(Number.isFinite(st2.sessions.s2.activeMs));
 });
 
 test('SessionEnd -> ended with endedReason', () => {
@@ -323,7 +395,7 @@ test('snapshot on empty state yields no sessions', () => {
 
 const T = (o = {}) => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, ...o });
 
-test('accumulateTurn: sums duration, prompts, tokens, and byModel', () => {
+test('accumulateTurn: sums prompts, tokens, and byModel (NOT active time)', () => {
   let r = createRollup('2026-07-02');
   r = accumulateTurn(r, {
     repoRoot: '/code/acme-api',
@@ -342,7 +414,7 @@ test('accumulateTurn: sums duration, prompts, tokens, and byModel', () => {
     ts: '2026-07-02T10:05:00.000Z',
   });
   const repo = r.repos['/code/acme-api'];
-  assert.strictEqual(repo.activeMs, 3000);
+  assert.strictEqual(repo.activeMs, 0); // active time is event-derived, not from durationMs
   assert.strictEqual(repo.prompts, 2);
   assert.deepStrictEqual(repo.tokens, { input: 110, output: 55, cacheRead: 3, cacheWrite: 7 });
   assert.strictEqual(repo.byModel['claude-sonnet-5'].input, 100);
@@ -398,7 +470,7 @@ test('accumulateTurnByModel: one turn, tokens split per model, counted once', ()
   });
   const repo = r.repos['/code/acme-api'];
   assert.strictEqual(repo.prompts, 1); // ONE turn, even though it spans two models
-  assert.strictEqual(repo.activeMs, 1500);
+  assert.strictEqual(repo.activeMs, 0); // active time is event-derived, not from durationMs
   assert.deepStrictEqual(repo.tokens, { input: 110, output: 205, cacheRead: 0, cacheWrite: 0 });
   // Each model keeps its own bucket, so cost can be priced at each model's rate.
   assert.strictEqual(repo.byModel['claude-opus-4-8'].output, 200);
@@ -418,6 +490,56 @@ test('accumulateTokensByModel: adds tokens per model WITHOUT counting a turn', (
   assert.deepStrictEqual(repo.tokens, { input: 100, output: 50, cacheRead: 20, cacheWrite: 0 });
   assert.strictEqual(repo.byModel['claude-opus-4-8'].input, 100);
   assert.strictEqual(repo.lastActive, '2026-07-02T09:00:00.000Z');
+});
+
+// --- event-derived per-repo active time --------------------------------------
+
+test('accumulateActiveFromEvents: per-repo active matches the live per-session clock', () => {
+  const events = [
+    ev('SessionStart', { ts: '2026-07-02T10:00:00.000Z' }),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('Notification', { ts: '2026-07-02T10:00:05.000Z', notification_type: 'permission_prompt' }), // +5s
+    ev('PostToolUse', { ts: '2026-07-02T10:00:35.000Z' }), // 30s wait excluded
+    ev('Stop', { ts: '2026-07-02T10:00:40.000Z' }), // +5s
+  ];
+  // Live per-session clock over the same events:
+  const live = run(events).sessions.s1.activeMs;
+  const rollup = accumulateActiveFromEvents(createRollup('2026-07-02'), events);
+  assert.strictEqual(live, 10000); // 5s + 5s, wait excluded
+  assert.strictEqual(rollup.repos['/code/acme-api'].activeMs, live); // rollup == live, by construction
+});
+
+test('accumulateActiveFromEvents: attributes per repo and per hour-of-day', () => {
+  const events = [
+    { ts: '2026-07-02T10:00:00.000Z', event: 'UserPromptSubmit', session_id: 'a', repo_root: '/x', repo_name: 'x', prompt_id: 'p1' },
+    { ts: '2026-07-02T10:00:04.000Z', event: 'Stop', session_id: 'a', repo_root: '/x', repo_name: 'x' }, // 4s on /x, closes @10:00
+    { ts: '2026-07-02T10:00:00.000Z', event: 'UserPromptSubmit', session_id: 'b', repo_root: '/y', repo_name: 'y', prompt_id: 'p1' },
+    { ts: '2026-07-02T10:00:10.000Z', event: 'Stop', session_id: 'b', repo_root: '/y', repo_name: 'y' }, // 10s on /y, closes @10:00
+  ];
+  const rollup = accumulateActiveFromEvents(createRollup('2026-07-02'), events);
+  assert.strictEqual(rollup.repos['/x'].activeMs, 4000);
+  assert.strictEqual(rollup.repos['/y'].activeMs, 10000);
+  // Both spans close at 10:xx local time; hourActive buckets them by the closing hour.
+  const localHour = new Date(Date.parse('2026-07-02T10:00:04.000Z')).getHours();
+  assert.strictEqual(rollup.hourActive[localHour], 14000);
+  assert.strictEqual(rollup.hourActive.reduce((a, v) => a + v, 0), 14000); // nothing leaked to other hours
+});
+
+test('accumulateActiveFromEvents: a closing event with no prior engaged state contributes nothing', () => {
+  // Models the cross-midnight case: day N+1's log holds only the SubagentStop that
+  // closes a span opened on day N. A fresh per-day replay has no anchor, so it counts
+  // 0 — matching the live path, which resets engagedSince at day rollover. This is the
+  // (consistent) boundary under-count, NOT a divergence.
+  const rollup = accumulateActiveFromEvents(createRollup('2026-07-03'), [
+    { ts: '2026-07-03T00:00:30.000Z', event: 'SubagentStop', session_id: 'a', repo_root: '/x', repo_name: 'x' },
+  ]);
+  assert.deepStrictEqual(rollup.repos, {});
+  assert.strictEqual(rollup.hourActive.reduce((a, v) => a + v, 0), 0);
+});
+
+test('accumulateActiveFromEvents: bad input is a safe no-op', () => {
+  assert.deepStrictEqual(accumulateActiveFromEvents(createRollup('2026-07-02'), null).repos, {});
+  assert.deepStrictEqual(accumulateActiveFromEvents(createRollup('2026-07-02'), 'nope').repos, {});
 });
 
 // --- fixes locked in ---------------------------------------------------------
