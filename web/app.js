@@ -382,19 +382,20 @@ function cardHTML(s) {
   // that shares the stat grid's columns — prompts/tokens/cost each land under the
   // matching per-session value so the two rows compare straight down. It carries no
   // text label: the muted colour + the dashed divider mark it as the repo total; the
-  // tooltip explains it. Cells auto-flow in column order (Age column left empty).
+  // tooltip explains it. Cells auto-flow in the same column order as the stats row.
   const rt = App.state && App.state.repoTotals && s.repoRoot ? App.state.repoTotals[s.repoRoot] : null;
   const repoTok = rt && rt.tokens != null ? sumTokens(rt.tokens) : null;
-  const atTitle = "This repo's cumulative total across every session in retained history (all time, up to the retention limit), including backfilled sessions. Chats and active time come from live sessions only — backfilled history contributes tokens/cost but no chats or active time.";
+  const atTitle = "This repo's cumulative total across every session in retained history (all time, up to the retention limit), including backfilled sessions. Chats, active time, agents and tools come from live sessions only — backfilled history contributes tokens/cost but not those.";
   const rtCells = [
     `<span class="card__at-v" title="${atTitle}">${rt && rt.prompts != null ? num(rt.prompts) : "—"}</span>`,
     `<span class="card__at-v" title="${atTitle}">${repoTok == null ? "—" : esc(fmtTokens(repoTok))}</span>`,
   ];
   if (costEnabled()) rtCells.push(`<span class="card__at-v" title="${atTitle}">${esc(fmtCost(rt ? rt.cost : null))}</span>`);
-  // Repo all-time active time — aligns under the per-session Active column (pushed
-  // after cost so column order matches the stats row in both cost/no-cost layouts).
-  // The trailing Agents/Tools columns are intentionally left with no cumulative cell.
+  // Active, then Agents, then Tools — pushed in this order (after the optional cost) so
+  // the repo-total cells land under the matching stats-row columns in both layouts.
   rtCells.push(`<span class="card__at-v" title="${atTitle}">${rt && rt.activeMs != null ? esc(fmtDuration(num(rt.activeMs))) : "—"}</span>`);
+  rtCells.push(`<span class="card__at-v" title="${atTitle}">${rt && rt.subagents != null ? num(rt.subagents) : "—"}</span>`);
+  rtCells.push(`<span class="card__at-v" title="${atTitle}">${rt && rt.tools != null ? num(rt.tools) : "—"}</span>`);
 
   // Pulse while this session's status-change window is open (see detectSoundCues).
   // The window (a timestamp) keeps the class across the frequent card-grid re-renders;

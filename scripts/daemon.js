@@ -656,9 +656,21 @@ function handleEvent(ev) {
   // midnight, or a tool starting engagement from idle), and gating only this live
   // path would make today's byTool disagree with the accumulateActiveFromEvents
   // rescan on restart. accumulateSession (above) already ensured the repo entry.
+  // Invalidate repoTotalsCache: the card's repo-total row now shows a Tools total.
   if (ev.event === 'PreToolUse' && ev.tool_name != null && session && session.repoRoot) {
     const r = todayRollup.repos[session.repoRoot];
-    if (r) r.byTool[ev.tool_name] = num(r.byTool[ev.tool_name]) + 1;
+    if (r) {
+      r.byTool[ev.tool_name] = num(r.byTool[ev.tool_name]) + 1;
+      repoTotalsCache = null;
+    }
+  }
+  // Per-repo subagent count (same pattern) — feeds the card's Agents total.
+  if (ev.event === 'SubagentStart' && session && session.repoRoot) {
+    const r = todayRollup.repos[session.repoRoot];
+    if (r) {
+      r.subagents = num(r.subagents) + 1;
+      repoTotalsCache = null;
+    }
   }
 
   switch (ev.event) {
@@ -982,12 +994,17 @@ function repoTotalsAllTime() {
   const agg = aggregateReposAcrossDates(listRollupDates());
   const out = {};
   for (const root of Object.keys(agg)) {
+    const bt = agg[root].byTool || {};
+    let tools = 0;
+    for (const k of Object.keys(bt)) tools += num(bt[k]);
     out[root] = {
-      // prompts + activeMs count live turns only (backfill can't reconstruct turn
-      // boundaries), so they under-represent repos with imported history — unlike
-      // tokens/cost.
+      // prompts, activeMs, subagents, tools all count live turns/events only (backfill
+      // can't reconstruct them), so they under-represent repos with imported history —
+      // unlike tokens/cost.
       prompts: agg[root].prompts,
       activeMs: agg[root].activeMs,
+      subagents: num(agg[root].subagents),
+      tools,
       tokens: agg[root].tokens,
       cost: cfg.cost.enabled ? pricing.estimateCost(agg[root].byModel, cfg.cost.rates).total : null,
     };
@@ -1079,10 +1096,11 @@ function aggregateReposAcrossDates(dates) {
     if (!rollup || !rollup.repos) continue;
     for (const root of Object.keys(rollup.repos)) {
       const rr = rollup.repos[root];
-      const a = agg[root] || (agg[root] = { repoRoot: root, repoName: rr.repoName, prompts: 0, activeMs: 0, tokens: emptyTokens(), byModel: {}, byTool: {} });
+      const a = agg[root] || (agg[root] = { repoRoot: root, repoName: rr.repoName, prompts: 0, activeMs: 0, subagents: 0, tokens: emptyTokens(), byModel: {}, byTool: {} });
       if (rr.repoName) a.repoName = rr.repoName;
       a.prompts += num(rr.prompts);
       a.activeMs += num(rr.activeMs);
+      a.subagents += num(rr.subagents);
       addTokens(a.tokens, rr.tokens);
       for (const m of Object.keys(rr.byModel || {})) {
         addTokens(a.byModel[m] || (a.byModel[m] = emptyTokens()), rr.byModel[m]);

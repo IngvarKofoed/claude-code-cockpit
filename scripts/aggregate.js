@@ -308,6 +308,7 @@ function ensureRepo(rollup, repoRoot, repoName) {
       tokens: emptyTokens(),
       byModel: {},
       byTool: {}, // toolName -> count, tallied from PreToolUse (event-derived, unconditional)
+      subagents: 0, // total subagents spawned, tallied from SubagentStart (event-derived)
       cost: null, // priced by the daemon, not here
       lastActive: null,
     };
@@ -425,6 +426,10 @@ function accumulateActiveFromEvents(rollup, events) {
     if (ev && ev.event === 'PreToolUse' && ev.tool_name != null && sess && sess.repoRoot != null) {
       const repo = ensureRepo(rollup, sess.repoRoot, sess.repoName);
       repo.byTool[ev.tool_name] = num(repo.byTool[ev.tool_name]) + 1;
+    }
+    // Per-repo subagent count, same unconditional event-derived pattern as byTool.
+    if (ev && ev.event === 'SubagentStart' && sess && sess.repoRoot != null) {
+      ensureRepo(rollup, sess.repoRoot, sess.repoName).subagents += 1;
     }
   }
   return rollup;

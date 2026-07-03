@@ -161,3 +161,13 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     persisting across the Stop while subagents stay in flight, cleared when fully idle); the card ticks from it
     (label "working") when there's no open prompt but a subagent is active. So an open turn still shows its
     prompt timer, and a background workflow shows a continuous "working" timer instead of a frozen dash.
+
+21. Status-change pulse made clearly visible and the repo-total row completed:
+    - The pulse now uses a thick ring + a large outer glow + an inner glow (was a faint outer glow only), and
+      the running→idle "done" pulse is a BRIGHT sky-blue — the mid accent blue was washing out against the
+      dark-blue backdrop.
+    - The card's muted repo-total row now also shows Agents and Tools totals (it previously stopped after
+      Active). Backed by a new per-repo `subagents` count in the rollup (event-derived from `SubagentStart`,
+      same unconditional pattern as `byTool`) plus a `tools` = Σ`byTool`, both summed across days and exposed on
+      `repoTotals`; `byTool`/`SubagentStart` now invalidate `repoTotalsCache`. Like chats/active, these are
+      live-only (no backfill). Reverses the earlier spec non-goal that the total row carried no Agents/Tools cell.

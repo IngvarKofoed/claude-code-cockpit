@@ -298,21 +298,27 @@ body {
    short pulse. Finite iteration counts mean a lingering class never pulses forever.
    Disabled under prefers-reduced-motion by the global rule at the bottom of this file. */
 .card--flash { animation: cardPulse 0.7s ease-in-out 1; }
-/* Important transitions: longer (5 pulses), equal length, distinct colours. */
-.card--flash-done { --flash-color: rgba(57, 135, 229, 0.6); animation-iteration-count: 5; }   /* running→idle: accent blue */
-.card--flash-waiting { --flash-color: rgba(245, 177, 32, 0.6); animation-iteration-count: 5; } /* running→waiting: amber */
+/* Important transitions: longer (5 pulses), equal length, distinct colours. `done`
+   uses a BRIGHT sky-blue (the mid accent blue blended into the dark-blue backdrop). */
+.card--flash-done { --flash-color: rgba(96, 180, 255, 0.9); animation-iteration-count: 5; }    /* running→idle */
+.card--flash-waiting { --flash-color: rgba(245, 177, 32, 0.85); animation-iteration-count: 5; } /* running→waiting */
 /* Everyday transitions: one short pulse in the new status's colour. */
-.card--flash-running { --flash-color: rgba(51, 193, 122, 0.5); }
-.card--flash-error { --flash-color: rgba(226, 86, 79, 0.5); }
-.card--flash-idle { --flash-color: rgba(107, 118, 136, 0.45); }
+.card--flash-running { --flash-color: rgba(51, 193, 122, 0.7); }
+.card--flash-error { --flash-color: rgba(226, 86, 79, 0.8); }
+.card--flash-idle { --flash-color: rgba(120, 132, 150, 0.6); }
 
 @keyframes cardPulse {
-  /* Symmetric fade (transparent → colour → transparent) = one clean pulse per cycle;
-     the same three shadow layers throughout so the list interpolates cleanly. */
-  0%, 100% { box-shadow: var(--shadow), 0 0 0 1px transparent, 0 0 0 -4px transparent; }
+  /* Symmetric fade (transparent → colour → transparent) = one clean pulse per cycle.
+     A thick ring + a big outer glow + an inner glow make it clearly visible on the
+     dark theme; the same four shadow layers throughout so the list interpolates cleanly. */
+  0%, 100% {
+    box-shadow: var(--shadow), 0 0 0 0 transparent, 0 0 0 0 transparent, inset 0 0 0 0 transparent;
+  }
   50% {
-    box-shadow: var(--shadow), 0 0 0 1px var(--flash-color, var(--accent)),
-      0 0 22px -4px var(--flash-color, var(--accent));
+    box-shadow: var(--shadow),
+      0 0 0 2px var(--flash-color, var(--accent)),
+      0 0 40px 4px var(--flash-color, var(--accent)),
+      inset 0 0 30px -6px var(--flash-color, var(--accent));
   }
 }
 

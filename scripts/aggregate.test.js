@@ -613,6 +613,19 @@ test('accumulateActiveFromEvents: tallies byTool by tool_name, per repo', () => 
   assert.deepStrictEqual(rollup.repos['/code/other'].byTool, { Read: 1 });
 });
 
+test('accumulateActiveFromEvents: tallies per-repo subagent count from SubagentStart', () => {
+  const events = [
+    ev('SessionStart', { ts: '2026-07-02T10:00:00.000Z' }),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('SubagentStart', { ts: '2026-07-02T10:00:01.000Z', agent_type: 'Explore' }),
+    ev('SubagentStart', { ts: '2026-07-02T10:00:02.000Z', agent_type: 'workflow-subagent' }),
+    ev('SubagentStop', { ts: '2026-07-02T10:00:09.000Z' }), // stop does NOT decrement the cumulative count
+    ev('Stop', { ts: '2026-07-02T10:00:10.000Z' }),
+  ];
+  const rollup = accumulateActiveFromEvents(createRollup('2026-07-02'), events);
+  assert.strictEqual(rollup.repos['/code/acme-api'].subagents, 2); // 2 spawned (stop doesn't reduce it)
+});
+
 test('accumulateActiveFromEvents: byTool counts a PreToolUse even when activeDelta is 0 (unconditional)', () => {
   // A PreToolUse fired from an idle session settles activeDelta === 0 (there was no
   // prior engaged span to close), yet byTool must still count it — the deliberate
