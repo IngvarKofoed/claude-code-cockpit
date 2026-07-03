@@ -114,3 +114,43 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     (an event appended during the boot read window; a same-day upgrade from a pre-clock v0.4.0 snapshot with no
     `engagedSince`; a boot straddling local midnight) — it self-corrects on the next restart's re-derivation,
     and fully unifying the snapshot-fast-start and event-rescan paths is a deferred follow-up.
+
+15. Live view gained a per-browser sort toggle (`Status | Name`) in its header. `Name` sorts cards purely
+    alphabetically by repo (then cwd, then sessionId) for STABLE positions that don't reorder on activity;
+    `Status` (default) keeps the server's waiting-first order. Client-only, remembered in `localStorage`
+    (`cockpit.liveSort`) — the daemon's `compareCards` is untouched. Waiting is not floated up in `Name` mode;
+    acceptable because the working set is small (grid never scrolls) and the ribbon's "Waiting" tile backstops.
+
+16. Live cards show two new per-session stat columns — Agents (`subagents.total`, per-type tooltip) and Tools
+    (`session.toolCount`) — and the wall-clock Age column was dropped, so the row is now
+    Chats·Tokens·[Cost]·Active·Agents·Tools. Note the display labels: the prompt-count column is labelled
+    "Chats" (field is still `promptCount`) and the subagent column "Agents" — a UI wording choice; the "Chats"
+    rename also applies to the Per-repo table's prompt column. Card width tuned to `.cards` minmax
+    min(420px,100%) so THREE cards fit across the 1400px content column, with a tight stat-grid gap + compact
+    mono values so the (now 6) columns fit. The old active-subagent chip was removed (column + tooltip
+    subsume it).
+
+17. Tool usage is now counted. Per session: `session.toolCount` increments on every `PreToolUse`
+    (num()-guarded for snapshot restore), including subagent tool calls (they fire on the parent session_id).
+    Per repo: a new event-derived `byTool` rollup tallies `PreToolUse` by tool name — UNCONDITIONALLY, on its
+    own branch, NOT gated on the active clock's `activeDelta>0` (else midnight/idle-start calls would drop and
+    live-vs-rescan would diverge) — exposed on `/api/state` repos and `/api/history` topRepos, and shown as a
+    sortable "Tools" column (with a per-tool breakdown tooltip) on the Per-repo page. Like active time, byTool
+    is event-derived, so backfilled/event-pruned days show Tools 0.
+
+18. The Live card's model chip now shows the session's CURRENT model, reversing entry 12's dominant-by-output.
+    `updateSessionTokens` sets `session.model` from the most-recent transcript message with `output>0`,
+    EXCLUDING sidechain (subagent) turns and `<synthetic>`/`unknown` pseudo-models (`isDisplayModel` +
+    the new `transcript.js` `sidechain` flag) — so a mid-session `/model` switch shows on the next real turn
+    without a subagent's cheaper model or a usage-only record mislabeling it. `session.modelsUsed` (real models,
+    first-seen) drives a "models this session (current)" tooltip. Display only — per-message token/cost
+    attribution is unchanged (only a truly model-less message's fallback bucket tracks the displayed model).
+
+19. Cards PULSE on a status change to make it noticeable, with the two most important transitions emphasized:
+    running→idle ("done", a distinct accent-blue pulse — not the muted idle grey) and running→waiting ("needs
+    you", amber) pulse LONGER (5 cycles, equal length); every other change is one short pulse in the new
+    status's colour. Reuses the existing `prevStatus` transition detection (a single pass shared with the sound
+    cues), gated on `soundsPrimed` so the first snapshot / reconnect resync doesn't flash the grid. Keyed by a
+    per-session `App.flash` = {until, cls} window (not a one-shot set) so the pulse survives the frequent
+    card-grid re-renders; finite CSS iteration counts mean a lingering class never pulses forever. New sessions
+    pulse once as a new-card cue; disabled under `prefers-reduced-motion`.

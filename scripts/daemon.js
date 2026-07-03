@@ -649,6 +649,18 @@ function handleEvent(ev) {
     }
   }
 
+  // Tally per-repo tool usage on its OWN PreToolUse branch — NOT alongside the
+  // active-delta fold above, which is gated on activeDelta > 0. byTool is
+  // unconditional (every PreToolUse with a tool_name): a PreToolUse can settle
+  // activeDelta === 0 (first event after rolloverDay nulled engagedSince at
+  // midnight, or a tool starting engagement from idle), and gating only this live
+  // path would make today's byTool disagree with the accumulateActiveFromEvents
+  // rescan on restart. accumulateSession (above) already ensured the repo entry.
+  if (ev.event === 'PreToolUse' && ev.tool_name != null && session && session.repoRoot) {
+    const r = todayRollup.repos[session.repoRoot];
+    if (r) r.byTool[ev.tool_name] = num(r.byTool[ev.tool_name]) + 1;
+  }
+
   switch (ev.event) {
     case 'Stop':
       ingestTurn(sid, ev);
@@ -841,31 +853,44 @@ function appendUsage(rec, date = currentDate) {
   }
 }
 
+// A per-message model id names a real, displayable model only if it isn't the
+// 'unknown' bucket nor one of Claude Code's `<synthetic>` / `<...>` pseudo-model
+// markers (written on synthetic transcript entries) — those must never surface as a
+// real model in the chip or the "models this session" tooltip.
+function isDisplayModel(m) {
+  return typeof m === 'string' && m !== '' && m !== 'unknown' && m[0] !== '<';
+}
+
 function updateSessionTokens(sid, usage) {
   const session = state.sessions[sid];
   if (!session) return;
   session.tokens = usage.totals;
   session.cost = cfg.cost.enabled ? pricing.estimateCost(usage.byModel, cfg.cost.rates).total : null;
-  // Backfill the session's displayed model from the transcript. The SessionStart
+  // Backfill the session's DISPLAYED model from the transcript. The SessionStart
   // hook is the ONLY event that ever carries `model`, and it may omit it (docs:
   // optional), so a resumed session or one first seen after a snapshot loss shows
-  // no model chip. Pick the DOMINANT model by output tokens — not the most-recent
-  // message, which can be a transient compaction/summary or sub-model turn that
-  // would mislabel an Opus/Sonnet session. Only overwrite when the transcript
-  // actually names a model, never clobbering a known model with a blank.
+  // no model chip. Show the CURRENT model — the model of the most-recent transcript
+  // message that actually GENERATED output (output > 0) — so a mid-session /model
+  // switch is reflected on the next real turn. The output > 0 filter skips
+  // usage-only/cache-only records that would otherwise flicker the chip across the
+  // ~5s pollTokens re-reads; only overwrite when such a message is found, so a
+  // transcript with no output-bearing message yet keeps the existing model.
+  const messages = Array.isArray(usage.messages) ? usage.messages : [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    // Skip sidechain (subagent) turns: a subagent may run a different/cheaper model,
+    // which isn't the SESSION's model and would mislabel the chip while it runs.
+    if (m && !m.sidechain && isDisplayModel(m.model) && num(m.output) > 0) {
+      session.model = m.model;
+      break;
+    }
+  }
+  // Full set of real models this session has used (first-seen order; 'unknown' and
+  // `<synthetic>`-style pseudo-models dropped). Stored uncapped — the tooltip's
+  // cap-at-5 is a client display concern.
   const bm = usage.byModel;
   if (bm && typeof bm === 'object') {
-    let best = null;
-    let bestOut = -1;
-    for (const m of Object.keys(bm)) {
-      if (m === 'unknown') continue;
-      const out = num(bm[m] && bm[m].output);
-      if (out > bestOut) {
-        bestOut = out;
-        best = m;
-      }
-    }
-    if (best) session.model = best;
+    session.modelsUsed = Object.keys(bm).filter(isDisplayModel);
   }
 }
 
@@ -936,6 +961,7 @@ function reposSummary() {
       prompts: r.prompts,
       sessions: r.sessions.length,
       tokens: r.tokens,
+      byTool: r.byTool,
       cost,
       lastActive: r.lastActive,
     });
@@ -1053,13 +1079,16 @@ function aggregateReposAcrossDates(dates) {
     if (!rollup || !rollup.repos) continue;
     for (const root of Object.keys(rollup.repos)) {
       const rr = rollup.repos[root];
-      const a = agg[root] || (agg[root] = { repoRoot: root, repoName: rr.repoName, prompts: 0, activeMs: 0, tokens: emptyTokens(), byModel: {} });
+      const a = agg[root] || (agg[root] = { repoRoot: root, repoName: rr.repoName, prompts: 0, activeMs: 0, tokens: emptyTokens(), byModel: {}, byTool: {} });
       if (rr.repoName) a.repoName = rr.repoName;
       a.prompts += num(rr.prompts);
       a.activeMs += num(rr.activeMs);
       addTokens(a.tokens, rr.tokens);
       for (const m of Object.keys(rr.byModel || {})) {
         addTokens(a.byModel[m] || (a.byModel[m] = emptyTokens()), rr.byModel[m]);
+      }
+      for (const t of Object.keys(rr.byTool || {})) {
+        a.byTool[t] = num(a.byTool[t]) + num(rr.byTool[t]);
       }
     }
   }
@@ -1108,6 +1137,7 @@ function buildHistory(rangeRaw) {
       repoName: a.repoName,
       activeMs: a.activeMs,
       tokens: a.tokens,
+      byTool: a.byTool,
       cost: cfg.cost.enabled ? pricing.estimateCost(a.byModel, cfg.cost.rates).total : null,
     }))
     .sort((x, y) => y.activeMs - x.activeMs)

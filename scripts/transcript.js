@@ -40,11 +40,16 @@ function parseUsageLine(obj) {
   // Per-message wall-clock time, so the daemon can attribute a back-read turn's
   // tokens to the day they were actually spent (not the ingest time). May be null.
   const ts = obj.timestamp || (msg && msg.timestamp) || obj.ts || null;
+  // Sidechain = a subagent turn recorded in the parent transcript; may run on a
+  // different model. Surfaced so the daemon can exclude it when choosing the
+  // session's DISPLAYED model (a subagent's model isn't the session's model).
+  const sidechain = obj.isSidechain === true;
 
   return {
     id,
     ts,
     model,
+    sidechain,
     input: num(usage.input_tokens),
     output: num(usage.output_tokens),
     cacheRead: num(usage.cache_read_input_tokens),

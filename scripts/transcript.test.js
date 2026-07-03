@@ -32,11 +32,19 @@ test('parseUsageLine: flat usage shape maps every field', () => {
     id: 'a1',
     ts: null, // no timestamp on this line
     model: 'claude-sonnet-5',
+    sidechain: false,
     input: 10,
     output: 20,
     cacheRead: 3,
     cacheWrite: 5,
   });
+});
+
+test('parseUsageLine: isSidechain surfaces as sidechain:true (subagent turn)', () => {
+  const out = parseUsageLine({ uuid: 's1', isSidechain: true, model: 'claude-haiku-4-5', usage: { output_tokens: 9 } });
+  assert.strictEqual(out.sidechain, true);
+  // absent / falsy isSidechain -> false
+  assert.strictEqual(parseUsageLine({ usage: { output_tokens: 1 } }).sidechain, false);
 });
 
 test('parseUsageLine: extracts per-message timestamp (top-level and nested)', () => {
@@ -87,6 +95,7 @@ test('parseUsageLine: missing token fields default to 0, missing model -> null',
     id: 'x',
     ts: null,
     model: null,
+    sidechain: false,
     input: 7,
     output: 0,
     cacheRead: 0,

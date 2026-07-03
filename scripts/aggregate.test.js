@@ -315,6 +315,33 @@ test('SubagentStop never drives active below 0', () => {
   assert.strictEqual(state.sessions.s1.subagents.active, 0);
 });
 
+// --- tool counts -------------------------------------------------------------
+
+test('toolCount starts at 0 and increments on each PreToolUse (incl. subagent tools)', () => {
+  const start = run([ev('SessionStart')]);
+  assert.strictEqual(start.sessions.s1.toolCount, 0); // newSession seeds 0
+
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { prompt_id: 'p1' }),
+    ev('PreToolUse', { tool_name: 'Bash' }),
+    ev('PreToolUse', { tool_name: 'Edit' }),
+    ev('PostToolUse'),
+    ev('PreToolUse', { tool_name: 'Read' }), // subagent tools fire on the same session_id
+  ]);
+  assert.strictEqual(state.sessions.s1.toolCount, 3);
+});
+
+test('toolCount is safe when a session lacks the counter (older snapshot)', () => {
+  // A pre-toolCount snapshot restores a session straight from JSON (no newSession),
+  // so toolCount is absent. The num() guard must start it from 0, never NaN.
+  const state = createState();
+  state.sessions.s1 = { sessionId: 's1', status: 'running', subagents: { active: 0 }, currentPrompt: null };
+  applyEvent(state, ev('PreToolUse', { ts: '2026-07-02T10:00:01.000Z', tool_name: 'Bash' }));
+  assert.strictEqual(state.sessions.s1.toolCount, 1);
+  assert.ok(Number.isFinite(state.sessions.s1.toolCount));
+});
+
 // --- robustness --------------------------------------------------------------
 
 test('unknown events are ignored but still refresh lastActivityAt/metadata', () => {
@@ -540,6 +567,45 @@ test('accumulateActiveFromEvents: a closing event with no prior engaged state co
 test('accumulateActiveFromEvents: bad input is a safe no-op', () => {
   assert.deepStrictEqual(accumulateActiveFromEvents(createRollup('2026-07-02'), null).repos, {});
   assert.deepStrictEqual(accumulateActiveFromEvents(createRollup('2026-07-02'), 'nope').repos, {});
+});
+
+test('accumulateActiveFromEvents: tallies byTool by tool_name, per repo', () => {
+  const events = [
+    ev('SessionStart', { ts: '2026-07-02T10:00:00.000Z' }),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:01.000Z', tool_name: 'Bash' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:02.000Z', tool_name: 'Edit' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:03.000Z', tool_name: 'Bash' }),
+    ev('Stop', { ts: '2026-07-02T10:00:04.000Z' }),
+    // A second repo/session tallies into its own byTool bucket.
+    { ts: '2026-07-02T10:00:00.000Z', event: 'UserPromptSubmit', session_id: 'b', repo_root: '/code/other', repo_name: 'other', prompt_id: 'p1' },
+    { ts: '2026-07-02T10:00:01.000Z', event: 'PreToolUse', session_id: 'b', repo_root: '/code/other', repo_name: 'other', tool_name: 'Read' },
+    { ts: '2026-07-02T10:00:02.000Z', event: 'Stop', session_id: 'b', repo_root: '/code/other', repo_name: 'other' },
+  ];
+  const rollup = accumulateActiveFromEvents(createRollup('2026-07-02'), events);
+  assert.deepStrictEqual(rollup.repos['/code/acme-api'].byTool, { Bash: 2, Edit: 1 });
+  assert.deepStrictEqual(rollup.repos['/code/other'].byTool, { Read: 1 });
+});
+
+test('accumulateActiveFromEvents: byTool counts a PreToolUse even when activeDelta is 0 (unconditional)', () => {
+  // A PreToolUse fired from an idle session settles activeDelta === 0 (there was no
+  // prior engaged span to close), yet byTool must still count it — the deliberate
+  // divergence from the active-time fold, which IS gated on activeDelta > 0. Verify
+  // the live clock produces activeDelta 0 for this event, then that byTool counts it.
+  const live = run([
+    ev('SessionStart', { ts: '2026-07-02T10:00:00.000Z' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:01.000Z', tool_name: 'Read' }),
+  ]);
+  assert.strictEqual(live.sessions.s1.activeDelta, 0); // idle -> no span settled
+
+  const events = [
+    ev('SessionStart', { ts: '2026-07-02T10:00:00.000Z' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:01.000Z', tool_name: 'Read' }),
+  ];
+  const rollup = accumulateActiveFromEvents(createRollup('2026-07-02'), events);
+  const repo = rollup.repos['/code/acme-api'];
+  assert.deepStrictEqual(repo.byTool, { Read: 1 }); // counted despite activeDelta 0
+  assert.strictEqual(repo.activeMs, 0); // ...and no active time was folded
 });
 
 // --- fixes locked in ---------------------------------------------------------

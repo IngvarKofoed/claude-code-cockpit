@@ -253,7 +253,11 @@ body {
 
 .cards {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+  /* 420px fits THREE cards across the 1400px-max content column while still holding
+     the 7-column stat row (Prompts · Tokens · Cost · Active · Subs · Tools · Age) —
+     the stat grid uses a tight gap + compact mono values to fit. min(...,100%) keeps
+     a single card from overflowing a narrow viewport. */
+  grid-template-columns: repeat(auto-fill, minmax(min(420px, 100%), 1fr));
   gap: 16px;
 }
 
@@ -284,6 +288,32 @@ body {
   border-color: rgba(245, 177, 32, 0.55);
   box-shadow: var(--shadow), 0 0 0 1px rgba(245, 177, 32, 0.25),
     0 0 26px -8px rgba(245, 177, 32, 0.5);
+}
+
+/* Pulse a card on a status change. renderLive adds card--flash (+ a variant chosen
+   by the transition) to a card while its flash window is open (App.flash), so the
+   pulse survives the frequent card-grid re-renders. The two most important
+   transitions — running→idle ("done") and running→waiting ("needs you") — pulse
+   LONGER (5 cycles) and in a distinct colour; every other change gets a single
+   short pulse. Finite iteration counts mean a lingering class never pulses forever.
+   Disabled under prefers-reduced-motion by the global rule at the bottom of this file. */
+.card--flash { animation: cardPulse 0.7s ease-in-out 1; }
+/* Important transitions: longer (5 pulses), equal length, distinct colours. */
+.card--flash-done { --flash-color: rgba(57, 135, 229, 0.6); animation-iteration-count: 5; }   /* running→idle: accent blue */
+.card--flash-waiting { --flash-color: rgba(245, 177, 32, 0.6); animation-iteration-count: 5; } /* running→waiting: amber */
+/* Everyday transitions: one short pulse in the new status's colour. */
+.card--flash-running { --flash-color: rgba(51, 193, 122, 0.5); }
+.card--flash-error { --flash-color: rgba(226, 86, 79, 0.5); }
+.card--flash-idle { --flash-color: rgba(107, 118, 136, 0.45); }
+
+@keyframes cardPulse {
+  /* Symmetric fade (transparent → colour → transparent) = one clean pulse per cycle;
+     the same three shadow layers throughout so the list interpolates cleanly. */
+  0%, 100% { box-shadow: var(--shadow), 0 0 0 1px transparent, 0 0 0 -4px transparent; }
+  50% {
+    box-shadow: var(--shadow), 0 0 0 1px var(--flash-color, var(--accent)),
+      0 0 22px -4px var(--flash-color, var(--accent));
+  }
 }
 
 .card__body {
@@ -412,7 +442,7 @@ body {
 
 .card__stats {
   display: grid;
-  column-gap: 12px;
+  column-gap: 8px; /* tight — 7 columns in a ~420px card */
   row-gap: 5px;
   padding-top: 2px;
   border-top: 1px solid var(--border);
@@ -422,12 +452,13 @@ body {
 .stat__k {
   font-size: 10px;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.02em;
   color: var(--ink-muted);
+  white-space: nowrap;
 }
 .stat__v {
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }

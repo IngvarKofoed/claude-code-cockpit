@@ -15,10 +15,12 @@ const App = {
   view: "live",
   repoRange: "today",
   histRange: "7d",
+  liveSort: "status", // "status" (server waiting-first) | "name" (alpha); set from localStorage in init
   repoRows: [], // normalized rows currently shown in the per-repo table
   repoSort: { key: "activeMs", dir: -1 }, // dir: 1 asc, -1 desc
   prevStatus: {}, // sessionId -> last status, for sound-cue transition detection
   soundsPrimed: false, // suppress cues on first snapshot / after a reconnect gap
+  flash: {}, // sessionId -> { until: epoch ms window ends, cls: variant class } for the status-change pulse
   longFired: {}, // sessionId -> promptStartMs already alerted for longRunning
   timers: [], // [{ el, start, kind }] updated once per second
   settingsRendered: false,
@@ -28,6 +30,8 @@ const App = {
 };
 
 const LOST_AFTER = 4; // consecutive SSE failures before showing the lost banner
+const FLASH_MS = 800; // window for a single short pulse (~0.7s cardPulse + margin)
+const FLASH_LONG_MS = 3700; // window for the important transitions (5 pulses ≈ 3.5s + margin)
 
 // ---- tiny helpers ----------------------------------------------------------
 
@@ -133,6 +137,34 @@ function shortModel(m) {
   return String(m || "").replace(/^claude-/, "");
 }
 
+// Tooltip for the card's model chip. With more than one model seen this session
+// (a mid-session /model switch), list them in first-seen order with the current
+// one marked; capped at 5 shown + "+N more". A single model → just its name.
+function modelsTooltip(s) {
+  const used = Array.isArray(s.modelsUsed) ? s.modelsUsed : [];
+  if (used.length <= 1) return shortModel(s.model);
+  const CAP = 5;
+  let shown = used.slice(0, CAP);
+  // Always surface the current model, even if it sorts beyond the cap — the tooltip's
+  // whole purpose is to reveal the current one, so it must never be the omitted item.
+  if (s.model && used.includes(s.model) && !shown.includes(s.model)) {
+    shown = shown.slice(0, CAP - 1).concat(s.model);
+  }
+  const more = used.length - shown.length;
+  const label = shown.map((m) => shortModel(m) + (m === s.model ? " (current)" : ""));
+  return "Models this session: " + label.join(", ") + (more > 0 ? " +" + more + " more" : "");
+}
+
+// Tooltip for the card's Subagents cell: per-type breakdown plus the active count.
+function subagentsTitle(sa) {
+  const parts = [];
+  const bt = sa && sa.byType && typeof sa.byType === "object" ? sa.byType : {};
+  for (const k of Object.keys(bt)) parts.push(k + " ×" + num(bt[k]));
+  const active = num(sa && sa.active);
+  if (active > 0) parts.push(active + " active");
+  return parts.length ? parts.join(" · ") : "Agents spawned this session";
+}
+
 // ---- HTTP ------------------------------------------------------------------
 
 async function api(path, opts) {
@@ -201,16 +233,36 @@ function evOn(name) {
 // notification-worthy transitions (only when browserSounds + that event is on).
 function detectSoundCues(sessions) {
   const next = {};
-  for (const s of sessions) next[s.sessionId] = s.status;
-  if (App.soundsPrimed && App.cfg && App.cfg.browserSounds) {
-    for (const s of sessions) {
-      const prev = App.prevStatus[s.sessionId];
-      const cur = s.status;
-      if (cur === prev) continue;
-      if (cur === "waiting" && evOn("needsInput")) CUES.needsInput();
-      else if (cur === "error" && evOn("turnFailed")) CUES.turnFailed();
-      else if (cur === "idle" && prev === "running" && evOn("sessionFinished")) CUES.sessionFinished();
+  const soundsOn = App.soundsPrimed && App.cfg && App.cfg.browserSounds;
+  const now = Date.now();
+  // Single pass over the transition (prev status -> current) for BOTH the pulse and
+  // the sound cue. On a change we open a flash window (App.flash[sid] = {until, cls}),
+  // so the card keeps its pulse class across the frequent SSE re-renders that rebuild
+  // the card grid. The two most important transitions get a longer window + a distinct
+  // variant: running→idle ("done", accent blue) and running→waiting ("needs you",
+  // amber) both pulse for FLASH_LONG_MS; every other change is one short pulse in the
+  // new status's colour. Gated on soundsPrimed (NOT browserSounds) so the pulse is
+  // visual regardless of the sound setting, while the first primed snapshot and
+  // post-reconnect resyncs don't flash the whole grid. A brand-new session (no prior
+  // status) counts as a transition.
+  for (const s of sessions) {
+    next[s.sessionId] = s.status;
+    const prev = App.prevStatus[s.sessionId];
+    if (s.status === prev || !App.soundsPrimed) continue;
+    let cls, dur;
+    if (prev === "running" && s.status === "idle") { cls = "card--flash-done"; dur = FLASH_LONG_MS; }
+    else if (prev === "running" && s.status === "waiting") { cls = "card--flash-waiting"; dur = FLASH_LONG_MS; }
+    else { cls = "card--flash-" + s.status; dur = FLASH_MS; }
+    App.flash[s.sessionId] = { until: now + dur, cls };
+    if (soundsOn) {
+      if (s.status === "waiting" && evOn("needsInput")) CUES.needsInput();
+      else if (s.status === "error" && evOn("turnFailed")) CUES.turnFailed();
+      else if (s.status === "idle" && prev === "running" && evOn("sessionFinished")) CUES.sessionFinished();
     }
+  }
+  // Drop expired / departed sessions so the map can't grow unbounded.
+  for (const sid of Object.keys(App.flash)) {
+    if (App.flash[sid].until <= now || !(sid in next)) delete App.flash[sid];
   }
   App.prevStatus = next;
   App.soundsPrimed = true;
@@ -294,27 +346,30 @@ function cardHTML(s) {
   const waiting = status === "waiting";
   const promptStart = s.currentPromptStartedAt;
   const promptStartMs = promptStart ? Date.parse(promptStart) : 0;
-  const startMs = Date.parse(s.startedAt || "") || 0;
   const tokensTotal = s.tokens == null ? null : sumTokens(s.tokens);
 
   const chips = [];
   if (s.permissionMode) chips.push(chip(s.permissionMode));
   if (s.effortLevel) chips.push(chip("effort: " + s.effortLevel));
-  if (s.model) chips.push(chip(shortModel(s.model), true));
-  if (s.subagents && s.subagents.active > 0)
-    chips.push(chip(s.subagents.active + " subagent" + (s.subagents.active > 1 ? "s" : "")));
+  // The model chip shows the current model; its tooltip reveals every model this
+  // session has used (marking the current one) when a /model switch has occurred.
+  if (s.model)
+    chips.push(`<span class="chip chip--mono" title="${esc(modelsTooltip(s))}">${esc(shortModel(s.model))}</span>`);
 
+  const sa = s.subagents || {};
   const stats = [
-    `<div class="stat"><span class="stat__k">Prompts</span><span class="stat__v">${num(s.promptCount)}</span></div>`,
+    `<div class="stat"><span class="stat__k">Chats</span><span class="stat__v">${num(s.promptCount)}</span></div>`,
     `<div class="stat"><span class="stat__k">Tokens</span><span class="stat__v">${tokensTotal == null ? "—" : esc(fmtTokens(tokensTotal))}</span></div>`,
   ];
   if (costEnabled())
     stats.push(`<div class="stat"><span class="stat__k">Cost</span><span class="stat__v">${esc(fmtCost(s.cost))}</span></div>`);
-  // Active = this session's cumulative working time (sum of closed turns), distinct
-  // from Age (wall-clock since the session started). Uses fmtDuration to match the
-  // Per-repo table and History, which render the same active-time metric.
+  // Active = this session's cumulative working time (sum of closed turns). Uses
+  // fmtDuration to match the Per-repo table and History, which render the same metric.
   stats.push(`<div class="stat"><span class="stat__k">Active</span><span class="stat__v">${esc(fmtDuration(num(s.activeMs)))}</span></div>`);
-  stats.push(`<div class="stat"><span class="stat__k">Age</span><span class="stat__v" data-timer="age" data-start="${startMs}">—</span></div>`);
+  // Subagents (total spawned; tooltip breaks down by type + active count) and Tools
+  // (all tool invocations this session, incl. those inside subagents).
+  stats.push(`<div class="stat" title="${esc(subagentsTitle(sa))}"><span class="stat__k">Agents</span><span class="stat__v">${num(sa.total)}</span></div>`);
+  stats.push(`<div class="stat"><span class="stat__k">Tools</span><span class="stat__v">${num(s.toolCount)}</span></div>`);
 
   // Repo-wide cumulative total (all sessions, all time), rendered as a second row
   // that shares the stat grid's columns — prompts/tokens/cost each land under the
@@ -323,7 +378,7 @@ function cardHTML(s) {
   // tooltip explains it. Cells auto-flow in column order (Age column left empty).
   const rt = App.state && App.state.repoTotals && s.repoRoot ? App.state.repoTotals[s.repoRoot] : null;
   const repoTok = rt && rt.tokens != null ? sumTokens(rt.tokens) : null;
-  const atTitle = "This repo's cumulative total across every session in retained history (all time, up to the retention limit), including backfilled sessions. Prompts and active time come from live sessions only — backfilled history contributes tokens/cost but no prompts or active time.";
+  const atTitle = "This repo's cumulative total across every session in retained history (all time, up to the retention limit), including backfilled sessions. Chats and active time come from live sessions only — backfilled history contributes tokens/cost but no chats or active time.";
   const rtCells = [
     `<span class="card__at-v" title="${atTitle}">${rt && rt.prompts != null ? num(rt.prompts) : "—"}</span>`,
     `<span class="card__at-v" title="${atTitle}">${repoTok == null ? "—" : esc(fmtTokens(repoTok))}</span>`,
@@ -331,11 +386,19 @@ function cardHTML(s) {
   if (costEnabled()) rtCells.push(`<span class="card__at-v" title="${atTitle}">${esc(fmtCost(rt ? rt.cost : null))}</span>`);
   // Repo all-time active time — aligns under the per-session Active column (pushed
   // after cost so column order matches the stats row in both cost/no-cost layouts).
-  // The Age column is intentionally left with no cumulative cell.
+  // The trailing Agents/Tools columns are intentionally left with no cumulative cell.
   rtCells.push(`<span class="card__at-v" title="${atTitle}">${rt && rt.activeMs != null ? esc(fmtDuration(num(rt.activeMs))) : "—"}</span>`);
 
+  // Pulse while this session's status-change window is open (see detectSoundCues).
+  // The window (a timestamp) keeps the class across the frequent card-grid re-renders;
+  // detectSoundCues chose the variant class per transition (a distinct/longer pulse for
+  // the important running→idle and running→waiting changes). Once the window lapses the
+  // class is gone, so a later re-render can't replay it.
+  const f = App.flash[s.sessionId];
+  const flash = f && f.until > Date.now() ? " card--flash " + f.cls : "";
+
   return `
-  <article class="card ${waiting ? "card--waiting" : ""}" data-status="${esc(status)}">
+  <article class="card ${waiting ? "card--waiting" : ""}${flash}" data-status="${esc(status)}">
     <div class="card__rail"></div>
     <div class="card__body">
       <div class="card__head">
@@ -400,8 +463,20 @@ function renderLive() {
     App.timers = [];
     return;
   }
-  // Server already sorts waiting-first; render in that order.
-  cards.innerHTML = sessions.map(cardHTML).join("");
+  // "status" renders the server order (already waiting-first via compareCards);
+  // "name" re-sorts a COPY alphabetically for stable positions (repoName, then
+  // cwd, then sessionId as tie-breakers) — waiting is not floated up in this mode.
+  let ordered = sessions;
+  if (App.liveSort === "name") {
+    ordered = sessions.slice().sort((a, b) => {
+      const byName = String(a.repoName || "").localeCompare(String(b.repoName || ""));
+      if (byName) return byName;
+      const byCwd = String(a.cwd || "").localeCompare(String(b.cwd || ""));
+      if (byCwd) return byCwd;
+      return String(a.sessionId || "").localeCompare(String(b.sessionId || ""));
+    });
+  }
+  cards.innerHTML = ordered.map(cardHTML).join("");
   cards.querySelectorAll(".path").forEach((btn) =>
     btn.addEventListener("click", () => copyPath(btn.dataset.path))
   );
@@ -423,15 +498,31 @@ async function copyPath(path) {
 const REPO_COLS = [
   { key: "repoName", label: "Repository", type: "str", get: (r) => r.repoName },
   { key: "activeMs", label: "Active", type: "num", get: (r) => r.activeMs, fmt: fmtDuration },
-  { key: "prompts", label: "Prompts", type: "num", get: (r) => r.prompts, fmt: (v) => (v == null ? "—" : String(v)) },
+  { key: "prompts", label: "Chats", type: "num", get: (r) => r.prompts, fmt: (v) => (v == null ? "—" : String(v)) },
   { key: "sessions", label: "Sessions", type: "num", get: (r) => r.sessions, fmt: (v) => (v == null ? "—" : String(v)) },
   { key: "tokensTotal", label: "Tokens", type: "num", get: (r) => r.tokensTotal, fmt: (v) => (v == null ? "—" : fmtTokens(v)) },
+  { key: "toolsTotal", label: "Tools", type: "num", get: (r) => r.toolsTotal, fmt: (v) => (v == null ? "—" : String(v)) },
   { key: "cost", label: "Cost", type: "num", get: (r) => r.cost, fmt: fmtCost },
   { key: "lastActive", label: "Last active", type: "time", get: (r) => r.lastActive, fmt: (v) => (v ? relTime(v) : "—") },
 ];
 
 function tokensBreakdown(t) {
   return `in ${fmtTokens(t.input)} · out ${fmtTokens(t.output)} · cache ${fmtTokens(num(t.cacheRead) + num(t.cacheWrite))}`;
+}
+
+// Sum a repo's per-tool counts. Returns null when the field is absent (older data /
+// a range that doesn't carry it) so the cell renders "—"; an empty {} sums to 0.
+function sumTools(bt) {
+  if (!bt || typeof bt !== "object") return null;
+  let n = 0;
+  for (const k of Object.keys(bt)) n += num(bt[k]);
+  return n;
+}
+
+function toolsBreakdown(bt) {
+  return Object.keys(bt)
+    .map((k) => `${k} ×${num(bt[k])}`)
+    .join(" · ");
 }
 
 function sortRepoRows(rows) {
@@ -478,8 +569,10 @@ function renderReposTable(rows) {
           const raw = c.get(r);
           const val = c.fmt ? c.fmt(raw) : raw == null ? "—" : String(raw);
           const muted = val === "—" ? ' class="muted"' : "";
-          const title =
-            c.key === "tokensTotal" && r.tokensObj ? ` title="${esc(tokensBreakdown(r.tokensObj))}"` : "";
+          let title = "";
+          if (c.key === "tokensTotal" && r.tokensObj) title = ` title="${esc(tokensBreakdown(r.tokensObj))}"`;
+          else if (c.key === "toolsTotal" && r.byTool && Object.keys(r.byTool).length)
+            title = ` title="${esc(toolsBreakdown(r.byTool))}"`;
           return `<td${muted}${title}>${esc(val)}</td>`;
         })
         .join("");
@@ -507,6 +600,8 @@ function renderReposFromState() {
     sessions: Array.isArray(r.sessions) ? r.sessions.length : typeof r.sessions === "number" ? r.sessions : null,
     tokensObj: r.tokens && typeof r.tokens === "object" ? r.tokens : null,
     tokensTotal: r.tokens == null ? null : sumTokens(r.tokens),
+    byTool: r.byTool && typeof r.byTool === "object" ? r.byTool : null,
+    toolsTotal: sumTools(r.byTool),
     cost: typeof r.cost === "number" ? r.cost : null,
     lastActive: r.lastActive || null,
   }));
@@ -528,6 +623,8 @@ function loadRepos() {
         sessions: null,
         tokensObj: r.tokens && typeof r.tokens === "object" ? r.tokens : null,
         tokensTotal: r.tokens == null ? null : sumTokens(r.tokens),
+        byTool: r.byTool && typeof r.byTool === "object" ? r.byTool : null,
+        toolsTotal: sumTools(r.byTool),
         cost: typeof r.cost === "number" ? r.cost : null,
         lastActive: null,
       }));
@@ -901,9 +998,32 @@ function connect() {
 // ---- init ------------------------------------------------------------------
 
 function init() {
+  // Per-browser Live sort preference (unknown value → "status"); reflect it in the toggle.
+  try {
+    const ls = localStorage.getItem("cockpit.liveSort");
+    if (ls === "name" || ls === "status") App.liveSort = ls;
+  } catch (_e) {
+    /* localStorage unavailable — keep the default */
+  }
+  const sortBtn = $("liveSort").querySelector(`.range__btn[data-sort="${App.liveSort}"]`);
+  if (sortBtn) setActiveRange("liveSort", sortBtn);
+
   $("nav").addEventListener("click", (e) => {
     const t = e.target.closest(".nav__tab");
     if (t) setView(t.dataset.view);
+  });
+
+  $("liveSort").addEventListener("click", (e) => {
+    const b = e.target.closest(".range__btn");
+    if (!b) return;
+    setActiveRange("liveSort", b);
+    App.liveSort = b.dataset.sort;
+    try {
+      localStorage.setItem("cockpit.liveSort", App.liveSort);
+    } catch (_e) {
+      /* persistence best-effort */
+    }
+    renderLive();
   });
 
   $("repoRange").addEventListener("click", (e) => {

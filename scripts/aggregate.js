@@ -47,6 +47,7 @@ function newSession(event) {
     currentPrompt: null, // { promptId, startedAt } while a turn is running
     currentActivity: null, // tool name Claude is running right now
     promptCount: 0,
+    toolCount: 0, // total tool invocations (incl. subagents), bumped on PreToolUse
     // Cumulative "engaged" wall-clock: time the session spent running a turn OR
     // with a subagent/workflow in flight, EXCLUDING permission/idle waits. Driven
     // by the incremental clock in applyEvent (see engagedSince), not by turn deltas.
@@ -140,6 +141,11 @@ function applyEvent(state, event) {
     case 'PreToolUse':
       session.status = 'running';
       if (event.tool_name != null) session.currentActivity = event.tool_name;
+      // num() coercion is required: loadSnapshot restores sessions straight from
+      // JSON without running newSession, so a session live across a daemon upgrade
+      // has no toolCount key and a bare += 1 would poison it to NaN (same guard the
+      // engaged clock uses for activeMs).
+      session.toolCount = num(session.toolCount) + 1;
       break;
 
     case 'PostToolUse':
@@ -291,6 +297,7 @@ function ensureRepo(rollup, repoRoot, repoName) {
       sessions: [], // distinct session ids
       tokens: emptyTokens(),
       byModel: {},
+      byTool: {}, // toolName -> count, tallied from PreToolUse (event-derived, unconditional)
       cost: null, // priced by the daemon, not here
       lastActive: null,
     };
@@ -398,6 +405,16 @@ function accumulateActiveFromEvents(rollup, events) {
       ensureRepo(rollup, sess.repoRoot, sess.repoName).activeMs += sess.activeDelta;
       const t = tsMs(ev.ts);
       if (t && Array.isArray(rollup.hourActive)) rollup.hourActive[new Date(t).getHours()] += sess.activeDelta;
+    }
+    // Tally per-repo tool usage on its OWN branch, UNCONDITIONALLY — every PreToolUse
+    // with a tool_name, independent of the engaged clock. Deliberately NOT gated on
+    // activeDelta > 0 like the active fold above: a PreToolUse can legitimately settle
+    // activeDelta === 0 (the first event after rolloverDay nulled engagedSince, or a
+    // tool starting engagement from idle), so gating byTool on the active fold would
+    // drop those calls and make today's figure change on restart vs. this rescan.
+    if (ev && ev.event === 'PreToolUse' && ev.tool_name != null && sess && sess.repoRoot != null) {
+      const repo = ensureRepo(rollup, sess.repoRoot, sess.repoName);
+      repo.byTool[ev.tool_name] = num(repo.byTool[ev.tool_name]) + 1;
     }
   }
   return rollup;
