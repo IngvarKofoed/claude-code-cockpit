@@ -676,7 +676,6 @@ function handleEvent(ev) {
   switch (ev.event) {
     case 'Stop':
       ingestTurn(sid, ev);
-      maybeNotify('sessionFinished', session);
       break;
     case 'Notification':
       if (ev.notification_type === 'permission_prompt') maybeNotify('needsInput', session);
@@ -692,6 +691,18 @@ function handleEvent(ev) {
       break;
     default:
       break;
+  }
+
+  // "Session finished" fires when the session actually finished working — the engaged→idle
+  // transition that aggregate flags as `disengagedNow` AND has settled to `idle` — NOT merely
+  // on Stop. Gating on the settled status being `idle` is essential: disengagedNow is also true
+  // on running→waiting (a permission prompt, which fires needsInput) and running→error (fires
+  // turnFailed), and on SessionEnd (status 'ended') — none of which are a finished turn. So a
+  // Stop that handed off to a still-running background workflow (bgTasks>0, still engaged) stays
+  // silent, and the notification lands only on the real completion (the Stop/SubagentStop that
+  // empties background_tasks and settles the session to idle).
+  if (session && session.disengagedNow && session.status === 'idle') {
+    maybeNotify('sessionFinished', session);
   }
 
   lastBusyAt = Date.now();

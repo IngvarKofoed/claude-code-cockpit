@@ -52,6 +52,15 @@ function newSession(event) {
     // with a subagent/workflow in flight, EXCLUDING permission/idle waits. Driven
     // by the incremental clock in applyEvent (see engagedSince), not by turn deltas.
     activeMs: 0,
+    // Count of background tasks (workflow / subagent / run_in_background shell / …) still in
+    // flight, from Claude Code's task registry (Stop / SubagentStop `background_tasks` length,
+    // v2.1.145+). The reliable "is this session still working after its turn's Stop" signal;
+    // drives isEngaged. 0 when nothing is backgrounded (or on older Claude Code that omits it).
+    bgTasks: 0,
+    // Set by applyEvent to true on exactly the event that ENDS the engaged period (turn done
+    // AND no background work left) — the daemon fires "session finished" on this, so a Stop that
+    // only handed off to a background workflow doesn't notify and the real completion does.
+    disengagedNow: false,
     engagedSince: null, // ms epoch the current engaged span began, or null when not engaged
     activeDelta: 0, // engaged ms settled by the LAST applyEvent (the daemon reads this per event)
     // ISO ts the current CONTINUOUS engaged period began (set on not-engaged→engaged,
@@ -86,13 +95,16 @@ function updateMeta(session, event) {
   if (event.source != null) session.source = event.source;
 }
 
-// A session is "engaged" (accruing active time) while it is running a turn OR has
-// a subagent/workflow agent in flight. NOT while merely `waiting` (a permission
-// prompt) or `idle`. The subagent clause is what lets a background workflow — whose
-// `workflow-subagent` SubagentStart/Stop arrive on this session AFTER the launching
-// turn's Stop — keep accruing while the main status sits idle.
+// A session is "engaged" (accruing active time, ticking the card's big timer) while it is
+// running a turn OR has background work still in flight. NOT while merely `waiting` (a
+// permission prompt) or `idle` with nothing backgrounded. "Background work in flight" comes
+// from Claude Code's AUTHORITATIVE task registry (session.bgTasks — the length of the Stop/
+// SubagentStop `background_tasks` array, v2.1.145+), NOT the ±unreliable SubagentStart/
+// SubagentStop counter. This is what keeps a background workflow / subagent / run_in_background
+// shell counting after the launching turn's Stop, while ensuring a dropped SubagentStop can no
+// longer strand the session "engaged" forever (the count self-heals on the next carrying event).
 function isEngaged(session) {
-  return session.status === 'running' || (session.subagents && session.subagents.active > 0);
+  return session.status === 'running' || num(session.bgTasks) > 0;
 }
 
 // Fold one event into state, mutating and returning the same object. Unknown
@@ -109,6 +121,16 @@ function applyEvent(state, event) {
 
   if (typeof event.ts === 'string') session.lastActivityAt = event.ts;
   updateMeta(session, event);
+
+  // Pre-event engaged state, captured BEFORE this event's status/bgTasks changes, so the
+  // re-anchor below can detect the engaged→idle transition (the true "finished" moment).
+  const wasEngaged = isEngaged(session);
+
+  // Absorb Claude Code's authoritative background-task count when this event carries it
+  // (Stop / SubagentStop). A present value — INCLUDING 0 — is authoritative; an absent field
+  // (older Claude Code, or an event that doesn't carry the registry) leaves the last known
+  // count intact. This is what settles bgTasks to 0 at real completion so isEngaged flips off.
+  if (typeof event.bg_tasks === 'number') session.bgTasks = event.bg_tasks;
 
   // --- engaged clock: settle the span that just elapsed under the PRE-event state.
   // engagedSince is non-null IFF the session was engaged since that instant, so its
@@ -171,12 +193,12 @@ function applyEvent(state, event) {
         // this is a no-op — we deliberately do NOT raise a distinct
         // "awaiting input" state that reads as needs-attention on a turn that
         // is simply done. But Claude Code also emits idle_prompt mid-turn while
-        // a subagent works and the main loop is quiet, so treat it as a
-        // done-signal only when nothing is in flight (no active subagent, no
-        // tool mid-call); that both avoids falsely idling a working session and
-        // still settles a `running` session whose Stop was somehow missed,
-        // which would otherwise tick a live timer forever.
-        const inFlight = session.subagents.active > 0 || session.currentActivity != null;
+        // background work runs and the main loop is quiet, so treat it as a
+        // done-signal only when nothing is in flight (no background task per the
+        // authoritative bgTasks count, no tool mid-call); that both avoids falsely
+        // idling a working session and still settles a `running` session whose Stop
+        // was somehow missed, which would otherwise tick a live timer forever.
+        const inFlight = num(session.bgTasks) > 0 || session.currentActivity != null;
         if (session.status === 'running' && !inFlight) {
           // Treat this as the missed Stop: CLOSE the turn — clear currentPrompt
           // (else snapshot keeps emitting currentPromptStartedAt and the browser
@@ -192,6 +214,8 @@ function applyEvent(state, event) {
 
     case 'Stop':
       session.currentPrompt = null;
+      session.currentActivity = null; // the turn's tool is no longer running; don't leave a
+      // stale "Running <tool>" showing while the card reads idle (or while background work runs)
       session.status = 'idle';
       break;
 
@@ -200,6 +224,7 @@ function applyEvent(state, event) {
       // running prompt so the dashboard stops ticking a live timer on a session
       // whose turn is already over.
       session.currentPrompt = null;
+      session.currentActivity = null;
       session.status = 'error';
       if (event.stop_reason != null) session.errorReason = event.stop_reason;
       break;
@@ -227,16 +252,30 @@ function applyEvent(state, event) {
       break;
   }
 
+  // Settle a stale background-residual `running`. When a background workflow runs after its
+  // launching turn's Stop, the subagents' PreToolUse/PostToolUse (on the parent) leave status
+  // at 'running' with no open prompt. So the event that empties background_tasks (typically the
+  // last SubagentStop) arrives while status is still 'running' — which would keep isEngaged
+  // true and never signal completion. If background work is now done (bgTasks===0) and no
+  // foreground turn is open (currentPrompt is null — an open turn would legitimately be
+  // running), that 'running' is residue: settle to idle so the engaged period actually ends
+  // (engagedNow below flips false → disengagedNow true → the daemon fires "finished" here, at
+  // real completion). Only touches 'running'; 'waiting'/'error' keep their meaning.
+  if (num(session.bgTasks) === 0 && !session.currentPrompt && session.status === 'running') {
+    session.status = 'idle';
+  }
+
   // Re-anchor the engaged clock based on the POST-event state.
-  if (isEngaged(session)) {
+  const engagedNow = isEngaged(session);
+  if (engagedNow) {
     // Advance the anchor to now, but NEVER move it backward on an out-of-order or
     // clock-skewed ts — that would make the next span over-count. A missing/bad ts
     // (nowMs === 0) leaves the existing anchor intact.
     if (nowMs && (!session.engagedSince || nowMs > session.engagedSince)) session.engagedSince = nowMs;
     // Stamp the START of this continuous engaged period once (on the not-engaged→
     // engaged transition, or when restored engaged without the field). It persists
-    // as the session stays engaged — including across a Stop while subagents keep
-    // working — so the card's timer counts the whole engaged period, not just the turn.
+    // as the session stays engaged — including across a Stop while background work
+    // keeps running — so the card's timer counts the whole engaged period, not just the turn.
     if (!session.engagedStartedAt && typeof event.ts === 'string') session.engagedStartedAt = event.ts;
   } else {
     // No longer engaged (turn ended / idle): stop the clock. Do this even with a bad
@@ -245,6 +284,12 @@ function applyEvent(state, event) {
     session.engagedSince = null;
     session.engagedStartedAt = null;
   }
+
+  // True exactly on the event that ended the engaged period (a Stop with no background work
+  // left, or the SubagentStop that emptied background_tasks) — NOT a Stop that handed off to a
+  // still-running background workflow. The daemon fires the "session finished" notification /
+  // "done" cue on this, so the notification lands at real completion, not the premature handoff.
+  session.disengagedNow = wasEngaged && !engagedNow;
 
   return state;
 }
@@ -257,20 +302,23 @@ function toCard(s) {
   const card = { ...s, currentPromptStartedAt: s.currentPrompt ? s.currentPrompt.startedAt : null };
   delete card.engagedSince;
   delete card.activeDelta;
+  delete card.disengagedNow; // daemon-only transition flag; bgTasks stays for the client's effectiveStatus
   return card;
 }
 
 // Waiting first (needs the user), then running, then everything else; ties
-// broken by most-recent activity.
-function statusRank(status) {
-  if (status === 'waiting') return 0;
-  if (status === 'running') return 1;
+// broken by most-recent activity. A session with background work still in flight
+// (bgTasks>0) ranks as running — it IS working, and the client colours/ticks it as
+// running — so its grid position agrees with its appearance (mirrors effectiveStatus).
+function statusRank(card) {
+  if (card.status === 'waiting') return 0;
+  if (card.status === 'running' || num(card.bgTasks) > 0) return 1;
   return 2;
 }
 
 function compareCards(a, b) {
-  const ra = statusRank(a.status);
-  const rb = statusRank(b.status);
+  const ra = statusRank(a);
+  const rb = statusRank(b);
   if (ra !== rb) return ra - rb;
   return tsMs(b.lastActivityAt) - tsMs(a.lastActivityAt);
 }

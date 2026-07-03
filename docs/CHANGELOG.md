@@ -186,3 +186,24 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     $15/$75 → $5/$25 correction reaches users who persisted a `rates` map (authoritative per entry 5, so it
     otherwise shadows the fix). Match is by value; a changed/removed rate is untouched. Persisted once as the
     minimal RAW config (omitted fields still inherit live defaults, not frozen), version-gated so it never re-runs.
+
+25. Session engagement (active-time clock + the card's big "working" timer) now derives from Claude Code's
+    authoritative `background_tasks` count — `emit.js` stores its LENGTH as `bgTasks` (Stop/SubagentStop payload,
+    v2.1.145+) — replacing the ±unreliable subagent start/stop counter, whose skew (up to +12 in a real day's
+    log) stranded done sessions "engaged": a phantom timer under an Idle badge + the idle gap folded into active.
+    `isEngaged = running || bgTasks>0`; a shared client `effectiveStatus` (and the server card sort) read a
+    session with background work in flight as "running", so badge/colour/timer/sort all agree. Bonus: a
+    `run_in_background` Bash (registry type "shell") now counts as active (closes an entry-14 gap); graceful on
+    Claude Code <2.1.145 (no `background_tasks` → running-only, no phantom). Stores the COUNT only — a task's
+    command/name/description is free text (paths, prompts) and would breach the no-message-content boundary.
+
+26. The "session finished" OS notification and the "done" card pulse/sound now fire on the real engaged→idle
+    transition (aggregate's `disengagedNow`) GATED on the settled status being `idle` — not merely on Stop. So a
+    handoff Stop with background work in flight stays silent, a permission prompt (running→waiting) fires only
+    needsInput, and "finished" lands at real completion. Since a background workflow's last subagent leaves status
+    `running`, the event that empties `background_tasks` first settles that residual `running`→idle (when no
+    foreground turn is open) so completion actually registers. Client pulse/sound key off the same
+    `effectiveStatus`, so visual, sound and OS notification agree.
+    Known limit: a DROPPED SubagentStop leaves the session "engaged" (a lingering "working" timer, no finished
+    ping) until the next turn's Stop re-reports the count — bounded and self-healing, unlike the old counter's
+    permanent drift.

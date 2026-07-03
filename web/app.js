@@ -246,18 +246,23 @@ function detectSoundCues(sessions) {
   // post-reconnect resyncs don't flash the whole grid. A brand-new session (no prior
   // status) counts as a transition.
   for (const s of sessions) {
-    next[s.sessionId] = s.status;
+    // Transitions key off effectiveStatus, not raw status: a background workflow holds it at
+    // "running" across the launching Stop and the idle gaps between subagent bursts, so the
+    // "done" pulse + sessionFinished cue fire only on the real engaged→idle transition (when
+    // background_tasks empties), never the premature handoff Stop.
+    const eff = effectiveStatus(s);
+    next[s.sessionId] = eff;
     const prev = App.prevStatus[s.sessionId];
-    if (s.status === prev || !App.soundsPrimed) continue;
+    if (eff === prev || !App.soundsPrimed) continue;
     let cls, dur;
-    if (prev === "running" && s.status === "idle") { cls = "card--flash-done"; dur = FLASH_LONG_MS; }
-    else if (prev === "running" && s.status === "waiting") { cls = "card--flash-waiting"; dur = FLASH_LONG_MS; }
-    else { cls = "card--flash-" + s.status; dur = FLASH_MS; }
+    if (prev === "running" && eff === "idle") { cls = "card--flash-done"; dur = FLASH_LONG_MS; }
+    else if (prev === "running" && eff === "waiting") { cls = "card--flash-waiting"; dur = FLASH_LONG_MS; }
+    else { cls = "card--flash-" + eff; dur = FLASH_MS; }
     App.flash[s.sessionId] = { until: now + dur, cls };
     if (soundsOn) {
-      if (s.status === "waiting" && evOn("needsInput")) CUES.needsInput();
-      else if (s.status === "error" && evOn("turnFailed")) CUES.turnFailed();
-      else if (s.status === "idle" && prev === "running" && evOn("sessionFinished")) CUES.sessionFinished();
+      if (eff === "waiting" && evOn("needsInput")) CUES.needsInput();
+      else if (eff === "error" && evOn("turnFailed")) CUES.turnFailed();
+      else if (eff === "idle" && prev === "running" && evOn("sessionFinished")) CUES.sessionFinished();
     }
   }
   // Drop expired / departed sessions so the map can't grow unbounded.
@@ -322,8 +327,20 @@ const STATUS_LABEL = {
   ended: "Ended",
 };
 
+// The card's effective status. A session with background work still in flight (bgTasks —
+// Claude Code's authoritative background_tasks count) reads as "running": it IS working after
+// its turn's Stop, so the badge, colour, big timer and pulse should all say so. A permission
+// prompt or error takes precedence (they need attention / are terminal). Derived from the
+// reliable count, never the ±unreliable subagent counter — so the timer can't disagree with
+// the colour, and the "done" pulse fires only on the real engaged→idle transition.
+function effectiveStatus(s) {
+  const raw = s.status || "idle";
+  if (raw === "waiting" || raw === "error") return raw;
+  return raw === "running" || num(s.bgTasks) > 0 ? "running" : "idle";
+}
+
 function activityText(s) {
-  switch (s.status) {
+  switch (effectiveStatus(s)) {
     case "running":
       return s.currentActivity ? "Running " + s.currentActivity : "Working…";
     case "waiting":
@@ -342,17 +359,26 @@ function chip(text, mono) {
 }
 
 function cardHTML(s) {
-  const status = s.status || "idle";
+  const status = effectiveStatus(s);
   const waiting = status === "waiting";
   const promptStart = s.currentPromptStartedAt;
   const promptStartMs = promptStart ? Date.parse(promptStart) : 0;
   // The big timer ticks for an open prompt (running/waiting) OR — so it keeps counting
-  // while a background workflow runs after the launching turn's Stop — while subagents
-  // are in flight, measured from when the session became engaged (engagedStartedAt).
-  const subActive = !!(s.subagents && s.subagents.active > 0);
-  const engagedMs = subActive && s.engagedStartedAt ? Date.parse(s.engagedStartedAt) : 0;
+  // while a background workflow runs after the launching turn's Stop — while the session
+  // is `running`, measured from when it became engaged (engagedStartedAt).
+  // Visibility is gated on the RELIABLE status (the same signal that drives the card
+  // colour), NOT on subagents.active: SubagentStart/SubagentStop are not guaranteed 1:1
+  // (a dropped/interrupted SubagentStop leaves the counter stuck > 0), so gating on it
+  // made an idle/gray card tick a phantom "working" timer forever. During a real
+  // background workflow the subagents' own PreToolUse/PostToolUse fire on the parent and
+  // hold status at `running`, so the timer keeps counting; the instant the session is
+  // idle/waiting/error the timer stops — the timer now always agrees with the colour.
+  const running = status === "running";
+  const engagedMs = running && s.engagedStartedAt ? Date.parse(s.engagedStartedAt) : 0;
   const timerMs = promptStartMs || engagedMs;
-  const timerLabel = status === "running" ? "elapsed" : engagedMs && !promptStartMs ? "working" : "prompt";
+  // Label only when there's an actual timer value; otherwise the "—" would sit under a
+  // misleading "working"/"prompt" action word (e.g. running with no engagedStartedAt yet).
+  const timerLabel = !timerMs ? "" : running ? (promptStartMs ? "elapsed" : "working") : "prompt";
   const tokensTotal = s.tokens == null ? null : sumTokens(s.tokens);
 
   const chips = [];
@@ -437,8 +463,8 @@ function tile(label, value, alert) {
 }
 
 function renderLiveRibbon(sessions) {
-  const running = sessions.filter((s) => s.status === "running").length;
-  const waiting = sessions.filter((s) => s.status === "waiting").length;
+  const running = sessions.filter((s) => effectiveStatus(s) === "running").length;
+  const waiting = sessions.filter((s) => effectiveStatus(s) === "waiting").length;
   const repos = (App.state && App.state.repos) || [];
   let tok = 0;
   let cost = 0;

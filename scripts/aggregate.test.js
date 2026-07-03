@@ -115,15 +115,16 @@ test('Notification idle_prompt after Stop leaves status idle (not a distinct sta
   assert.strictEqual(state.sessions.s1.status, 'idle');
 });
 
-test('Notification idle_prompt mid-turn does not clobber running (subagent active)', () => {
-  // idle_prompt can fire while a subagent works and the main loop is quiet;
-  // with a subagent in flight it must not flip the session to idle.
+test('Notification idle_prompt mid-turn does not clobber running (background work in flight)', () => {
+  // idle_prompt can fire while background work runs and the main loop is quiet; with a
+  // background task in flight (bgTasks>0, from Claude Code's registry) it must not idle.
   const state = run([
     ev('SessionStart'),
     ev('UserPromptSubmit', { prompt_id: 'p1' }),
-    ev('SubagentStart', { agent_type: 'Explore' }),
-    ev('PreToolUse', { tool_name: 'Bash' }),
-    ev('PostToolUse'), // clears currentActivity but subagent still active
+    ev('PreToolUse', { tool_name: 'Workflow' }),
+    ev('Stop', { ts: '2026-07-02T10:00:03.000Z', bg_tasks: 1 }), // handed off; a background task is in flight
+    ev('PreToolUse', { tool_name: 'Bash', agent_type: 'workflow-subagent' }), // subagent working -> running
+    ev('PostToolUse'), // clears currentActivity but the background task is still in flight
     ev('Notification', { notification_type: 'idle_prompt' }),
   ]);
   assert.strictEqual(state.sessions.s1.status, 'running');
@@ -221,43 +222,139 @@ test('activeMs EXCLUDES permission-waiting time within a turn', () => {
   assert.strictEqual(state.sessions.s1.activeMs, 5000);
 });
 
-test('activeMs COUNTS a background workflow running after the turn Stop', () => {
+test('activeMs COUNTS a background workflow running after the turn Stop (bgTasks-driven)', () => {
   const state = run([
     ev('SessionStart'),
     ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
-    ev('SubagentStart', { ts: '2026-07-02T10:00:10.000Z', agent_type: 'workflow-subagent' }), // +10s running
-    ev('Stop', { ts: '2026-07-02T10:00:12.000Z' }), // +2s; turn closes but subagent still active
-    ev('SubagentStop', { ts: '2026-07-02T10:05:12.000Z', agent_type: 'workflow-subagent' }), // +5min background (idle but engaged)
+    ev('PreToolUse', { ts: '2026-07-02T10:00:10.000Z', tool_name: 'Workflow' }), // +10s running (launch)
+    ev('Stop', { ts: '2026-07-02T10:00:12.000Z', bg_tasks: 1 }), // +2s; turn closes but a workflow is still in flight
+    ev('SubagentStop', { ts: '2026-07-02T10:05:12.000Z', bg_tasks: 0 }), // +5min background (idle but engaged), then all done
   ]);
-  // 12s in-turn + 300s background = 312s; the workflow time after Stop still counts.
-  assert.strictEqual(state.sessions.s1.activeMs, 312000);
-  assert.strictEqual(state.sessions.s1.status, 'idle');
+  const s = state.sessions.s1;
+  // 12s in-turn + 300s background = 312s; background_tasks kept the session engaged past Stop.
+  assert.strictEqual(s.activeMs, 312000);
+  assert.strictEqual(s.status, 'idle');
+  assert.strictEqual(s.bgTasks, 0);
+  assert.strictEqual(s.disengagedNow, true); // the SubagentStop that emptied bgTasks ended the engaged period
 });
 
 test('engagedStartedAt spans the whole engaged period so the card timer keeps counting', () => {
   const state = run([
     ev('SessionStart', { ts: '2026-07-02T10:00:00.000Z' }),
     ev('UserPromptSubmit', { ts: '2026-07-02T10:00:01.000Z', prompt_id: 'p1' }),
-    ev('SubagentStart', { ts: '2026-07-02T10:00:05.000Z', agent_type: 'workflow-subagent' }),
-    ev('Stop', { ts: '2026-07-02T10:00:08.000Z' }), // turn closes; subagent still running
+    ev('PreToolUse', { ts: '2026-07-02T10:00:05.000Z', tool_name: 'Workflow' }),
+    ev('Stop', { ts: '2026-07-02T10:00:08.000Z', bg_tasks: 1 }), // turn closes; workflow still in flight
   ]);
   const s = state.sessions.s1;
-  // Set at the prompt (engaged began) and UNCHANGED across Stop while the subagent runs,
-  // even though the prompt (and its live timer) is gone — so the timer keeps counting.
+  // Set at the prompt (engaged began) and UNCHANGED across the Stop while background work
+  // continues (bgTasks>0), even though the prompt (and its live timer) is gone — timer keeps counting.
   assert.strictEqual(s.engagedStartedAt, '2026-07-02T10:00:01.000Z');
   assert.strictEqual(s.currentPrompt, null);
-  // When the background work ends, it clears (timer stops -> "—").
-  applyEvent(state, ev('SubagentStop', { ts: '2026-07-02T10:05:00.000Z' }));
+  // When background work ends (background_tasks empties), it clears (timer stops -> "—").
+  applyEvent(state, ev('SubagentStop', { ts: '2026-07-02T10:05:00.000Z', bg_tasks: 0 }));
   assert.strictEqual(s.engagedStartedAt, null);
 });
 
-test('engagedStartedAt clears at Stop when no subagent is in flight (plain turn)', () => {
+test('engagedStartedAt clears at Stop when no background work is in flight (plain turn)', () => {
   const state = run([
     ev('SessionStart', { ts: '2026-07-02T10:00:00.000Z' }),
     ev('UserPromptSubmit', { ts: '2026-07-02T10:00:01.000Z', prompt_id: 'p1' }),
-    ev('Stop', { ts: '2026-07-02T10:00:04.000Z' }),
+    ev('Stop', { ts: '2026-07-02T10:00:04.000Z', bg_tasks: 0 }),
   ]);
   assert.strictEqual(state.sessions.s1.engagedStartedAt, null); // no lingering timer on a normal idle
+  assert.strictEqual(state.sessions.s1.disengagedNow, true); // a plain turn's Stop ends the engaged period
+});
+
+// --- background-task engagement (bgTasks, from Claude Code's background_tasks registry) ------
+
+test('a Stop that handed off to a background workflow stays engaged and does NOT signal finished', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:02.000Z', tool_name: 'Workflow' }),
+    ev('Stop', { ts: '2026-07-02T10:00:05.000Z', bg_tasks: 2 }), // handed off; 2 background tasks still running
+  ]);
+  const s = state.sessions.s1;
+  assert.strictEqual(s.status, 'idle');
+  assert.strictEqual(s.bgTasks, 2);
+  assert.strictEqual(s.disengagedNow, false); // still engaged -> daemon must NOT fire sessionFinished here
+  assert.ok(s.engagedStartedAt); // timer keeps counting through the handoff
+});
+
+test('a leaked SubagentStart no longer strands the session engaged (bgTasks, not the counter, decides)', () => {
+  // The original bug: SubagentStart bumped subagents.active, and a dropped SubagentStop left
+  // it stuck > 0, ticking a phantom timer under an Idle badge and folding the idle gap into
+  // activeMs. Engagement now reads the authoritative bgTasks, so the stuck counter is inert.
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('SubagentStart', { ts: '2026-07-02T10:00:01.000Z', agent_type: 'workflow-subagent' }),
+    ev('Stop', { ts: '2026-07-02T10:00:05.000Z', bg_tasks: 0 }), // turn truly done; nothing in flight
+    // ... the matching SubagentStop never arrives (dropped/interrupted hook) ...
+  ]);
+  const s = state.sessions.s1;
+  assert.strictEqual(s.subagents.active, 1); // counter is stuck (unreliable) ...
+  assert.strictEqual(s.bgTasks, 0); // ... but the registry says nothing is in flight
+  assert.strictEqual(s.status, 'idle');
+  assert.strictEqual(s.engagedStartedAt, null); // NOT engaged -> no phantom timer
+  assert.strictEqual(s.disengagedNow, true); // the Stop ended the engaged period
+  // A prompt an hour later must NOT fold the idle gap into activeMs.
+  const before = s.activeMs; // 5s (the one real turn)
+  applyEvent(state, ev('UserPromptSubmit', { ts: '2026-07-02T11:00:05.000Z', prompt_id: 'p2' }));
+  assert.strictEqual(s.activeMs, before);
+});
+
+test('an event without background_tasks leaves the last known bgTasks intact', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('Stop', { ts: '2026-07-02T10:00:05.000Z', bg_tasks: 1 }), // background in flight
+    ev('PreToolUse', { ts: '2026-07-02T10:00:07.000Z', tool_name: 'Bash', agent_type: 'workflow-subagent' }), // no bg_tasks field
+  ]);
+  assert.strictEqual(state.sessions.s1.bgTasks, 1); // unchanged by an event that didn't carry the registry
+});
+
+test('background completion: the final SubagentStop settles residual running to idle and signals finished', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:02.000Z', tool_name: 'Workflow' }),
+    ev('Stop', { ts: '2026-07-02T10:00:05.000Z', bg_tasks: 1 }), // handoff: idle + engaged
+    // the workflow's subagent runs tools on the parent session, setting status back to running:
+    ev('PreToolUse', { ts: '2026-07-02T10:00:07.000Z', tool_name: 'Bash', agent_type: 'workflow-subagent' }),
+    ev('PostToolUse', { ts: '2026-07-02T10:00:09.000Z' }), // status='running', currentPrompt still null
+    ev('SubagentStop', { ts: '2026-07-02T10:00:12.000Z', bg_tasks: 0 }), // all done — but status is still 'running'
+  ]);
+  const s = state.sessions.s1;
+  assert.strictEqual(s.bgTasks, 0);
+  assert.strictEqual(s.status, 'idle'); // residual 'running' settled -> the engaged period actually ends
+  assert.strictEqual(s.engagedStartedAt, null); // timer stops at real completion
+  assert.strictEqual(s.disengagedNow, true); // "finished" fires HERE, not the premature handoff Stop
+  assert.strictEqual(s.activeMs, 12000); // whole engaged period counted (incl. the background gaps)
+});
+
+test('a permission prompt disengages but settles to waiting, not idle (daemon must not fire finished)', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:02.000Z', tool_name: 'Bash' }),
+    ev('Notification', { ts: '2026-07-02T10:00:03.000Z', notification_type: 'permission_prompt' }),
+  ]);
+  const s = state.sessions.s1;
+  assert.strictEqual(s.status, 'waiting');
+  // disengagedNow is true (engaged→not-engaged), so the daemon MUST additionally gate on
+  // status==='idle' — otherwise every permission prompt would fire a spurious "session finished".
+  assert.strictEqual(s.disengagedNow, true);
+});
+
+test('Stop clears currentActivity so no stale "Running <tool>" lingers on an idle/background card', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { prompt_id: 'p1' }),
+    ev('PreToolUse', { tool_name: 'Bash' }),
+    ev('Stop', { stop_reason: 'end_turn' }),
+  ]);
+  assert.strictEqual(state.sessions.s1.currentActivity, null);
 });
 
 test('activeMs does not double-count a blocking subagent (running AND subagent active)', () => {

@@ -95,6 +95,14 @@ function buildRecord(payload) {
   }
   setIf(record, 'agent_type', payload.agent_type);
   setIf(record, 'reason', payload.reason);
+  // Claude Code's task registry (Stop / SubagentStop, v2.1.145+): the COUNT of background
+  // tasks still in flight — workflow / subagent / run_in_background shell / monitor / …. This
+  // is the reliable "is the session still working after its turn's Stop" signal the daemon
+  // uses for engagement (see aggregate.isEngaged). We store ONLY the length: each element's
+  // command / description / name are free text (paths, prompts, secrets) and persisting them
+  // would breach the "no message content" privacy boundary. A present array (including empty)
+  // is authoritative; absent (older Claude Code) leaves the daemon's last known count intact.
+  if (Array.isArray(payload.background_tasks)) record.bg_tasks = payload.background_tasks.length;
   return record;
 }
 
