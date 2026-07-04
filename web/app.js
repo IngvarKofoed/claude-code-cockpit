@@ -13,7 +13,7 @@ const App = {
   cfg: null, // current config (from state.config / config SSE / PUT response)
   clockOffset: 0, // serverNow - clientNow, for drift-corrected timers
   view: "live",
-  repoRange: "today",
+  repoRange: "all",
   histRange: "7d",
   liveSort: "status", // "status" (server waiting-first) | "name" (alpha); set from localStorage in init
   repoRows: [], // normalized rows currently shown in the per-repo table
@@ -33,6 +33,7 @@ const App = {
 const LOST_AFTER = 4; // consecutive SSE failures before showing the lost banner
 const FLASH_MS = 800; // window for a single short pulse (~0.7s cardPulse + margin)
 const FLASH_LONG_MS = 3700; // window for the important transitions (5 pulses ≈ 3.5s + margin)
+const REPO_REFRESH_MS = 2000; // throttle for live-refreshing a historical per-repo range on SSE frames
 
 // ---- tiny helpers ----------------------------------------------------------
 
@@ -591,6 +592,7 @@ const REPO_COLS = [
   { key: "prompts", label: "Chats", type: "num", get: (r) => r.prompts, fmt: (v) => (v == null ? "—" : String(v)) },
   { key: "sessions", label: "Sessions", type: "num", get: (r) => r.sessions, fmt: (v) => (v == null ? "—" : String(v)) },
   { key: "tokensTotal", label: "Tokens", type: "num", get: (r) => r.tokensTotal, fmt: (v) => (v == null ? "—" : fmtTokens(v)) },
+  { key: "agents", label: "Agents", type: "num", get: (r) => r.agents, fmt: (v) => (v == null ? "—" : String(v)) },
   { key: "toolsTotal", label: "Tools", type: "num", get: (r) => r.toolsTotal, fmt: (v) => (v == null ? "—" : String(v)) },
   { key: "cost", label: "Cost", type: "num", get: (r) => r.cost, fmt: fmtCost },
   { key: "lastActive", label: "Last active", type: "time", get: (r) => r.lastActive, fmt: (v) => (v ? relTime(v) : "—") },
@@ -689,11 +691,14 @@ function setRepoSort(key) {
   renderReposTable(App.repoRows);
 }
 
-// Today uses live per-repo totals from /api/state; other ranges use the
-// pre-bucketed rollups exposed by /api/history (fewer columns available).
-function renderReposFromState() {
-  const repos = (App.state && App.state.repos) || [];
-  App.repoRows = repos.map((r) => ({
+// Normalize one repo record into the row shape the Per-repo table renders. Both
+// sources — /api/state repos ("today") and /api/history topRepos (other ranges) —
+// carry the same fields, so a single normalizer keeps the two range paths from
+// drifting: a column added here reaches every range at once, instead of showing a
+// value in "today" and "—" in the rest. `sessions` may arrive as an array (older
+// state payloads) or a number (current); both collapse to a count.
+function normalizeRepoRow(r) {
+  return {
     repoRoot: r.repoRoot,
     repoName: r.repoName || basename(r.repoRoot),
     activeMs: num(r.activeMs),
@@ -701,11 +706,19 @@ function renderReposFromState() {
     sessions: Array.isArray(r.sessions) ? r.sessions.length : typeof r.sessions === "number" ? r.sessions : null,
     tokensObj: r.tokens && typeof r.tokens === "object" ? r.tokens : null,
     tokensTotal: r.tokens == null ? null : sumTokens(r.tokens),
+    agents: r.subagents == null ? null : num(r.subagents),
     byTool: r.byTool && typeof r.byTool === "object" ? r.byTool : null,
     toolsTotal: sumTools(r.byTool),
     cost: typeof r.cost === "number" ? r.cost : null,
     lastActive: r.lastActive || null,
-  }));
+  };
+}
+
+// Today uses live per-repo totals from /api/state; other ranges use the
+// pre-bucketed rollups exposed by /api/history. Both paths feed normalizeRepoRow.
+function renderReposFromState() {
+  const repos = (App.state && App.state.repos) || [];
+  App.repoRows = repos.map(normalizeRepoRow);
   renderReposTable(App.repoRows);
 }
 
@@ -716,19 +729,7 @@ function loadRepos() {
   }
   api("/api/history?range=" + encodeURIComponent(App.repoRange))
     .then((h) => {
-      App.repoRows = ((h && h.topRepos) || []).map((r) => ({
-        repoRoot: r.repoRoot,
-        repoName: r.repoName || basename(r.repoRoot),
-        activeMs: num(r.activeMs),
-        prompts: null,
-        sessions: null,
-        tokensObj: r.tokens && typeof r.tokens === "object" ? r.tokens : null,
-        tokensTotal: r.tokens == null ? null : sumTokens(r.tokens),
-        byTool: r.byTool && typeof r.byTool === "object" ? r.byTool : null,
-        toolsTotal: sumTools(r.byTool),
-        cost: typeof r.cost === "number" ? r.cost : null,
-        lastActive: null,
-      }));
+      App.repoRows = ((h && h.topRepos) || []).map(normalizeRepoRow);
       renderReposTable(App.repoRows);
     })
     .catch(() => {
@@ -977,7 +978,8 @@ function drawHistory(h) {
   );
   barChart(
     $("chartRepos"),
-    topRepos.map((r) => ({ label: r.repoName || basename(r.repoRoot), value: num(r.activeMs) })),
+    // topRepos is the full sorted list; this chart shows only the top 10 by active time.
+    topRepos.slice(0, 10).map((r) => ({ label: r.repoName || basename(r.repoRoot), value: num(r.activeMs) })),
     { horizontal: true, format: fmtDuration, empty: "No repositories yet." }
   );
 }
@@ -1212,6 +1214,32 @@ function onSettingsClick(e) {
 
 // ---- state application & view switching ------------------------------------
 
+// Refresh the per-repo table from the freshest data for its current range: "today"
+// renders straight from the live /api/state snapshot (instant, no fetch); every other
+// range re-fetches /api/history. Skipped while a ⋯ menu is open (a re-render closes it).
+function refreshReposView() {
+  if (App.view !== "repos" || activeMenu) return;
+  if (App.repoRange === "today") renderReposFromState();
+  else loadRepos();
+}
+
+// SSE frames are frequent and a historical range re-fetches /api/history, so coalesce
+// bursts into at most one fetch per REPO_REFRESH_MS. "today" reads the in-memory state
+// with no fetch, so it refreshes immediately without the throttle.
+let repoRefreshTimer = null;
+function throttledReposRefresh() {
+  if (App.view !== "repos" || activeMenu) return;
+  if (App.repoRange === "today") {
+    renderReposFromState();
+    return;
+  }
+  if (repoRefreshTimer) return;
+  repoRefreshTimer = setTimeout(() => {
+    repoRefreshTimer = null;
+    refreshReposView();
+  }, REPO_REFRESH_MS);
+}
+
 function applyState(state) {
   if (!state) return;
   App.state = state;
@@ -1219,7 +1247,7 @@ function applyState(state) {
   if (typeof state.now === "number") App.clockOffset = state.now - Date.now();
   detectSoundCues(state.sessions || []);
   renderLive();
-  if (App.view === "repos" && App.repoRange === "today" && !activeMenu) renderReposFromState(); // skip while a ⋯ menu is open (re-render would close it)
+  throttledReposRefresh();
   if (App.view === "settings" && !App.settingsRendered) renderSettings();
 }
 
@@ -1227,7 +1255,7 @@ function applyState(state) {
 // visible view. Settings is only re-rendered when the user isn't mid-edit.
 function onConfigChanged() {
   renderLive();
-  if (App.view === "repos" && App.repoRange === "today" && !activeMenu) renderReposFromState(); // skip while a ⋯ menu is open (re-render would close it)
+  refreshReposView(); // rare, so refresh immediately (cost column may have changed)
   if (App.view === "settings") maybeRenderSettings();
 }
 

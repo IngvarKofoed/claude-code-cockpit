@@ -306,26 +306,20 @@ function deriveRollupFromUsage(date) {
   return rollup;
 }
 
-// Fold a day's event-derived active time (engaged-clock replay) into `rollup`. Active
-// excludes permission/idle waits and includes background-workflow time, and — being a
-// pure function of the durable per-day event log — stays crash-safe and matches the
-// live per-session clock exactly (same applyEvent). Pass pre-read `events` to avoid a
-// second read of the log.
+// Fold a day's event-derived facts (active time, plus the distinct sessions that
+// touched each repo) into `rollup`. Active time excludes permission/idle waits and
+// includes background-workflow time, and — being a pure function of the durable
+// per-day event log — stays crash-safe and matches the live per-session clock exactly
+// (same applyEvent). The session set is folded in here too so EVERY day (today and
+// past days re-derived by getRollup) counts sessions identically from the event log;
+// backfill-only days have no events, so they contribute tokens/cost but no session
+// count — the same limit as active time. Pass pre-read `events` to avoid a second read.
 function addActiveFromEvents(rollup, date, events) {
-  aggregate.accumulateActiveFromEvents(rollup, events || readJsonl(paths.eventLogPath(date)));
-  return rollup;
-}
-
-// Rebuild TODAY's rollup from today's usage log, plus per-repo session counts from
-// today's event log (only the today card table shows session counts). Never trusts
-// a possibly mid-write rollup file for the open day.
-function rebuildTodayRollup() {
-  todayRollup = deriveRollupFromUsage(currentDate);
-  const events = readJsonl(paths.eventLogPath(currentDate)); // read once for both passes below
-  addActiveFromEvents(todayRollup, currentDate, events); // active time (engaged clock)
-  for (const ev of events) {
+  const evts = events || readJsonl(paths.eventLogPath(date));
+  aggregate.accumulateActiveFromEvents(rollup, evts);
+  for (const ev of evts) {
     if (ev.session_id != null && ev.repo_root != null) {
-      aggregate.accumulateSession(todayRollup, {
+      aggregate.accumulateSession(rollup, {
         repoRoot: ev.repo_root,
         repoName: ev.repo_name,
         sessionId: ev.session_id,
@@ -333,6 +327,15 @@ function rebuildTodayRollup() {
       });
     }
   }
+  return rollup;
+}
+
+// Rebuild TODAY's rollup from today's usage log (tokens/prompts/cost), then fold in the
+// event-derived active time and per-repo session set. Never trusts a possibly mid-write
+// rollup file for the open day.
+function rebuildTodayRollup() {
+  todayRollup = deriveRollupFromUsage(currentDate);
+  addActiveFromEvents(todayRollup, currentDate, readJsonl(paths.eventLogPath(currentDate)));
 }
 
 // Seed a session's counted-message-id set from the DURABLE usage logs (the source
@@ -983,6 +986,7 @@ function reposSummary() {
       prompts: r.prompts,
       sessions: r.sessions.length,
       tokens: r.tokens,
+      subagents: r.subagents,
       byTool: r.byTool,
       cost,
       lastActive: r.lastActive,
@@ -1001,7 +1005,7 @@ function reposSummary() {
 // invalidated wherever tokens, rollups, or cost config change.
 function repoTotalsAllTime() {
   if (repoTotalsCache) return repoTotalsCache;
-  const agg = aggregateReposAcrossDates(listRollupDates());
+  const agg = aggregateReposAcrossDates(listRollupDates(), { trackSessions: false });
   const out = {};
   for (const root of Object.keys(agg)) {
     const bt = agg[root].byTool || {};
@@ -1099,18 +1103,25 @@ function dayCost(rollup) {
 // Aggregate per-repo tokens (total + per-model) and active time across a set of days,
 // keyed by repoRoot. Shared by the History range view and the Live cards' all-time
 // totals so the two can't diverge. getRollup memoizes past days, so this is O(days).
-function aggregateReposAcrossDates(dates) {
+// `trackSessions` unions each repo's distinct session ids (needed only by the History
+// per-repo table); repoTotalsAllTime doesn't surface sessions, so it opts out to avoid
+// building an all-time id Set on every cache rebuild.
+function aggregateReposAcrossDates(dates, { trackSessions = true } = {}) {
   const agg = {}; // repoRoot -> { repoRoot, repoName, prompts, activeMs, tokens, byModel }
   for (const date of dates) {
     const rollup = getRollup(date);
     if (!rollup || !rollup.repos) continue;
     for (const root of Object.keys(rollup.repos)) {
       const rr = rollup.repos[root];
-      const a = agg[root] || (agg[root] = { repoRoot: root, repoName: rr.repoName, prompts: 0, activeMs: 0, subagents: 0, tokens: emptyTokens(), byModel: {}, byTool: {} });
+      const a = agg[root] || (agg[root] = { repoRoot: root, repoName: rr.repoName, prompts: 0, activeMs: 0, subagents: 0, tokens: emptyTokens(), byModel: {}, byTool: {}, sessionIds: trackSessions ? new Set() : null, lastActive: null });
       if (rr.repoName) a.repoName = rr.repoName;
       a.prompts += num(rr.prompts);
       a.activeMs += num(rr.activeMs);
       a.subagents += num(rr.subagents);
+      // Distinct sessions across the range: union the per-day id lists so a session
+      // spanning several days is counted once. lastActive is the max timestamp seen.
+      if (trackSessions) for (const sid of rr.sessions || []) a.sessionIds.add(sid);
+      if (rr.lastActive && (a.lastActive == null || Date.parse(rr.lastActive) > Date.parse(a.lastActive))) a.lastActive = rr.lastActive;
       addTokens(a.tokens, rr.tokens);
       for (const m of Object.keys(rr.byModel || {})) {
         addTokens(a.byModel[m] || (a.byModel[m] = emptyTokens()), rr.byModel[m]);
@@ -1159,17 +1170,24 @@ function buildHistory(rangeRaw) {
     }
   }
 
+  // The FULL per-repo list for the range, sorted by active time — NOT capped here.
+  // The Per-repo table renders all of them; the History "Top repos" chart caps to its
+  // top N client-side. (Capping here would silently drop repos from the Per-repo view,
+  // which is now its default range.)
   const topRepos = Object.values(repoAgg)
     .map((a) => ({
       repoRoot: a.repoRoot,
       repoName: a.repoName,
       activeMs: a.activeMs,
+      prompts: a.prompts,
+      sessions: a.sessionIds.size,
       tokens: a.tokens,
+      subagents: a.subagents,
       byTool: a.byTool,
       cost: cfg.cost.enabled ? pricing.estimateCost(a.byModel, cfg.cost.rates).total : null,
+      lastActive: a.lastActive,
     }))
-    .sort((x, y) => y.activeMs - x.activeMs)
-    .slice(0, 10);
+    .sort((x, y) => y.activeMs - x.activeMs);
 
   return { range, perDay, byHour, topRepos };
 }
