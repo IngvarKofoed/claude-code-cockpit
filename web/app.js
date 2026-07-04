@@ -520,8 +520,21 @@ function tile(label, value, alert) {
 }
 
 function renderLiveRibbon(sessions) {
-  const running = sessions.filter((s) => effectiveStatus(s) === "running").length;
-  const waiting = sessions.filter((s) => effectiveStatus(s) === "waiting").length;
+  // One pass over the (small) live-session set: running/waiting status counts, agents in flight
+  // ("Active agents" = Σ bgTasks — Claude Code's authoritative background_tasks count, i.e. workflow
+  // subagents / background shells running right now, NOT the drift-prone subagents.active), and total
+  // engaged time ("Active time" = Σ session.activeMs — the roll-up of each card's Active stat).
+  let running = 0;
+  let waiting = 0;
+  let inFlight = 0;
+  let activeMs = 0;
+  for (const s of sessions) {
+    const st = effectiveStatus(s);
+    if (st === "running") running++;
+    else if (st === "waiting") waiting++;
+    inFlight += num(s.bgTasks);
+    activeMs += num(s.activeMs);
+  }
   const repos = (App.state && App.state.repos) || [];
   let tok = 0;
   let cost = 0;
@@ -537,6 +550,8 @@ function renderLiveRibbon(sessions) {
     tile("Sessions", sessions.length),
     tile("Running", running),
     tile("Waiting", waiting, waiting > 0),
+    tile("Active agents", inFlight),
+    tile("Active time", fmtDuration(activeMs)),
     tile("Tokens today", fmtTokens(tok)),
   ];
   if (costEnabled()) tiles.push(tile("Cost today", hasCost ? fmtCost(cost) : "—"));
@@ -546,7 +561,6 @@ function renderLiveRibbon(sessions) {
 function renderLive() {
   const sessions = (App.state && App.state.sessions) || [];
   renderLiveRibbon(sessions);
-  $("liveNote").textContent = sessions.length ? `${sessions.length} active` : "";
   const cards = $("cards");
   if (!sessions.length) {
     cards.innerHTML =
@@ -582,6 +596,19 @@ async function copyPath(path) {
   } catch (_e) {
     toast("Copy failed", true);
   }
+}
+
+// Live card sort order — a per-browser preference (localStorage), NOT daemon config, so it
+// never goes through PUT /api/config. Set from the Settings > Dashboard control. "status" keeps
+// the server's waiting-first order; "name" sorts alphabetically for stable positions.
+function setLiveSort(value) {
+  App.liveSort = value === "name" ? "name" : "status";
+  try {
+    localStorage.setItem("cockpit.liveSort", App.liveSort);
+  } catch (_e) {
+    /* persistence best-effort */
+  }
+  renderLive();
 }
 
 // ---- Per-repo view ---------------------------------------------------------
@@ -1044,6 +1071,14 @@ function settingsHTML(cfg) {
     null,
     fieldRow("In-browser sounds", "Play Web Audio cues in this tab", sw("set-browserSounds", cfg.browserSounds)) +
       fieldRow(
+        "Live view sort",
+        "Order the live session cards (this browser only)",
+        `<select class="select" id="set-liveSort">
+           <option value="status" ${App.liveSort === "status" ? "selected" : ""}>Status (waiting first)</option>
+           <option value="name" ${App.liveSort === "name" ? "selected" : ""}>Repository name</option>
+         </select>`
+      ) +
+      fieldRow(
         "Activity detail",
         "Arguments may contain paths/secrets — shown locally only",
         `<select class="select" id="set-activityDetail">
@@ -1359,32 +1394,18 @@ function connect() {
 // ---- init ------------------------------------------------------------------
 
 function init() {
-  // Per-browser Live sort preference (unknown value → "status"); reflect it in the toggle.
+  // Per-browser Live sort preference (unknown value → "status"); the Settings > Dashboard
+  // control reflects and updates it (see setLiveSort).
   try {
     const ls = localStorage.getItem("cockpit.liveSort");
     if (ls === "name" || ls === "status") App.liveSort = ls;
   } catch (_e) {
     /* localStorage unavailable — keep the default */
   }
-  const sortBtn = $("liveSort").querySelector(`.range__btn[data-sort="${App.liveSort}"]`);
-  if (sortBtn) setActiveRange("liveSort", sortBtn);
 
   $("nav").addEventListener("click", (e) => {
     const t = e.target.closest(".nav__tab");
     if (t) setView(t.dataset.view);
-  });
-
-  $("liveSort").addEventListener("click", (e) => {
-    const b = e.target.closest(".range__btn");
-    if (!b) return;
-    setActiveRange("liveSort", b);
-    App.liveSort = b.dataset.sort;
-    try {
-      localStorage.setItem("cockpit.liveSort", App.liveSort);
-    } catch (_e) {
-      /* persistence best-effort */
-    }
-    renderLive();
   });
 
   $("repoRange").addEventListener("click", (e) => {
@@ -1416,6 +1437,12 @@ function init() {
   // Delegated on the static #settings container so listeners survive innerHTML swaps.
   const sh = $("settings");
   sh.addEventListener("change", (e) => {
+    // Live view sort is a per-browser localStorage preference, not daemon config — apply it
+    // locally and never PUT it (a config save would also pop a spurious "Settings saved" toast).
+    if (e.target.id === "set-liveSort") {
+      setLiveSort(e.target.value);
+      return;
+    }
     // The Data section (store size + cleanup) isn't part of the config, so its inputs
     // must not trigger a config PUT / "Settings saved" toast.
     if (e.target.closest("#data-section")) return;

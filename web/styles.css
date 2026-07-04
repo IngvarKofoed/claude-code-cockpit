@@ -80,47 +80,9 @@ body {
   border-bottom: 1px solid var(--border);
 }
 
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 11px;
-  min-width: 0;
-}
-
-.brand__mark {
-  width: 26px;
-  height: 26px;
-  border-radius: 7px;
-  background: linear-gradient(150deg, var(--accent), #1f5fb0);
-  box-shadow: 0 0 0 1px var(--border-strong), 0 0 16px -4px var(--accent);
-  position: relative;
-  flex: none;
-}
-.brand__mark::after {
-  content: "";
-  position: absolute;
-  inset: 8px;
-  border-radius: 50%;
-  border: 2px solid rgba(255, 255, 255, 0.85);
-  border-top-color: transparent;
-}
-
-.brand__name {
-  font-size: 13px;
-  font-weight: 700;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-}
-.brand__sub {
-  font-size: 11px;
-  color: var(--ink-muted);
-  letter-spacing: 0.05em;
-}
-
 .nav {
   display: flex;
   gap: 4px;
-  margin-left: 6px;
 }
 
 .nav__tab {
