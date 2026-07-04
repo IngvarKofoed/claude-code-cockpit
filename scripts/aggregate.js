@@ -46,6 +46,12 @@ function newSession(event) {
     lastActivityAt: typeof event.ts === 'string' ? event.ts : null,
     currentPrompt: null, // { promptId, startedAt } while a turn is running
     currentActivity: null, // tool name Claude is running right now
+    // ISO ts the session entered `waiting` (a permission prompt), or null when not waiting.
+    // Set ONCE on the idle/running→waiting transition and cleared on leaving waiting, so it
+    // is a STABLE anchor: benign events that arrive mid-wait (which refresh lastActivityAt)
+    // don't move it. The card freezes its big timer at waitingSince − promptStart, so a
+    // blocked card shows how long the prompt ran before it asked you, without ticking.
+    waitingSince: null,
     promptCount: 0,
     toolCount: 0, // total tool invocations (incl. subagents), bumped on PreToolUse
     // Cumulative "engaged" wall-clock: time the session spent running a turn OR
@@ -125,6 +131,8 @@ function applyEvent(state, event) {
   // Pre-event engaged state, captured BEFORE this event's status/bgTasks changes, so the
   // re-anchor below can detect the engaged→idle transition (the true "finished" moment).
   const wasEngaged = isEngaged(session);
+  // Pre-event status, so the waiting anchor below is set only on ENTERING waiting.
+  const prevStatus = session.status;
 
   // Absorb Claude Code's authoritative background-task count when this event carries it
   // (Stop / SubagentStop). A present value — INCLUDING 0 — is authoritative; an absent field
@@ -263,6 +271,15 @@ function applyEvent(state, event) {
   // real completion). Only touches 'running'; 'waiting'/'error' keep their meaning.
   if (num(session.bgTasks) === 0 && !session.currentPrompt && session.status === 'running') {
     session.status = 'idle';
+  }
+
+  // Maintain the stable waiting anchor from the FINAL status (after any residual settle).
+  // Set only on the transition INTO waiting so a benign mid-wait event (which still refreshed
+  // lastActivityAt above) can't advance it; cleared the moment the session is no longer waiting.
+  if (session.status === 'waiting') {
+    if (prevStatus !== 'waiting' && typeof event.ts === 'string') session.waitingSince = event.ts;
+  } else {
+    session.waitingSince = null;
   }
 
   // Re-anchor the engaged clock based on the POST-event state.

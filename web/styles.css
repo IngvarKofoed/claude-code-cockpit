@@ -497,6 +497,27 @@ body {
 }
 .chip--mono { font-family: var(--font-mono); }
 
+/* Live in-flight pill (background tasks / workflow subagents running now). Reads as
+   active work with the running-green accent + a pulsing leading dot, distinct from the
+   muted cumulative "Agents" stat below. */
+.chip--live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(51, 193, 122, 0.14);
+  color: var(--st-running);
+  border-color: rgba(51, 193, 122, 0.35);
+}
+.chip--live::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--st-running);
+  box-shadow: 0 0 0 0 rgba(51, 193, 122, 0.5);
+  animation: pulse 1.6s infinite; /* shared green-ping keyframe (also .conn__dot / .spark) */
+}
+
 /* ---------- Empty state ---------- */
 
 .empty {

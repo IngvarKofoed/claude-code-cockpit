@@ -103,6 +103,36 @@ test('Notification permission_prompt -> waiting', () => {
   assert.strictEqual(state.sessions.s1.status, 'waiting');
 });
 
+test('waitingSince is a stable anchor: set on entering waiting, unmoved by a benign mid-wait event, cleared on resume', () => {
+  const s = run([
+    ev('SessionStart', { ts: '2026-07-02T10:00:00.000Z' }),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:01.000Z', prompt_id: 'p1' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:02.000Z', tool_name: 'Bash' }),
+    ev('Notification', { ts: '2026-07-02T10:00:05.000Z', notification_type: 'permission_prompt' }), // enters waiting
+  ]).sessions.s1;
+  assert.strictEqual(s.status, 'waiting');
+  assert.strictEqual(s.waitingSince, '2026-07-02T10:00:05.000Z');
+
+  // A benign event mid-wait refreshes lastActivityAt but must NOT advance waitingSince,
+  // so the card's frozen "paused" figure can't creep.
+  const state2 = createState();
+  for (const e of [
+    ev('SessionStart', { ts: '2026-07-02T10:00:00.000Z' }),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:01.000Z', prompt_id: 'p1' }),
+    ev('Notification', { ts: '2026-07-02T10:00:05.000Z', notification_type: 'permission_prompt' }),
+    ev('Notification', { ts: '2026-07-02T10:00:30.000Z', notification_type: 'auth_success' }), // benign, stays waiting
+  ]) applyEvent(state2, e);
+  const s2 = state2.sessions.s1;
+  assert.strictEqual(s2.status, 'waiting');
+  assert.strictEqual(s2.lastActivityAt, '2026-07-02T10:00:30.000Z'); // advanced
+  assert.strictEqual(s2.waitingSince, '2026-07-02T10:00:05.000Z'); // did NOT advance
+
+  // Approval (PostToolUse -> running) clears the anchor.
+  applyEvent(state2, ev('PostToolUse', { ts: '2026-07-02T10:00:40.000Z' }));
+  assert.strictEqual(state2.sessions.s1.status, 'running');
+  assert.strictEqual(state2.sessions.s1.waitingSince, null);
+});
+
 test('Notification idle_prompt after Stop leaves status idle (not a distinct state)', () => {
   // idle_prompt means "done, awaiting your next prompt"; the session is already
   // idle from its Stop, so it stays plain idle rather than "awaiting input".

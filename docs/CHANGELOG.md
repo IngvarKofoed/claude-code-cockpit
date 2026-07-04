@@ -226,3 +226,17 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     is rewritten too, and its tail byte-offset reset to the shrunk size, so the next tail can't re-read and
     double-count the OTHER repos' live state (the sharp edge — a naive shrink would trip the size<offset
     "truncated→restart-from-0" path). Triggered from a ⋯ menu on the Per-repo page behind an in-app confirm.
+
+30. The Live card's big timer no longer counts up while `waiting`; it FREEZES (label "paused") at how long
+    the prompt ran before it blocked — anchored to a new STABLE `session.waitingSince` (aggregate sets it
+    once on entering waiting, clears it on leaving), so a benign mid-wait event that refreshes lastActivityAt
+    can't creep it. Ticks only while running/engaged; on approval "elapsed" resumes from true prompt
+    wall-clock (the Active stat, not this timer, is the wait-excluding metric). Cause: a permission
+    Notification sets `waiting` without clearing currentPrompt, so the prompt timer kept ticking on a blocked card.
+
+31. Restored the live in-flight pill on the Live card (dropped in entry 16 for the cumulative Agents stat):
+    green with a pulsing dot, next to the model/effort chips, shown ONLY on a running card while bgTasks>0
+    (suppressed on waiting/error, where a green pulse would misread as progress). Sourced from Claude Code's
+    authoritative background_tasks count (bgTasks), NOT subagents.active (dropped-SubagentStop drift
+    over-reports). Labelled "N in flight" — bgTasks also counts run_in_background shells, so "subagents"
+    would misname them (the tooltip gives the full scope). Reuses the shared `pulse` keyframe.

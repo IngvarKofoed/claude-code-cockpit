@@ -397,25 +397,47 @@ function cardHTML(s) {
   const waiting = status === "waiting";
   const promptStart = s.currentPromptStartedAt;
   const promptStartMs = promptStart ? Date.parse(promptStart) : 0;
-  // The big timer ticks for an open prompt (running/waiting) OR — so it keeps counting
-  // while a background workflow runs after the launching turn's Stop — while the session
-  // is `running`, measured from when it became engaged (engagedStartedAt).
-  // Visibility is gated on the RELIABLE status (the same signal that drives the card
-  // colour), NOT on subagents.active: SubagentStart/SubagentStop are not guaranteed 1:1
-  // (a dropped/interrupted SubagentStop leaves the counter stuck > 0), so gating on it
-  // made an idle/gray card tick a phantom "working" timer forever. During a real
-  // background workflow the subagents' own PreToolUse/PostToolUse fire on the parent and
-  // hold status at `running`, so the timer keeps counting; the instant the session is
-  // idle/waiting/error the timer stops — the timer now always agrees with the colour.
+  // The big timer TICKS live only while `running`: from the open prompt's start (label
+  // "elapsed") or — so it keeps counting while a background workflow runs after the launching
+  // turn's Stop — from when the session became engaged (engagedStartedAt, label "working").
+  // Ticking is gated on the RELIABLE status (the signal that drives the card colour), NOT
+  // subagents.active, whose dropped SubagentStops once left an idle card ticking a phantom
+  // timer. While `waiting` on a permission prompt the timer is FROZEN (label "paused"), not
+  // ticking, so you don't watch it climb while YOU are the holdup: it shows how long the prompt
+  // ran before it blocked (promptStart .. waitingSince, a stable server anchor a benign mid-wait
+  // event can't move). The Active stat is the true wait-excluding metric; on approval the ticking
+  // "elapsed" resumes from real prompt wall-clock. Idle/error: no timer.
   const running = status === "running";
   const engagedMs = running && s.engagedStartedAt ? Date.parse(s.engagedStartedAt) : 0;
-  const timerMs = promptStartMs || engagedMs;
-  // Label only when there's an actual timer value; otherwise the "—" would sit under a
-  // misleading "working"/"prompt" action word (e.g. running with no engagedStartedAt yet).
-  const timerLabel = !timerMs ? "" : running ? (promptStartMs ? "elapsed" : "working") : "prompt";
+  const tickMs = running ? promptStartMs || engagedMs : 0; // anchor for the live ticking timer
+  // Frozen prompt-elapsed while waiting, from the stable waitingSince anchor. Clamp a negative
+  // delta (an out-of-order/resumed ts where waitingSince precedes promptStart) to 0 rather than
+  // rendering a misleading value; a missing anchor just means no frozen figure.
+  const waitStartMs = waiting ? Date.parse(s.waitingSince) : NaN;
+  const hasFrozen = waiting && promptStartMs > 0 && Number.isFinite(waitStartMs);
+  const waitFrozenMs = hasFrozen ? Math.max(0, waitStartMs - promptStartMs) : 0;
+  // A running card always gets a label even with no anchor yet (tickMs 0 — e.g. a snapshot-
+  // restored session engaged via bgTasks before engagedStartedAt is stamped), so it reads
+  // "— working" rather than a bare, broken-looking "—".
+  const timerLabel = tickMs ? (promptStartMs ? "elapsed" : "working") : running ? "working" : hasFrozen ? "paused" : "";
   const tokensTotal = s.tokens == null ? null : sumTokens(s.tokens);
 
   const chips = [];
+  // Live in-flight indicator: how many background tasks (workflow subagents / background
+  // shells) are running RIGHT NOW, from Claude Code's authoritative background_tasks count
+  // (bgTasks) — NOT subagents.active, whose dropped-SubagentStop drift would over-report.
+  // Restores the old subagent pill (dropped when the cumulative Agents stat landed) so a
+  // running workflow is visible at a glance next to the model/effort chips. Shown only on a
+  // RUNNING card: on a waiting/error card the amber/red state + frozen timer already own the
+  // story and a pulsing green pill there would falsely read as "work progressing". Labelled
+  // "in flight" (not "subagents") because bgTasks also counts run_in_background shells — the
+  // tooltip spells out the scope. The green pulsing dot marks it live, distinct from the muted
+  // cumulative "Agents" stat below. Placed first so it leads the row when a workflow kicks off.
+  const inFlight = num(s.bgTasks);
+  if (running && inFlight > 0)
+    chips.push(
+      `<span class="chip chip--live" title="${inFlight} background task${inFlight === 1 ? "" : "s"} in flight — workflow subagents / background shells">${inFlight} in flight</span>`
+    );
   if (s.permissionMode) chips.push(chip(s.permissionMode));
   if (s.effortLevel) chips.push(chip("effort: " + s.effortLevel));
   // The model chip shows the current model; its tooltip reveals every model this
@@ -479,7 +501,7 @@ function cardHTML(s) {
       </div>
       <div class="card__activity"><span class="spark"></span><span>${esc(activityText(s))}</span></div>
       <div class="telemetry">
-        <span class="telemetry__value" ${timerMs ? `data-timer="dur" data-start="${timerMs}"` : ""}>${timerMs ? "0s" : "—"}</span>
+        <span class="telemetry__value" ${tickMs ? `data-timer="dur" data-start="${tickMs}"` : ""}>${tickMs ? "0s" : hasFrozen ? esc(fmtDuration(waitFrozenMs)) : "—"}</span>
         <span class="telemetry__label">${timerLabel}</span>
       </div>
       ${chips.length ? `<div class="chips">${chips.join("")}</div>` : ""}
