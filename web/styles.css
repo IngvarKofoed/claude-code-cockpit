@@ -568,6 +568,73 @@ body {
 .table tbody tr:hover td { background: rgba(255, 255, 255, 0.02); }
 .table .muted { color: var(--ink-muted); }
 
+/* ---------- Sessions table ---------- */
+
+.sessions-table { min-width: 780px; }
+/* Sessions headers aren't sortable — drop the base .table th pointer affordance. */
+.sessions-table th { cursor: default; }
+.sessions-table th:hover { color: var(--ink-muted); }
+/* Status / Name / Repo are text columns — left-align (the base .table right-aligns cells). */
+.sessions-table th.col-status, .sessions-table td.col-status,
+.sessions-table th.col-name, .sessions-table td.col-name,
+.sessions-table th.col-repo, .sessions-table td.col-repo { text-align: left; }
+.sessions-table td.col-status { width: 96px; }
+.sessions-table td.col-name {
+  font-family: var(--font-ui);
+  color: var(--ink);
+  font-weight: 550;
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sessions-table td.col-repo { font-family: var(--font-ui); color: var(--ink-2); }
+.sessions-table .session-untitled { color: var(--ink-muted); font-style: italic; }
+.sessions-table .live-elapsed { color: var(--st-running); }
+
+/* Standalone status pill for the Sessions rows (the .badge coloring is scoped to .card). */
+.sbadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--ink-2);
+  text-transform: capitalize;
+}
+.sbadge::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.sbadge[data-status="running"] { color: var(--st-running); background: rgba(51, 193, 122, 0.12); }
+.sbadge[data-status="waiting"] { color: var(--st-waiting); background: rgba(245, 177, 32, 0.14); }
+.sbadge[data-status="error"] { color: var(--st-error); background: rgba(226, 86, 79, 0.14); }
+.sbadge[data-status="idle"] { color: var(--st-idle); }
+
+/* ---------- Pagination ---------- */
+
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  margin-top: 16px;
+}
+.pager:empty { margin-top: 0; }
+.pager .btn { margin-top: 0; }
+.pager .btn:disabled { opacity: 0.4; cursor: default; }
+.pager .btn:disabled:hover { background: var(--surface-2); }
+.pager__label {
+  color: var(--ink-2);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---------- Charts ---------- */
 
 .charts {

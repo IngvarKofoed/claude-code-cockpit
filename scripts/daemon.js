@@ -69,6 +69,10 @@ const ingesting = new Set(); // session_ids with an in-flight ingestTurn retry c
 const pendingIngest = new Map(); // session_id -> { stopEvent } queued mid-ingest
 const primedSeen = new Set(); // session_ids whose seenIds have been seeded from the usage logs
 const rollupCache = new Map(); // dateStr -> memoized derived past-day rollup (fast History reads)
+let sessionsSnapshot = null; // { at, files:[{path,proj,sid,mtimeMs,size}], total } short-TTL stat/sort snapshot for /api/sessions
+const sessionsParseCache = new Map(); // transcriptPath -> { mtimeMs, size, meta } — reuse the parse iff both match a fresh stat
+const sessionActiveDayCache = new Map(); // dateStr (PAST day only) -> Map<sid, activeMs>, memoized event-log-derived engaged time
+let sessionActiveTotalsCache = null; // { at, map: Map<sid, activeMs> } short-TTL sum across days (includes the live current day)
 let repoTotalsCache = null; // memoized all-time per-repo totals for /api/state; invalidated on any token/rollup/cost-config change (see repoTotalsAllTime)
 
 let replaying = false; // true while replaying the log on boot: suppress side effects
@@ -403,6 +407,33 @@ function claudeProjectsDir() {
   return path.join(base, 'projects');
 }
 
+// Enumerate every retained transcript: calls cb({ proj, sid, path }) for each
+// <projects>/<proj>/<session_id>.jsonl. The transcript directory layout is INTERNAL to
+// Claude Code and changes between versions (see scripts/CLAUDE.md), so both historical
+// backfill and the Sessions list walk it through this ONE helper — a layout change is
+// then fixed in a single place instead of silently diverging between the two.
+function forEachTranscriptFile(cb) {
+  let projects;
+  try {
+    projects = fs.readdirSync(claudeProjectsDir());
+  } catch (_e) {
+    return; // projects dir missing / unreadable
+  }
+  for (const proj of projects) {
+    const dir = path.join(claudeProjectsDir(), proj);
+    let names;
+    try {
+      names = fs.readdirSync(dir);
+    } catch (_e) {
+      continue; // not a directory / unreadable
+    }
+    for (const f of names) {
+      if (!f.endsWith('.jsonl')) continue;
+      cb({ proj, sid: f.slice(0, -6), path: path.join(dir, f) });
+    }
+  }
+}
+
 // Build, in ONE pass over the usage logs, a map of session_id -> Set(message ids
 // already counted). Backfill dedups against this instead of the live seenIds/
 // ensureSeenSeeded (which would be O(sessions x all-logs) and would bloat the live
@@ -457,67 +488,48 @@ function backfillTranscripts(filterRepoRoot) {
     const x = extra.get(s);
     if (x && x.transcriptPath) liveTranscripts.add(x.transcriptPath);
   }
-  let projects;
-  try {
-    projects = fs.readdirSync(claudeProjectsDir());
-  } catch (_e) {
-    return summary;
-  }
-
-  for (const proj of projects) {
-    const dir = path.join(claudeProjectsDir(), proj);
-    let files;
+  forEachTranscriptFile(({ sid, path: tpath }) => {
+    if (state.sessions[sid] || liveTranscripts.has(tpath)) {
+      summary.skippedActive++;
+      return; // handled by live ingestion (by id, or by reused transcript path)
+    }
+    let usage;
     try {
-      files = fs.readdirSync(dir);
+      usage = transcript.readUsage(tpath);
     } catch (_e) {
-      continue; // not a directory / unreadable
+      return;
     }
-    for (const f of files) {
-      if (!f.endsWith('.jsonl')) continue;
-      const sid = f.slice(0, -6);
-      const tpath = path.join(dir, f);
-      if (state.sessions[sid] || liveTranscripts.has(tpath)) {
-        summary.skippedActive++;
-        continue; // handled by live ingestion (by id, or by reused transcript path)
-      }
-      let usage;
-      try {
-        usage = transcript.readUsage(tpath);
-      } catch (_e) {
-        continue;
-      }
-      if (!usage.ok || usage.messages.length === 0 || !usage.cwd) continue;
-      const repo = repoLib.resolveRepo(usage.cwd);
-      if (filterRepoRoot && repo.repo_root !== filterRepoRoot) continue;
-      summary.transcripts++;
+    if (!usage.ok || usage.messages.length === 0 || !usage.cwd) return;
+    const repo = repoLib.resolveRepo(usage.cwd);
+    if (filterRepoRoot && repo.repo_root !== filterRepoRoot) return;
+    summary.transcripts++;
 
-      const seen = counted.get(sid) || new Set();
-      const fresh = usage.messages.filter((m) => !seen.has(m.id));
-      if (fresh.length === 0) continue;
+    const seen = counted.get(sid) || new Set();
+    const fresh = usage.messages.filter((m) => !seen.has(m.id));
+    if (fresh.length === 0) return;
 
-      let maxTs = null;
-      for (const m of fresh) if (m.ts && (!maxTs || m.ts > maxTs)) maxTs = m.ts;
-      const stopEvent = { ts: maxTs, repo_root: repo.repo_root, repo_name: repo.repo_name };
-      const groups = recordTurn(sid, stopEvent, usage, fresh, seen, /* allBackfill */ true);
+    let maxTs = null;
+    for (const m of fresh) if (m.ts && (!maxTs || m.ts > maxTs)) maxTs = m.ts;
+    const stopEvent = { ts: maxTs, repo_root: repo.repo_root, repo_name: repo.repo_name };
+    const groups = recordTurn(sid, stopEvent, usage, fresh, seen, /* allBackfill */ true);
 
-      summary.sessionsIngested++;
-      summary.newMessages += fresh.length;
-      const rs =
-        summary.repos[repo.repo_name] ||
-        (summary.repos[repo.repo_name] = { repoRoot: repo.repo_root, tokens: emptyTokens(), byModel: {} });
-      // Build the summary from the days recordTurn ACTUALLY wrote to, so the reported
-      // date range and totals can never diverge from where the tokens landed.
-      for (const [day, g] of groups) {
-        daySet.add(day);
-        addTokens(summary.tokens, g.totals);
-        addTokens(rs.tokens, g.totals);
-        for (const model of Object.keys(g.byModel)) {
-          addTokens(summary.byModel[model] || (summary.byModel[model] = emptyTokens()), g.byModel[model]);
-          addTokens(rs.byModel[model] || (rs.byModel[model] = emptyTokens()), g.byModel[model]);
-        }
+    summary.sessionsIngested++;
+    summary.newMessages += fresh.length;
+    const rs =
+      summary.repos[repo.repo_name] ||
+      (summary.repos[repo.repo_name] = { repoRoot: repo.repo_root, tokens: emptyTokens(), byModel: {} });
+    // Build the summary from the days recordTurn ACTUALLY wrote to, so the reported
+    // date range and totals can never diverge from where the tokens landed.
+    for (const [day, g] of groups) {
+      daySet.add(day);
+      addTokens(summary.tokens, g.totals);
+      addTokens(rs.tokens, g.totals);
+      for (const model of Object.keys(g.byModel)) {
+        addTokens(summary.byModel[model] || (summary.byModel[model] = emptyTokens()), g.byModel[model]);
+        addTokens(rs.byModel[model] || (rs.byModel[model] = emptyTokens()), g.byModel[model]);
       }
     }
-  }
+  });
 
   // Price the summary, then drop the internal byModel maps from the response.
   summary.cost = cfg.cost.enabled ? pricing.estimateCost(summary.byModel, cfg.cost.rates).total : null;
@@ -529,6 +541,197 @@ function backfillTranscripts(filterRepoRoot) {
   }
   summary.days = [...daySet].sort();
   return summary;
+}
+
+// ---- sessions list (GET /api/sessions) --------------------------------------
+
+const SESSIONS_SNAPSHOT_TTL_MS = 3000; // rapid Prev/Next reuses one stat sweep
+const SESSIONS_PARSE_CACHE_MAX = 2000; // FIFO cap: a long-lived daemon's parse cache must not grow unbounded
+
+// Insert into sessionsParseCache with a FIFO cap so paging a store of thousands of
+// transcripts can't grow the daemon's RSS without bound (a Map keeps insertion order, so
+// the first key is the oldest). Only evicts when adding a NEW key over the cap.
+function setSessionsParseCache(key, val) {
+  if (!sessionsParseCache.has(key) && sessionsParseCache.size >= SESSIONS_PARSE_CACHE_MAX) {
+    const oldest = sessionsParseCache.keys().next().value;
+    if (oldest !== undefined) sessionsParseCache.delete(oldest);
+  }
+  sessionsParseCache.set(key, val);
+}
+
+// Claude Code encodes a session's cwd into its project-dir name by replacing path
+// separators (and some chars) with '-'. Reverse it best-effort for a repo label
+// when the transcript carries no cwd; '-'<->'/' is lossy (a repo name containing
+// '-' is indistinguishable from a separator), so this is only a degradation path.
+function decodeProjectDir(proj) {
+  const decoded = String(proj || '').replace(/-/g, '/');
+  return path.basename(decoded) || String(proj || '');
+}
+
+// Snapshot of every transcript file (stat'd for mtime/size), sorted mtime-desc.
+// The O(total) stat sweep is memoized for a few seconds so rapid paging doesn't
+// re-stat the whole store per request — kept off the SSE hot path, like computeStorage.
+function sessionsFileList() {
+  const now = Date.now();
+  if (sessionsSnapshot && now - sessionsSnapshot.at < SESSIONS_SNAPSHOT_TTL_MS) return sessionsSnapshot;
+  const files = [];
+  forEachTranscriptFile(({ proj, sid, path: p }) => {
+    let st;
+    try {
+      st = fs.statSync(p);
+    } catch (_e) {
+      return; // vanished between readdir and stat
+    }
+    files.push({ path: p, proj, sid, mtimeMs: st.mtimeMs, size: st.size });
+  });
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  sessionsSnapshot = { at: now, files, total: files.length };
+  return sessionsSnapshot;
+}
+
+// Parse the per-file, content-derived row fields (repo + tokens + title). Reads the
+// transcript ASYNCHRONOUSLY (not readFileSync) so buildSessions can await between files
+// and never blocks the daemon's single event loop on a page of whole-file reads. Cost is
+// NOT stored here — it's computed fresh per request so a pricing-config change is reflected
+// without invalidating the cache. Every file yields a row: an unreadable/unparseable
+// transcript degrades to tokens:null — marked UNAVAILABLE in the UI, never a misleading
+// 0/$0.000 (the documented graceful-degradation rule) — with a dir-name repo fallback.
+async function sessionMeta(tpath, proj) {
+  let content;
+  try {
+    content = await fs.promises.readFile(tpath, 'utf8');
+  } catch (_e) {
+    content = null;
+  }
+  const usage = content != null ? transcript.readUsageContent(content) : null;
+  if (!usage || !usage.ok) {
+    return { title: null, repoName: decodeProjectDir(proj), repoRoot: null, tokens: null, byModel: {} };
+  }
+  let repoName, repoRoot;
+  if (usage.cwd) {
+    const repo = repoLib.resolveRepo(usage.cwd);
+    repoName = repo.repo_name;
+    repoRoot = repo.repo_root;
+  } else {
+    repoName = decodeProjectDir(proj); // cwd unresolvable -> best-effort name, null root
+    repoRoot = null;
+  }
+  return { title: usage.title != null ? usage.title : null, repoName, repoRoot, tokens: usage.totals, byModel: usage.byModel };
+}
+
+// One response row for a snapshot file entry, served from the parse cache when the
+// snapshot's (mtime AND size) still match the cached parse — an active session's growing
+// file changes mtime, so it re-parses on the next snapshot refresh (≤ the snapshot TTL).
+// Reuses the snapshot's stat: no second statSync per page file.
+async function sessionRow(f, activeIdx) {
+  const cached = sessionsParseCache.get(f.path);
+  let meta;
+  if (cached && cached.mtimeMs === f.mtimeMs && cached.size === f.size) {
+    meta = cached.meta;
+  } else {
+    meta = await sessionMeta(f.path, f.proj);
+    setSessionsParseCache(f.path, { mtimeMs: f.mtimeMs, size: f.size, meta });
+  }
+  // Engaged active time. A live session uses the authoritative live value (matches the
+  // Live card's "Active", includes work since the last settled event); a past session
+  // uses the event-log index; a session the cockpit never observed (pre-install /
+  // transcript-only) has no events, so activeMs is null -> the UI shows "—".
+  const liveSess = state.sessions[f.sid];
+  let activeMs = null;
+  if (liveSess) activeMs = num(liveSess.activeMs);
+  else if (activeIdx && activeIdx.has(f.sid)) activeMs = num(activeIdx.get(f.sid));
+  return {
+    sessionId: f.sid,
+    title: meta.title,
+    repoName: meta.repoName,
+    repoRoot: meta.repoRoot,
+    activeMs, // null when the cockpit never saw this session (no events) -> UI shows "—"
+    lastActive: f.mtimeMs,
+    tokens: meta.tokens, // null when the transcript couldn't be read/parsed -> UI shows "unavailable"
+    cost: meta.tokens != null && cfg.cost.enabled ? pricing.estimateCost(meta.byModel, cfg.cost.rates).total : null,
+  };
+}
+
+// Every day that has an event log, plus today. Active time is EVENT-log-derived, so this
+// (not listRollupDates, which also counts usage-only backfill days) is the right span.
+// Reuses forEachDateFile/DATE_FILE_RE so the day-file naming lives in one place.
+function listEventLogDates() {
+  const set = new Set([currentDate]);
+  forEachDateFile(paths.eventsDir(), (_f, d) => set.add(d));
+  return [...set];
+}
+
+// Read a day's event log ASYNCHRONOUSLY and parse it to an events array. Async so the
+// active-index build can yield the event loop between days instead of readFileSync-ing the
+// whole history in one synchronous stretch (see sessionActiveTotals). Tolerates a torn line.
+async function readEventsAsync(p) {
+  let content;
+  try {
+    content = await fs.promises.readFile(p, 'utf8');
+  } catch (_e) {
+    return [];
+  }
+  const out = [];
+  for (const line of content.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      out.push(JSON.parse(t));
+    } catch (_e) {
+      /* skip malformed / torn line */
+    }
+  }
+  return out;
+}
+
+// Per-session engaged active time (ms) for one day's event log. Past days are memoized
+// (immutable — only cleanup/repo-delete change them, which clear the cache); the current
+// day is recomputed since it's still being appended. Mirrors getRollup's past/today split.
+// Async: the file read yields, so building the index never blocks on synchronous I/O.
+async function sessionActiveByDay(date) {
+  if (date === currentDate) {
+    return aggregate.accumulateSessionActiveFromEvents(await readEventsAsync(paths.eventLogPath(date)));
+  }
+  let m = sessionActiveDayCache.get(date);
+  if (!m) {
+    m = aggregate.accumulateSessionActiveFromEvents(await readEventsAsync(paths.eventLogPath(date)));
+    sessionActiveDayCache.set(date, m);
+  }
+  return m;
+}
+
+// Map<session_id, total engaged ms> across the whole event log — the Sessions view's
+// Active column for PAST (not-currently-live) sessions. Summed from the per-day maps (past
+// days memoized, current day live), cached for the snapshot TTL so rapid Prev/Next reuses
+// one sum. Async and awaits each day so a COLD build (boot, or after a cache clear) replays
+// one day at a time WITH yields — it never freezes the event loop replaying all history at
+// once, matching buildSessions' non-blocking contract.
+async function sessionActiveTotals() {
+  const now = Date.now();
+  if (sessionActiveTotalsCache && now - sessionActiveTotalsCache.at < SESSIONS_SNAPSHOT_TTL_MS) {
+    return sessionActiveTotalsCache.map;
+  }
+  const total = new Map();
+  for (const date of listEventLogDates()) {
+    const day = await sessionActiveByDay(date);
+    for (const [sid, ms] of day) total.set(sid, num(total.get(sid)) + ms);
+  }
+  sessionActiveTotalsCache = { at: now, map: total };
+  return total;
+}
+
+// Paginated, newest-first list of every retained transcript. `total` is the file
+// count (== rendered rows across all pages); an out-of-range page yields an empty
+// slice with the correct total. Async so the per-page transcript reads never block the
+// event loop — each awaited read yields, letting SSE frames and other requests interleave.
+async function buildSessions(page, pageSize) {
+  const snap = sessionsFileList();
+  const activeIdx = await sessionActiveTotals();
+  const start = page * pageSize;
+  const slice = snap.files.slice(start, start + pageSize);
+  const sessions = [];
+  for (const f of slice) sessions.push(await sessionRow(f, activeIdx));
+  return { now: Date.now(), page, pageSize, total: snap.total, sessions };
 }
 
 // ---- event log tail ---------------------------------------------------------
@@ -566,6 +769,8 @@ function rolloverDay(today) {
   offsets[currentDate] = 0;
   todayRollup = aggregate.createRollup(currentDate);
   rollupCache.clear(); // yesterday is now a past day — re-derive it on demand
+  sessionActiveDayCache.clear(); // engaged spans break at the boundary; re-derive per-session active too
+  sessionActiveTotalsCache = null;
   repoTotalsCache = null;
   // Break every session's engaged span at the day boundary so the live per-repo
   // active total matches the fresh per-day re-derivation (which starts each day with
@@ -1555,6 +1760,8 @@ function handleDataCleanup(req, res) {
       // A pruned day drops out of every range aggregate — clear the memoized rollups
       // and the all-time totals so they no longer count the deleted days.
       rollupCache.clear();
+      sessionActiveDayCache.clear(); // deleted day-files change per-session active too
+      sessionActiveTotalsCache = null;
       repoTotalsCache = null;
       markDirty();
       json(res, { ok: true, deletedDays: deletedDays.size, freedBytes: Math.max(0, before - storeBytes()) });
@@ -1636,6 +1843,8 @@ function handleReposDelete(req, res) {
       // offset + corrected rollup together (saveSnapshot), and refresh open dashboards.
       rebuildTodayRollup();
       rollupCache.clear();
+      sessionActiveDayCache.clear(); // this repo's events were rewritten out of the day-files
+      sessionActiveTotalsCache = null;
       repoTotalsCache = null;
       saveSnapshot();
       markDirty();
@@ -1677,6 +1886,21 @@ function handleRequest(req, res) {
     if (req.method === 'GET' && pathname === '/api/stream') return serveStream(req, res);
     if (req.method === 'GET' && pathname === '/api/history') return json(res, buildHistory(url.searchParams.get('range')));
     if (req.method === 'GET' && pathname === '/api/storage') return json(res, computeStorage());
+    if (req.method === 'GET' && pathname === '/api/sessions') {
+      let pageSize = parseInt(url.searchParams.get('pageSize'), 10);
+      if (!Number.isFinite(pageSize)) pageSize = 50;
+      pageSize = Math.max(1, Math.min(100, pageSize)); // clamp so ?pageSize=99999 can't parse the whole store
+      let page = parseInt(url.searchParams.get('page'), 10);
+      if (!Number.isFinite(page) || page < 0) page = 0;
+      buildSessions(page, pageSize).then(
+        (payload) => json(res, payload),
+        (e) => {
+          log('sessions failed ' + ((e && e.stack) || e));
+          json(res, { error: 'sessions failed' }, 500);
+        }
+      );
+      return;
+    }
     if (req.method === 'GET' && pathname === '/api/config') return json(res, cfg);
     if (req.method === 'PUT' && pathname === '/api/config') return handlePutConfig(req, res);
     if (req.method === 'POST' && pathname === '/api/data/cleanup') return handleDataCleanup(req, res);

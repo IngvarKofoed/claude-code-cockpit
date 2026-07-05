@@ -500,6 +500,32 @@ function accumulateActiveFromEvents(rollup, events) {
   return rollup;
 }
 
+// Per-SESSION engaged active time (ms) for a day's event stream, keyed by session_id. Uses
+// the SAME fresh-state replay, engaged clock, AND `repoRoot != null` gate as
+// accumulateActiveFromEvents — so a repo's active time equals the sum of its sessions'
+// active time here, and neither counts a span the other drops. EVERY session in the stream
+// gets an entry (0 when it did no engaged work), so a caller can distinguish "observed, did
+// 0 work" (present, 0) from "never observed" (absent). Same fresh-state-per-day semantics: a
+// span crossing midnight loses the slice between its last pre-midnight and first
+// post-midnight event (mirrors the live path and the per-repo rollup).
+function accumulateSessionActiveFromEvents(events) {
+  const out = new Map();
+  if (!Array.isArray(events)) return out;
+  const s = createState();
+  for (const ev of events) {
+    applyEvent(s, ev);
+    const sid = ev && ev.session_id;
+    if (sid == null) continue;
+    const sess = s.sessions[sid];
+    if (!sess) continue;
+    // Record the session even at 0 delta (so it counts as "observed"); add engaged ms only
+    // under the same repoRoot guard the per-repo fold uses, keeping the two views consistent.
+    const add = sess.activeDelta > 0 && sess.repoRoot != null ? sess.activeDelta : 0;
+    out.set(sid, num(out.get(sid)) + add);
+  }
+  return out;
+}
+
 module.exports = {
   createState,
   applyEvent,
@@ -510,4 +536,5 @@ module.exports = {
   accumulateTokensByModel,
   accumulateSession,
   accumulateActiveFromEvents,
+  accumulateSessionActiveFromEvents,
 };

@@ -41,8 +41,9 @@ Plus the notifier's ambient layer: an OS notification and/or a sound when a sess
 2. **Live activity detail.** What Claude is doing *now* — the current tool (running `Bash`, editing a file, waiting on a permission prompt) derived from tool-use hooks — not just a running/idle flag.
 3. **Per-repository accounting.** Total active time, prompt count, session count, token totals (input / output / cache), and an **estimated dollar cost**, with a time-range filter. *Active time* is engaged wall-clock — time a session spent working a turn or running a background workflow — and deliberately **excludes** time spent waiting on you (a permission prompt) or sitting idle, so it reflects real work rather than elapsed clock.
 4. **History & trends.** Retained aggregates rendered as charts: tokens and time per day, activity by hour of day, and top repositories by time or tokens.
-5. **Notifications & sounds.** OS notifications (opt-in, configurable per event) plus in-dashboard sounds, for: session finished, needs input, prompt running too long, and turn failed.
-6. **Zero-friction, cross-platform, private.** No native build step, works on macOS / Windows / Linux, and all data stays on your machine.
+5. **Session directory.** A newest-first, paginated list of *every* Claude Code session still on disk — read straight from the transcript files, so it covers pre-cockpit and already-ended sessions the accounting store no longer holds. Each row shows the session's AI-generated title, its repository, when it was last active, and its token/cost totals, with live sessions badged active. Because it reads Claude Code's transcripts (not the cockpit's store), it follows Claude Code's retention — a repo cleared from the accounting views still lists its sessions here. The verbatim last prompt is never shown; only the derived title.
+6. **Notifications & sounds.** OS notifications (opt-in, configurable per event) plus in-dashboard sounds, for: session finished, needs input, prompt running too long, and turn failed.
+7. **Zero-friction, cross-platform, private.** No native build step, works on macOS / Windows / Linux, and all data stays on your machine.
 
 ## Principles
 

@@ -268,3 +268,29 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     The Status/Name sort moved from the Live header to Settings > Dashboard ("Live view sort") — still a
     per-browser localStorage pref (not daemon config), intercepted before the config-save handler so it
     never PUTs or pops a "Settings saved" toast.
+
+35. New top-level Sessions view (v0.10.0) + `GET /api/sessions` listing EVERY retained Claude Code session by
+    reading the transcript filesystem directly (`~/.claude/projects/<encoded-cwd>/*.jsonl`), not the cockpit's
+    store — newest-first by file mtime, paginated (`pageSize` default 50, clamped `[1,100]`; `page` coerced,
+    out-of-range → empty page + correct total). Every transcript is exactly one row (no file dropped), so
+    `total` equals the rendered count and paging is exact. Names come from the transcript `ai-title`; the
+    verbatim `last-prompt` is NEVER surfaced — that line is the privacy boundary (derived label yes, raw text
+    no). Cost bounded by a ~3s stat/sort snapshot (sweep) + a per-file mtime/size parse cache (parse), so the
+    O(total) scan never runs on the SSE hot path.
+    Deliberate consequence: this view follows CLAUDE CODE's transcript retention, not the cockpit's — so a repo
+    removed via `/api/repos/delete` (or days via `/api/data/cleanup`) still lists its sessions here. The price
+    of complete coverage with no new store/writer; "active" is a client overlay intersecting the live stream.
+    The endpoint reads each page's transcripts ASYNCHRONOUSLY (never a blocking readFileSync on the event loop),
+    so a cold page can't stall SSE/hooks/notifications for other sessions. An unreadable/unparseable transcript
+    shows tokens as UNAVAILABLE ("—"), never a misleading 0/$0.000 (the graceful-degradation rule).
+
+36. Sessions view gains an **Active** (engaged time) column, and **Last active** moved to the far right.
+    Active time can't come from transcripts (it's event-log-derived), so a new `aggregate.accumulateSessionActiveFromEvents`
+    replays the event log PER SESSION with the SAME engaged clock as Live/Per-repo — so a repo's active time equals the
+    sum of its sessions' by construction. A live session uses its live `activeMs`; a past session the cockpit observed
+    uses a cached event-log index (per-past-day memoized, summed under the snapshot TTL, invalidated on rollover/cleanup/
+    repo-delete); a session the cockpit never saw (pre-install / transcript-only, no events) shows "—", not a false "0s".
+    The index build is ASYNC (reads each day's log with an await between days), so even a cold build after boot/cache-clear
+    never freezes the event loop replaying all history at once. A session the cockpit DID observe but that did no engaged
+    work is recorded as 0 (shows "0s"), kept distinct from a never-observed session ("—"). A live row's Active uses the
+    fresh live `activeMs` and is updated in place each SSE frame (no table rebuild, so text selection survives).

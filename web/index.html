@@ -15,6 +15,7 @@
     <header class="topbar">
       <nav class="nav" id="nav">
         <button class="nav__tab is-active" type="button" data-view="live">Live</button>
+        <button class="nav__tab" type="button" data-view="sessions">Sessions</button>
         <button class="nav__tab" type="button" data-view="repos">Per-repo</button>
         <button class="nav__tab" type="button" data-view="history">History</button>
         <button class="nav__tab" type="button" data-view="settings">Settings</button>
@@ -34,6 +35,16 @@
       <section class="view is-active" id="view-live">
         <div class="ribbon" id="liveRibbon"></div>
         <div class="cards" id="cards"></div>
+      </section>
+
+      <!-- Sessions -->
+      <section class="view" id="view-sessions">
+        <div class="view__head">
+          <h2 class="view__title">Sessions</h2>
+          <span class="view__note">every session Claude Code retains on disk, newest first</span>
+        </div>
+        <div class="panel" id="sessionsPanel"></div>
+        <div class="pager" id="sessionsPager"></div>
       </section>
 
       <!-- Per-repo -->

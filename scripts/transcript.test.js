@@ -183,3 +183,32 @@ test('readUsage: empty / whitespace-only file -> ok:false', () => {
   assert.strictEqual(r.ok, false);
   assert.strictEqual(r.messages.length, 0);
 });
+
+// --- ai-title capture (Sessions list) ----------------------------------------
+
+test('readUsage: last ai-title wins across multiple lines', () => {
+  const file = writeFixture([
+    JSON.stringify({ type: 'ai-title', aiTitle: 'First guess' }),
+    JSON.stringify({ uuid: 'a', model: 'm', usage: { input_tokens: 1 } }),
+    JSON.stringify({ type: 'ai-title', aiTitle: 'Refined title' }),
+  ]);
+  const r = readUsage(file);
+  assert.strictEqual(r.title, 'Refined title');
+  assert.strictEqual(r.totals.input, 1); // usage still parsed alongside the title
+});
+
+test('readUsage: no ai-title line -> title null', () => {
+  const file = writeFixture([JSON.stringify({ uuid: 'a', model: 'm', usage: { input_tokens: 1 } })]);
+  assert.strictEqual(readUsage(file).title, null);
+});
+
+test('readUsage: malformed / torn line tolerated while capturing a later ai-title', () => {
+  const file = writeFixture([
+    '{ this is : not json', // malformed -> skipped, must not throw
+    JSON.stringify({ type: 'ai-title' }), // ai-title with no aiTitle -> ignored
+    JSON.stringify({ type: 'ai-title', aiTitle: 'Good title' }),
+  ]);
+  const r = readUsage(file);
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.title, 'Good title');
+});

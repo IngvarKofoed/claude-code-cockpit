@@ -18,6 +18,10 @@ const App = {
   liveSort: "status", // "status" (server waiting-first) | "name" (alpha); set from localStorage in init
   repoRows: [], // normalized rows currently shown in the per-repo table
   repoSort: { key: "activeMs", dir: -1 }, // dir: 1 asc, -1 desc
+  sessionsPage: 0, // current 0-based page of the Sessions view
+  sessionsPageSize: 50, // page size sent to GET /api/sessions (server clamps to [1,100])
+  sessionsTotal: 0, // total session count reported by the last /api/sessions fetch
+  sessionsRows: [], // rows from the last /api/sessions fetch (re-rendered with a fresh live overlay)
   storage: null, // last GET /api/storage snapshot (Settings > Data), for the cleanup preview
   prevStatus: {}, // sessionId -> last status, for sound-cue transition detection
   soundsPrimed: false, // suppress cues on first snapshot / after a reconnect gap
@@ -326,9 +330,17 @@ function checkLongRunning(now) {
 
 // ---- live timers -----------------------------------------------------------
 
-function collectTimers(root) {
+// Rebuild the ticking-timer registry from the [data-timer] elements in the ACTIVE view
+// only. Both the Live cards and the Sessions rows carry live timers; scoping to the
+// visible view means a hidden view's stale timers aren't re-painted every second (the
+// Live cards are rebuilt every frame even while hidden, so a document-wide scan would tick
+// invisible elements forever). Both renderLive and renderSessions call this after
+// replacing their markup.
+function collectTimers() {
   App.timers = [];
-  root.querySelectorAll("[data-timer]").forEach((el) => {
+  const active = document.querySelector(".view.is-active");
+  if (!active) return;
+  active.querySelectorAll("[data-timer]").forEach((el) => {
     const start = Number(el.dataset.start);
     if (!Number.isFinite(start) || start <= 0) return;
     App.timers.push({ el, start, kind: el.dataset.timer });
@@ -585,7 +597,7 @@ function renderLive() {
   cards.querySelectorAll(".path").forEach((btn) =>
     btn.addEventListener("click", () => copyPath(btn.dataset.path))
   );
-  collectTimers(cards);
+  collectTimers();
   tick(); // paint timers immediately rather than waiting up to a second
 }
 
@@ -609,6 +621,216 @@ function setLiveSort(value) {
     /* persistence best-effort */
   }
   renderLive();
+}
+
+// ---- Sessions view ---------------------------------------------------------
+
+// Relative "3h ago" from an epoch-ms timestamp (the transcript file mtime). Reuses
+// relTime (which parses an ISO string) after converting; "—" for a missing/invalid ms.
+function relTimeMs(ms) {
+  const n = num(ms);
+  if (n <= 0) return "—";
+  return relTime(new Date(n).toISOString());
+}
+
+// The anchor for a live session's ticking "elapsed" timer, matching the Live card: the
+// open prompt's start, or — while a background workflow runs on after the launching turn's
+// Stop — when the session became engaged. 0 when neither is known.
+function liveTickAnchor(s) {
+  const promptStartMs = s.currentPromptStartedAt ? Date.parse(s.currentPromptStartedAt) : 0;
+  const engagedMs = s.engagedStartedAt ? Date.parse(s.engagedStartedAt) : 0;
+  const anchor = Number.isFinite(promptStartMs) && promptStartMs > 0 ? promptStartMs : engagedMs;
+  return Number.isFinite(anchor) && anchor > 0 ? anchor : 0;
+}
+
+// One Sessions-table row. `liveS` is the matching live session from App.state.sessions (or
+// undefined for a plain past session). Every string that reaches innerHTML is esc()'d — the
+// title is AI-generated text and could otherwise inject markup.
+function sessionRowHTML(r, liveS, showCost) {
+  const st = liveS ? effectiveStatus(liveS) : null;
+  const statusCell = st
+    ? `<td class="col-status"><span class="sbadge" data-status="${esc(st)}">${esc(STATUS_LABEL[st] || st)}</span></td>`
+    : `<td class="col-status"></td>`;
+
+  const title = r.title != null && String(r.title).trim() !== "" ? String(r.title) : null;
+  const first8 = String(r.sessionId || "").slice(0, 8);
+  // Name: the AI title when present; otherwise a muted fallback. NEVER the last-prompt text
+  // (it isn't in the payload and would breach the no-message-content boundary).
+  const nameCell = title
+    ? `<td class="col-name" title="${esc(title)}">${esc(title)}</td>`
+    : `<td class="col-name"><span class="session-untitled">Untitled session · ${esc(first8)}</span></td>`;
+
+  const repoCell = r.repoName
+    ? `<td class="col-repo"${r.repoRoot ? ` title="${esc(r.repoRoot)}"` : ""}>${esc(r.repoName)}</td>`
+    : `<td class="col-repo muted">—</td>`;
+
+  // Last active: a live running/engaged row shows the ticking elapsed timer (reused Live-card
+  // mechanism); every other row shows the relative transcript mtime.
+  let timeCell;
+  const tickMs = liveS && st === "running" ? liveTickAnchor(liveS) : 0;
+  if (tickMs) {
+    timeCell = `<td class="col-time"><span class="live-elapsed" data-timer="dur" data-start="${tickMs}">0s</span></td>`;
+  } else {
+    const rel = relTimeMs(r.lastActive);
+    timeCell = `<td class="col-time${rel === "—" ? " muted" : ""}">${esc(rel)}</td>`;
+  }
+
+  // tokens === null means the transcript couldn't be read/parsed: show it as unavailable,
+  // NOT a misleading "0" (which would read as a real zero-cost session).
+  let tokCell;
+  if (r.tokens == null) {
+    tokCell = `<td class="muted" title="token usage unavailable — transcript unreadable">—</td>`;
+  } else {
+    const tok = sumTokens(r.tokens);
+    const tokTitle = typeof r.tokens === "object" ? ` title="${esc(tokensBreakdown(r.tokens))}"` : "";
+    tokCell = `<td${tokTitle}>${esc(fmtTokens(tok))}</td>`;
+  }
+
+  let costCell = "";
+  if (showCost) {
+    const c = typeof r.cost === "number" ? r.cost : null;
+    costCell = `<td${c == null ? ' class="muted"' : ""}>${esc(fmtCost(c))}</td>`;
+  }
+
+  // Active (engaged) time. A LIVE session uses its fresh overlay value (matches the Live
+  // card and advances as it works — refreshLiveActiveCells keeps it current between
+  // rebuilds); a past session uses the fetched index value. null (only for a past session
+  // the cockpit never observed) shows "—" rather than a misleading "0s".
+  const activeMs = liveS ? num(liveS.activeMs) : r.activeMs;
+  const activeCell =
+    activeMs == null
+      ? `<td class="col-active muted" title="no active time recorded — the cockpit didn't observe this session">—</td>`
+      : `<td class="col-active">${esc(fmtDuration(num(activeMs)))}</td>`;
+
+  // Column order: Active sits with the other stats; Last active (timeCell) is last.
+  // data-session-id lets refreshLiveActiveCells update this row's Active cell in place.
+  return `<tr data-session-id="${esc(r.sessionId)}">${statusCell}${nameCell}${repoCell}${activeCell}${tokCell}${costCell}${timeCell}</tr>`;
+}
+
+// Render the Sessions table + pager from the cached rows (App.sessionsRows) and the current
+// live overlay (App.state.sessions). Called on fetch and on every SSE frame while the view
+// is open — the overlay is what keeps listed rows' badges/timers fresh, so no refetch.
+function renderSessions() {
+  const panel = $("sessionsPanel");
+  if (!panel) return;
+  App.sessionsOverlaySig = sessionsOverlaySig(); // seed, so the next SSE frame only rebuilds on a real change
+  const rows = App.sessionsRows || [];
+  const total = num(App.sessionsTotal);
+  if (!rows.length) {
+    panel.innerHTML =
+      '<div class="empty"><strong>No sessions found</strong>Claude Code has no session transcripts on disk yet.</div>';
+    renderSessionsPager(total);
+    return;
+  }
+  const showCost = costEnabled();
+  const live = {};
+  for (const s of (App.state && App.state.sessions) || []) live[s.sessionId] = s;
+  const head =
+    `<tr><th class="col-status" aria-hidden="true"></th><th class="col-name">Name</th>` +
+    `<th class="col-repo">Repo</th><th class="col-active">Active</th><th>Tokens</th>` +
+    (showCost ? "<th>Cost</th>" : "") +
+    `<th class="col-time">Last active</th>` +
+    `</tr>`;
+  const body = rows.map((r) => sessionRowHTML(r, live[r.sessionId], showCost)).join("");
+  panel.innerHTML = `<table class="table sessions-table"><thead>${head}</thead><tbody>${body}</tbody></table>`;
+  renderSessionsPager(total);
+  collectTimers(); // register any live ticking timers now in the rows
+  tick(); // paint them immediately
+}
+
+function renderSessionsPager(total) {
+  const pager = $("sessionsPager");
+  if (!pager) return;
+  const pageCount = Math.max(1, Math.ceil(num(total) / App.sessionsPageSize));
+  const page = clamp(num(App.sessionsPage), 0, pageCount - 1);
+  if (!total) {
+    pager.innerHTML = "";
+    return;
+  }
+  pager.innerHTML =
+    `<button class="btn" id="sessPrev" type="button"${page <= 0 ? " disabled" : ""}>Prev</button>` +
+    `<span class="pager__label">page ${page + 1} of ${pageCount} · ${total} session${total === 1 ? "" : "s"}</span>` +
+    `<button class="btn" id="sessNext" type="button"${page >= pageCount - 1 ? " disabled" : ""}>Next</button>`;
+}
+
+// Fetch one page of GET /api/sessions and render it. Called on view (re)open and on
+// Prev/Next only — NOT on every SSE frame (the O(total) server sweep must not run per frame).
+function loadSessions(page) {
+  const p = Math.max(0, Math.floor(num(page)));
+  App.sessionsPage = p;
+  api("/api/sessions?page=" + p + "&pageSize=" + App.sessionsPageSize)
+    .then((data) => {
+      App.sessionsTotal = num(data && data.total);
+      const rows = data && Array.isArray(data.sessions) ? data.sessions : [];
+      if (data && Number.isFinite(data.page)) App.sessionsPage = data.page;
+      // Out-of-range page: the server clamps `page` only at 0 (no upper bound), so a
+      // stale page beyond the current total returns an empty slice with total>0. Clamp
+      // to the last valid page and refetch, so the view can't strand on "No sessions
+      // found" with both pager buttons disabled and no in-UI recovery.
+      if (!rows.length && App.sessionsTotal > 0) {
+        const lastPage = Math.max(0, Math.ceil(App.sessionsTotal / App.sessionsPageSize) - 1);
+        if (App.sessionsPage > lastPage) {
+          loadSessions(lastPage);
+          return;
+        }
+      }
+      App.sessionsRows = rows;
+      renderSessions();
+    })
+    .catch(() => {
+      App.sessionsTotal = 0;
+      App.sessionsRows = [];
+      renderSessions(); // shows the "No sessions found" empty state
+    });
+}
+
+// A compact signature of the live overlay for the currently-displayed rows —
+// sessionId:status:timerAnchor for each. It changes only when a listed session's live
+// status or its ticking-timer anchor changes; a plain token/activity update leaves it
+// identical.
+function sessionsOverlaySig() {
+  const live = {};
+  for (const s of (App.state && App.state.sessions) || []) live[s.sessionId] = s;
+  return (App.sessionsRows || [])
+    .map((r) => {
+      const s = live[r.sessionId];
+      const st = s ? effectiveStatus(s) : "";
+      const anchor = s && st === "running" ? liveTickAnchor(s) : 0;
+      return r.sessionId + ":" + st + ":" + anchor;
+    })
+    .join("|");
+}
+
+// SSE-frame refresh of the Sessions view. A full renderSessions() replaces the table's
+// innerHTML — which drops the user's text selection and flickers up to ~4x/sec while a
+// session is actively working — so only rebuild when a listed session's live status or
+// timer anchor ACTUALLY changed (infrequent). Between those, the ticking timers keep
+// moving via tick() with no DOM churn, so a title stays selectable.
+function refreshSessionsOverlay() {
+  refreshLiveActiveCells(); // in-place: keep live rows' Active advancing without a rebuild
+  const sig = sessionsOverlaySig();
+  if (sig === App.sessionsOverlaySig) return;
+  renderSessions(); // re-seeds App.sessionsOverlaySig
+}
+
+// Update only the Active cell of each currently-live row from the fresh live overlay, in
+// place (no table rebuild). Without this a live session's Active would freeze at the
+// fetch-time value — refreshSessionsOverlay rebuilds only on a status/timer change — so it
+// would diverge from the Live card, whose Active advances each SSE frame. Touching just the
+// one cell keeps the user's text selection (a full innerHTML rebuild would drop it).
+function refreshLiveActiveCells() {
+  const panel = $("sessionsPanel");
+  if (!panel) return;
+  const live = {};
+  for (const s of (App.state && App.state.sessions) || []) live[s.sessionId] = s;
+  panel.querySelectorAll("tr[data-session-id]").forEach((tr) => {
+    const s = live[tr.dataset.sessionId];
+    if (!s) return; // a past row's index value is static — nothing to refresh
+    const cell = tr.querySelector(".col-active");
+    if (!cell) return;
+    cell.classList.remove("muted");
+    cell.textContent = fmtDuration(num(s.activeMs));
+  });
 }
 
 // ---- Per-repo view ---------------------------------------------------------
@@ -1283,6 +1505,10 @@ function applyState(state) {
   detectSoundCues(state.sessions || []);
   renderLive();
   throttledReposRefresh();
+  // Sessions view: refresh the live overlay (badges/timers) of the already-fetched rows
+  // from the new snapshot — no endpoint refetch (that only happens on view open / Prev-Next),
+  // and only a real status/timer change rebuilds the table (else selection would drop).
+  if (App.view === "sessions") refreshSessionsOverlay();
   if (App.view === "settings" && !App.settingsRendered) renderSettings();
 }
 
@@ -1291,6 +1517,9 @@ function applyState(state) {
 function onConfigChanged() {
   renderLive();
   refreshReposView(); // rare, so refresh immediately (cost column may have changed)
+  // Refetch (not just re-render): cost is computed server-side per request, so a pricing
+  // rate edit or a cost enable/disable only reaches the client's rows by re-fetching.
+  if (App.view === "sessions") loadSessions(App.sessionsPage);
   if (App.view === "settings") maybeRenderSettings();
 }
 
@@ -1298,7 +1527,8 @@ function setView(v) {
   App.view = v;
   document.querySelectorAll(".nav__tab").forEach((t) => t.classList.toggle("is-active", t.dataset.view === v));
   document.querySelectorAll(".view").forEach((sec) => sec.classList.toggle("is-active", sec.id === "view-" + v));
-  if (v === "repos") loadRepos();
+  if (v === "sessions") loadSessions(App.sessionsPage);
+  else if (v === "repos") loadRepos();
   else if (v === "history") loadHistory();
   else if (v === "settings") renderSettings();
 }
@@ -1406,6 +1636,13 @@ function init() {
   $("nav").addEventListener("click", (e) => {
     const t = e.target.closest(".nav__tab");
     if (t) setView(t.dataset.view);
+  });
+
+  $("sessionsPager").addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b || b.disabled) return;
+    if (b.id === "sessPrev") loadSessions(App.sessionsPage - 1);
+    else if (b.id === "sessNext") loadSessions(App.sessionsPage + 1);
   });
 
   $("repoRange").addEventListener("click", (e) => {

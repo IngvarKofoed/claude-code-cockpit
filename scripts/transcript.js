@@ -63,17 +63,27 @@ function parseUsageLine(obj) {
 // plus per-model and grand totals. `ok` is false only when the file is
 // unreadable or empty — the daemon then marks tokens unavailable.
 function readUsage(transcriptPath) {
-  // `cwd` is the session's working directory, captured from the first entry that
-  // carries it — used by backfill to resolve which repo a whole transcript belongs
-  // to (transcript filenames only carry the session id, not the cwd).
-  const result = { messages: [], byModel: {}, totals: emptyTokens(), cwd: null, ok: false };
-
   let content;
   try {
     content = fs.readFileSync(transcriptPath, 'utf8');
   } catch (_err) {
-    return result; // missing / unreadable -> ok:false
+    // missing / unreadable -> ok:false
+    return { messages: [], byModel: {}, totals: emptyTokens(), cwd: null, title: null, ok: false };
   }
+  return readUsageContent(content);
+}
+
+// Parse already-read transcript CONTENT (the file's text). Split from readUsage so a
+// caller that reads the file ASYNCHRONOUSLY — the Sessions list endpoint, which must not
+// block the daemon's single event loop on a synchronous readFileSync of up to a page of
+// whole transcripts — can reuse the exact same parsing. `ok` is false only for
+// empty/whitespace content; the daemon then marks that session's tokens unavailable.
+function readUsageContent(content) {
+  // `cwd` is the session's working directory, captured from the first entry that
+  // carries it — used by backfill to resolve which repo a whole transcript belongs
+  // to (transcript filenames only carry the session id, not the cwd).
+  const result = { messages: [], byModel: {}, totals: emptyTokens(), cwd: null, title: null, ok: false };
+
   if (!content || !content.trim()) return result; // empty -> ok:false
   result.ok = true;
 
@@ -91,6 +101,11 @@ function readUsage(transcriptPath) {
     }
 
     if (result.cwd == null && typeof obj.cwd === 'string' && obj.cwd) result.cwd = obj.cwd;
+
+    // The session's AI-generated name arrives as `ai-title` lines and is refined
+    // as the session grows, so the LAST one wins. Captured in this same pass for
+    // the Sessions list; a missing ai-title just leaves title:null.
+    if (obj.type === 'ai-title' && typeof obj.aiTitle === 'string') result.title = obj.aiTitle;
 
     const parsed = parseUsageLine(obj);
     if (!parsed) continue; // no usage on this line
@@ -115,4 +130,4 @@ function readUsage(transcriptPath) {
   return result;
 }
 
-module.exports = { readUsage, parseUsageLine };
+module.exports = { readUsage, readUsageContent, parseUsageLine };

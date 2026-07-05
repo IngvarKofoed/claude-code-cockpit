@@ -12,6 +12,7 @@ const {
   accumulateTokensByModel,
   accumulateSession,
   accumulateActiveFromEvents,
+  accumulateSessionActiveFromEvents,
 } = require('./aggregate');
 
 // Build a normalized event record with sensible defaults; override per case.
@@ -720,6 +721,47 @@ test('accumulateActiveFromEvents: a closing event with no prior engaged state co
 test('accumulateActiveFromEvents: bad input is a safe no-op', () => {
   assert.deepStrictEqual(accumulateActiveFromEvents(createRollup('2026-07-02'), null).repos, {});
   assert.deepStrictEqual(accumulateActiveFromEvents(createRollup('2026-07-02'), 'nope').repos, {});
+});
+
+// --- accumulateSessionActiveFromEvents (per-session active, Sessions view) ----
+
+test('accumulateSessionActiveFromEvents: keyed by session, agrees with the per-repo total', () => {
+  const events = [
+    { ts: '2026-07-02T10:00:00.000Z', event: 'UserPromptSubmit', session_id: 'a', repo_root: '/x', repo_name: 'x', prompt_id: 'p1' },
+    { ts: '2026-07-02T10:00:04.000Z', event: 'Stop', session_id: 'a', repo_root: '/x', repo_name: 'x' }, // 4s
+    { ts: '2026-07-02T10:00:00.000Z', event: 'UserPromptSubmit', session_id: 'b', repo_root: '/x', repo_name: 'x', prompt_id: 'p1' },
+    { ts: '2026-07-02T10:00:10.000Z', event: 'Stop', session_id: 'b', repo_root: '/x', repo_name: 'x' }, // 10s
+  ];
+  const perSession = accumulateSessionActiveFromEvents(events);
+  assert.strictEqual(perSession.get('a'), 4000);
+  assert.strictEqual(perSession.get('b'), 10000);
+  // By construction, a repo's active time == the sum of its sessions' active time.
+  const repo = accumulateActiveFromEvents(createRollup('2026-07-02'), events).repos['/x'].activeMs;
+  assert.strictEqual(perSession.get('a') + perSession.get('b'), repo);
+});
+
+test('accumulateSessionActiveFromEvents: excludes permission-wait time (same engaged clock)', () => {
+  const events = [
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('Notification', { ts: '2026-07-02T10:00:05.000Z', notification_type: 'permission_prompt' }), // +5s engaged
+    ev('PostToolUse', { ts: '2026-07-02T10:00:35.000Z' }), // 30s wait excluded
+    ev('Stop', { ts: '2026-07-02T10:00:40.000Z' }), // +5s
+  ];
+  assert.strictEqual(accumulateSessionActiveFromEvents(events).get('s1'), 10000); // 5s + 5s
+});
+
+test('accumulateSessionActiveFromEvents: records an observed-but-idle session as 0, not absent', () => {
+  const m = accumulateSessionActiveFromEvents([
+    ev('SessionStart', { ts: '2026-07-02T10:00:00.000Z' }),
+    ev('Notification', { ts: '2026-07-02T10:00:05.000Z', notification_type: 'permission_prompt' }), // waiting, not engaged
+  ]);
+  assert.ok(m.has('s1')); // observed (it appeared in the stream)...
+  assert.strictEqual(m.get('s1'), 0); // ...but did no engaged work -> 0, so the UI shows "0s", not "—" (unobserved)
+});
+
+test('accumulateSessionActiveFromEvents: bad input returns an empty Map', () => {
+  assert.strictEqual(accumulateSessionActiveFromEvents(null).size, 0);
+  assert.strictEqual(accumulateSessionActiveFromEvents('nope').size, 0);
 });
 
 test('accumulateActiveFromEvents: tallies byTool by tool_name, per repo', () => {
