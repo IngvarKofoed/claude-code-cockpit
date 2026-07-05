@@ -294,3 +294,7 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     never freezes the event loop replaying all history at once. A session the cockpit DID observe but that did no engaged
     work is recorded as 0 (shows "0s"), kept distinct from a never-observed session ("—"). A live row's Active uses the
     fresh live `activeMs` and is updated in place each SSE frame (no table rebuild, so text selection survives).
+
+37. Renamed the "Per-repo" dashboard tab (and its "Per-repository" view title) to "Repos" — shorter label,
+    same view. Label-only: the `data-view="repos"` id, the `repos` route, and the API/rollup fields are
+    unchanged; "per-repo" as a concept (per-repository accounting) stays in prose and code comments.

@@ -64,7 +64,7 @@ The dashboard's tabs:
 - **Live** — one card per active session: repo, branch, status, current
   activity, a ticking prompt timer, tokens, and estimated cost. Sessions
   *waiting for input* sort to the top and are highlighted.
-- **Per-repo** — a sortable table of active time, prompts, sessions, tokens, and
+- **Repos** — a sortable table of active time, prompts, sessions, tokens, and
   estimated cost, with a time-range filter.
 - **History** — charts of tokens and time per day, activity by hour, and top
   repositories.
