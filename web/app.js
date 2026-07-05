@@ -532,26 +532,33 @@ function tile(label, value, alert) {
 }
 
 function renderLiveRibbon(sessions) {
-  // One pass over the (small) live-session set: running/waiting status counts, agents in flight
-  // ("Active agents" = Σ bgTasks — Claude Code's authoritative background_tasks count, i.e. workflow
-  // subagents / background shells running right now, NOT the drift-prone subagents.active), and total
-  // engaged time ("Active time" = Σ session.activeMs — the roll-up of each card's Active stat).
+  // The Live page is the main screen, so its ribbon doubles as a "today at a glance" summary.
+  // Running / Waiting are the only momentary tiles — status counts over the live session set,
+  // which only make sense "right now". Everything else (Sessions, Agents, Active time, Tokens,
+  // Cost) is TODAY's total across all of today's sessions, read from the today per-repo rollup
+  // (App.state.repos) — so a session that already ended today still counts, unlike the old
+  // sum-over-live-sessions. Sessions/Agents sum the per-repo counts (a session touching two
+  // repos counts once per repo — rare, and matches the Repos table's per-repo figures).
   let running = 0;
   let waiting = 0;
-  let inFlight = 0;
-  let activeMs = 0;
   for (const s of sessions) {
     const st = effectiveStatus(s);
     if (st === "running") running++;
     else if (st === "waiting") waiting++;
-    inFlight += num(s.bgTasks);
-    activeMs += num(s.activeMs);
   }
   const repos = (App.state && App.state.repos) || [];
+  let sessionsToday = 0;
+  let agents = 0;
+  let activeMs = 0;
   let tok = 0;
   let cost = 0;
   let hasCost = false;
   for (const r of repos) {
+    // r.sessions may arrive as an array (older payloads) or a number (current) — mirror
+    // normalizeRepoRow so the ribbon and the Repos table read the field identically.
+    sessionsToday += Array.isArray(r.sessions) ? r.sessions.length : num(r.sessions);
+    agents += num(r.subagents);
+    activeMs += num(r.activeMs);
     tok += sumTokens(r.tokens);
     if (typeof r.cost === "number" && Number.isFinite(r.cost)) {
       cost += r.cost;
@@ -559,14 +566,14 @@ function renderLiveRibbon(sessions) {
     }
   }
   const tiles = [
-    tile("Sessions", sessions.length),
+    tile("Sessions", sessionsToday),
     tile("Running", running),
     tile("Waiting", waiting, waiting > 0),
-    tile("Active agents", inFlight),
+    tile("Agents", agents),
     tile("Active time", fmtDuration(activeMs)),
-    tile("Tokens today", fmtTokens(tok)),
+    tile("Tokens", fmtTokens(tok)),
   ];
-  if (costEnabled()) tiles.push(tile("Cost today", hasCost ? fmtCost(cost) : "—"));
+  if (costEnabled()) tiles.push(tile("Cost", hasCost ? fmtCost(cost) : "—"));
   $("liveRibbon").innerHTML = tiles.join("");
 }
 
