@@ -72,8 +72,8 @@ const primedSeen = new Set(); // session_ids whose seenIds have been seeded from
 const rollupCache = new Map(); // dateStr -> memoized derived past-day rollup (fast History reads)
 let sessionsSnapshot = null; // { at, files:[{path,proj,sid,mtimeMs,size}], total } short-TTL stat/sort snapshot for /api/sessions
 const sessionsParseCache = new Map(); // transcriptPath -> { mtimeMs, size, meta } — reuse the parse iff both match a fresh stat
-const sessionActiveDayCache = new Map(); // dateStr (PAST day only) -> Map<sid, activeMs>, memoized event-log-derived engaged time
-let sessionActiveTotalsCache = null; // { at, map: Map<sid, activeMs> } short-TTL sum across days (includes the live current day)
+const sessionActiveDayCache = new Map(); // dateStr (PAST day only) -> Map<sid, {activeMs,chats,tools,agents}>, memoized event-log-derived per-session stats
+let sessionActiveTotalsCache = null; // { at, map: Map<sid, {activeMs,chats,tools,agents}> } short-TTL sum across days (includes the live current day)
 let repoTotalsCache = null; // memoized all-time per-repo totals for /api/state; invalidated on any token/rollup/cost-config change (see repoTotalsAllTime)
 let rateLimitUsage = null; // latest GLOBAL rate-limit snapshot from the statusline forwarder (POST /internal/usage); null until one arrives. Named distinctly from the many function-local `usage` vars in this file so a dropped `let` can't silently clobber it. Served on buildStatePayload().usage.
 
@@ -637,20 +637,41 @@ async function sessionRow(f, activeIdx) {
     meta = await sessionMeta(f.path, f.proj);
     setSessionsParseCache(f.path, { mtimeMs: f.mtimeMs, size: f.size, meta });
   }
-  // Engaged active time. A live session uses the authoritative live value (matches the
-  // Live card's "Active", includes work since the last settled event); a past session
-  // uses the event-log index; a session the cockpit never observed (pre-install /
-  // transcript-only) has no events, so activeMs is null -> the UI shows "—".
+  // Engaged active time + activity counts (chats/tools/agents). All four are EVENT-derived,
+  // so they share one source rule: a live session uses the authoritative live value (matches
+  // the Live card exactly, including work since the last settled event); a past session the
+  // cockpit observed uses the event-log index; a session the cockpit never observed
+  // (pre-install / transcript-only, or whose event days were cleaned up) has no events, so
+  // they stay null -> the UI shows "—" (never a misleading 0). NOT transcript-derived: a
+  // transcript's raw prompt/tool counts diverge from the cockpit's event counts shown
+  // everywhere else, which would contradict the Live card and Repos table.
   const liveSess = state.sessions[f.sid];
-  let activeMs = null;
-  if (liveSess) activeMs = num(liveSess.activeMs);
-  else if (activeIdx && activeIdx.has(f.sid)) activeMs = num(activeIdx.get(f.sid));
+  let activeMs = null,
+    chats = null,
+    tools = null,
+    agents = null;
+  if (liveSess) {
+    activeMs = num(liveSess.activeMs);
+    chats = num(liveSess.promptCount);
+    tools = num(liveSess.toolCount);
+    agents = num(liveSess.subagents ? liveSess.subagents.total : 0);
+  } else if (activeIdx && activeIdx.has(f.sid)) {
+    const rec = activeIdx.get(f.sid);
+    activeMs = num(rec.activeMs);
+    chats = num(rec.chats);
+    tools = num(rec.tools);
+    agents = num(rec.agents);
+  }
   return {
     sessionId: f.sid,
     title: meta.title,
     repoName: meta.repoName,
     repoRoot: meta.repoRoot,
-    activeMs, // null when the cockpit never saw this session (no events) -> UI shows "—"
+    // null when the cockpit never saw this session (no events) -> UI shows "—"
+    activeMs,
+    chats,
+    tools,
+    agents,
     lastActive: f.mtimeMs,
     tokens: meta.tokens, // null when the transcript couldn't be read/parsed -> UI shows "unavailable"
     cost: meta.tokens != null && cfg.cost.enabled ? pricing.estimateCost(meta.byModel, cfg.cost.rates).total : null,
@@ -689,28 +710,28 @@ async function readEventsAsync(p) {
   return out;
 }
 
-// Per-session engaged active time (ms) for one day's event log. Past days are memoized
-// (immutable — only cleanup/repo-delete change them, which clear the cache); the current
-// day is recomputed since it's still being appended. Mirrors getRollup's past/today split.
-// Async: the file read yields, so building the index never blocks on synchronous I/O.
+// Per-session stats ({activeMs, chats, tools, agents}) for one day's event log. Past days are
+// memoized (immutable — only cleanup/repo-delete change them, which clear the cache); the
+// current day is recomputed since it's still being appended. Mirrors getRollup's past/today
+// split. Async: the file read yields, so building the index never blocks on synchronous I/O.
 async function sessionActiveByDay(date) {
   if (date === currentDate) {
-    return aggregate.accumulateSessionActiveFromEvents(await readEventsAsync(paths.eventLogPath(date)));
+    return aggregate.accumulateSessionStatsFromEvents(await readEventsAsync(paths.eventLogPath(date)));
   }
   let m = sessionActiveDayCache.get(date);
   if (!m) {
-    m = aggregate.accumulateSessionActiveFromEvents(await readEventsAsync(paths.eventLogPath(date)));
+    m = aggregate.accumulateSessionStatsFromEvents(await readEventsAsync(paths.eventLogPath(date)));
     sessionActiveDayCache.set(date, m);
   }
   return m;
 }
 
-// Map<session_id, total engaged ms> across the whole event log — the Sessions view's
-// Active column for PAST (not-currently-live) sessions. Summed from the per-day maps (past
-// days memoized, current day live), cached for the snapshot TTL so rapid Prev/Next reuses
-// one sum. Async and awaits each day so a COLD build (boot, or after a cache clear) replays
-// one day at a time WITH yields — it never freezes the event loop replaying all history at
-// once, matching buildSessions' non-blocking contract.
+// Map<session_id, {activeMs, chats, tools, agents}> across the whole event log — the Sessions
+// view's event-derived columns for PAST (not-currently-live) sessions. Summed field-by-field
+// from the per-day maps (past days memoized, current day live), cached for the snapshot TTL so
+// rapid Prev/Next reuses one sum. Async and awaits each day so a COLD build (boot, or after a
+// cache clear) replays one day at a time WITH yields — it never freezes the event loop
+// replaying all history at once, matching buildSessions' non-blocking contract.
 async function sessionActiveTotals() {
   const now = Date.now();
   if (sessionActiveTotalsCache && now - sessionActiveTotalsCache.at < SESSIONS_SNAPSHOT_TTL_MS) {
@@ -719,7 +740,14 @@ async function sessionActiveTotals() {
   const total = new Map();
   for (const date of listEventLogDates()) {
     const day = await sessionActiveByDay(date);
-    for (const [sid, ms] of day) total.set(sid, num(total.get(sid)) + ms);
+    for (const [sid, rec] of day) {
+      const acc = total.get(sid) || { activeMs: 0, chats: 0, tools: 0, agents: 0 };
+      acc.activeMs += num(rec.activeMs);
+      acc.chats += num(rec.chats);
+      acc.tools += num(rec.tools);
+      acc.agents += num(rec.agents);
+      total.set(sid, acc);
+    }
   }
   sessionActiveTotalsCache = { at: now, map: total };
   return total;

@@ -461,19 +461,22 @@ function cardHTML(s) {
     chips.push(`<span class="chip chip--mono" title="${esc(modelsTooltip(s))}">${esc(shortModel(s.model))}</span>`);
 
   const sa = s.subagents || {};
+  // Column order: Tokens | Cost | Chats | Tools | Agents | Active. Cost drops out when
+  // disabled, shifting the rest left one column; the repo-total row below mirrors the
+  // same order so the two rows stay aligned straight down.
   const stats = [
-    `<div class="stat"><span class="stat__k">Chats</span><span class="stat__v">${num(s.promptCount)}</span></div>`,
     `<div class="stat"><span class="stat__k">Tokens</span><span class="stat__v">${tokensTotal == null ? "—" : esc(fmtTokens(tokensTotal))}</span></div>`,
   ];
   if (costEnabled())
     stats.push(`<div class="stat"><span class="stat__k">Cost</span><span class="stat__v">${esc(fmtCost(s.cost))}</span></div>`);
+  stats.push(`<div class="stat"><span class="stat__k">Chats</span><span class="stat__v">${num(s.promptCount)}</span></div>`);
+  // Tools (all tool invocations this session, incl. those inside subagents) and Agents
+  // (subagents spawned; tooltip breaks down by type + active count).
+  stats.push(`<div class="stat"><span class="stat__k">Tools</span><span class="stat__v">${num(s.toolCount)}</span></div>`);
+  stats.push(`<div class="stat" title="${esc(subagentsTitle(sa))}"><span class="stat__k">Agents</span><span class="stat__v">${num(sa.total)}</span></div>`);
   // Active = this session's cumulative working time (sum of closed turns). Uses
   // fmtDuration to match the Per-repo table and History, which render the same metric.
   stats.push(`<div class="stat"><span class="stat__k">Active</span><span class="stat__v">${esc(fmtDuration(num(s.activeMs)))}</span></div>`);
-  // Subagents (total spawned; tooltip breaks down by type + active count) and Tools
-  // (all tool invocations this session, incl. those inside subagents).
-  stats.push(`<div class="stat" title="${esc(subagentsTitle(sa))}"><span class="stat__k">Agents</span><span class="stat__v">${num(sa.total)}</span></div>`);
-  stats.push(`<div class="stat"><span class="stat__k">Tools</span><span class="stat__v">${num(s.toolCount)}</span></div>`);
 
   // Repo-wide cumulative total (all sessions, all time), rendered as a second row
   // that shares the stat grid's columns — prompts/tokens/cost each land under the
@@ -484,15 +487,15 @@ function cardHTML(s) {
   const repoTok = rt && rt.tokens != null ? sumTokens(rt.tokens) : null;
   const atTitle = "This repo's cumulative total across every session on record (all time), including backfilled sessions. Chats, active time, agents and tools come from live sessions only — backfilled history contributes tokens/cost but not those.";
   const rtCells = [
-    `<span class="card__at-v" title="${atTitle}">${rt && rt.prompts != null ? num(rt.prompts) : "—"}</span>`,
     `<span class="card__at-v" title="${atTitle}">${repoTok == null ? "—" : esc(fmtTokens(repoTok))}</span>`,
   ];
   if (costEnabled()) rtCells.push(`<span class="card__at-v" title="${atTitle}">${esc(fmtCost(rt ? rt.cost : null))}</span>`);
-  // Active, then Agents, then Tools — pushed in this order (after the optional cost) so
-  // the repo-total cells land under the matching stats-row columns in both layouts.
-  rtCells.push(`<span class="card__at-v" title="${atTitle}">${rt && rt.activeMs != null ? esc(fmtDuration(num(rt.activeMs))) : "—"}</span>`);
-  rtCells.push(`<span class="card__at-v" title="${atTitle}">${rt && rt.subagents != null ? num(rt.subagents) : "—"}</span>`);
+  // Chats, then Tools, then Agents, then Active — pushed in this order (after the optional
+  // cost) so the repo-total cells land under the matching stats-row columns in both layouts.
+  rtCells.push(`<span class="card__at-v" title="${atTitle}">${rt && rt.prompts != null ? num(rt.prompts) : "—"}</span>`);
   rtCells.push(`<span class="card__at-v" title="${atTitle}">${rt && rt.tools != null ? num(rt.tools) : "—"}</span>`);
+  rtCells.push(`<span class="card__at-v" title="${atTitle}">${rt && rt.subagents != null ? num(rt.subagents) : "—"}</span>`);
+  rtCells.push(`<span class="card__at-v" title="${atTitle}">${rt && rt.activeMs != null ? esc(fmtDuration(num(rt.activeMs))) : "—"}</span>`);
 
   // Pulse while this session's status-change window is open (see detectSoundCues).
   // The window (a timestamp) keeps the class across the frequent card-grid re-renders;
@@ -933,8 +936,23 @@ function sessionRowHTML(r, liveS, showCost) {
     costCell = `<td${c == null ? ' class="muted"' : ""}>${esc(fmtCost(c))}</td>`;
   }
 
+  // Chats / Tools / Agents — event-derived per-session counts (matching the Live card and the
+  // Repos table, NOT the transcript, whose raw counts diverge). A LIVE session reads its fresh
+  // overlay value (identical to its card); a past session uses the fetched event-index value;
+  // null (a session the cockpit never observed, so no events) shows a muted "—", never a
+  // misleading 0. Each carries a col-* class so refreshLiveStatCells can advance it in place
+  // mid-turn (like Active) — else Tools/Agents would freeze at turn-start counts and disagree
+  // with the card until the next rebuild. `cnt` renders that shared rule once.
+  const cnt = (cls, v) =>
+    v == null
+      ? `<td class="${cls} muted" title="not recorded — the cockpit didn't observe this session">—</td>`
+      : `<td class="${cls}">${esc(String(v))}</td>`;
+  const chatsCell = cnt("col-chats", liveS ? num(liveS.promptCount) : r.chats);
+  const toolsCell = cnt("col-tools", liveS ? num(liveS.toolCount) : r.tools);
+  const agentsCell = cnt("col-agents", liveS ? num(liveS.subagents ? liveS.subagents.total : 0) : r.agents);
+
   // Active (engaged) time. A LIVE session uses its fresh overlay value (matches the Live
-  // card and advances as it works — refreshLiveActiveCells keeps it current between
+  // card and advances as it works — refreshLiveStatCells keeps it current between
   // rebuilds); a past session uses the fetched index value. null (only for a past session
   // the cockpit never observed) shows "—" rather than a misleading "0s".
   const activeMs = liveS ? num(liveS.activeMs) : r.activeMs;
@@ -943,9 +961,10 @@ function sessionRowHTML(r, liveS, showCost) {
       ? `<td class="col-active muted" title="no active time recorded — the cockpit didn't observe this session">—</td>`
       : `<td class="col-active">${esc(fmtDuration(num(activeMs)))}</td>`;
 
-  // Column order: Active sits with the other stats; Last active (timeCell) is last.
-  // data-session-id lets refreshLiveActiveCells update this row's Active cell in place.
-  return `<tr data-session-id="${esc(r.sessionId)}">${statusCell}${nameCell}${repoCell}${activeCell}${tokCell}${costCell}${timeCell}</tr>`;
+  // Column order matches the header: Tokens · Cost · Chats · Tools · Agents · Active, then Last
+  // active (timeCell) last. data-session-id lets refreshLiveStatCells update the live cells
+  // (found by their col-* classes, so this reorder is safe) in place each SSE frame.
+  return `<tr data-session-id="${esc(r.sessionId)}">${statusCell}${nameCell}${repoCell}${tokCell}${costCell}${chatsCell}${toolsCell}${agentsCell}${activeCell}${timeCell}</tr>`;
 }
 
 // Render the Sessions table + pager from the cached rows (App.sessionsRows) and the current
@@ -966,10 +985,16 @@ function renderSessions() {
   const showCost = costEnabled();
   const live = {};
   for (const s of (App.state && App.state.sessions) || []) live[s.sessionId] = s;
+  // Column order follows the canonical stat sequence (Tokens · Cost · Sessions · Chats · Tools ·
+  // Agents · Active · Last active) shared with the Live ribbon/cards and the Repos table; a
+  // session row omits Sessions (a row IS one session, so a session count is meaningless — the
+  // Live card omits it for the same reason) and leads with Name · Repo as its label columns.
   const head =
     `<tr><th class="col-status" aria-hidden="true"></th><th class="col-name">Name</th>` +
-    `<th class="col-repo">Repo</th><th class="col-active">Active</th><th>Tokens</th>` +
+    `<th class="col-repo">Repo</th><th>Tokens</th>` +
     (showCost ? "<th>Cost</th>" : "") +
+    `<th>Chats</th><th>Tools</th><th>Agents</th>` +
+    `<th class="col-active">Active</th>` +
     `<th class="col-time">Last active</th>` +
     `</tr>`;
   const body = rows.map((r) => sessionRowHTML(r, live[r.sessionId], showCost)).join("");
@@ -1048,43 +1073,56 @@ function sessionsOverlaySig() {
 // timer anchor ACTUALLY changed (infrequent). Between those, the ticking timers keep
 // moving via tick() with no DOM churn, so a title stays selectable.
 function refreshSessionsOverlay() {
-  refreshLiveActiveCells(); // in-place: keep live rows' Active advancing without a rebuild
+  refreshLiveStatCells(); // in-place: keep live rows' event-derived stats advancing without a rebuild
   const sig = sessionsOverlaySig();
   if (sig === App.sessionsOverlaySig) return;
   renderSessions(); // re-seeds App.sessionsOverlaySig
 }
 
-// Update only the Active cell of each currently-live row from the fresh live overlay, in
-// place (no table rebuild). Without this a live session's Active would freeze at the
-// fetch-time value — refreshSessionsOverlay rebuilds only on a status/timer change — so it
-// would diverge from the Live card, whose Active advances each SSE frame. Touching just the
-// one cell keeps the user's text selection (a full innerHTML rebuild would drop it).
-function refreshLiveActiveCells() {
+// Update every EVENT-DERIVED cell of each currently-live row from the fresh live overlay, in
+// place (no table rebuild): Active (ticks each second), Chats, Tools, and Agents (rise as the
+// turn works). Without this they'd freeze at fetch/rebuild-time values — refreshSessionsOverlay
+// rebuilds only on a status/timer-anchor change, and none of these counts move that signature —
+// so the row would diverge from the session's Live card mid-turn. Touching just these cells
+// keeps the user's text selection (a full innerHTML rebuild would drop it). Past rows are
+// static (index values) so are skipped. Tokens/cost aren't here — they're transcript-sourced
+// snapshots that only change on a refetch.
+function refreshLiveStatCells() {
   const panel = $("sessionsPanel");
   if (!panel) return;
   const live = {};
   for (const s of (App.state && App.state.sessions) || []) live[s.sessionId] = s;
   panel.querySelectorAll("tr[data-session-id]").forEach((tr) => {
     const s = live[tr.dataset.sessionId];
-    if (!s) return; // a past row's index value is static — nothing to refresh
-    const cell = tr.querySelector(".col-active");
-    if (!cell) return;
-    cell.classList.remove("muted");
-    cell.textContent = fmtDuration(num(s.activeMs));
+    if (!s) return; // a past row's index values are static — nothing to refresh
+    const set = (sel, text) => {
+      const cell = tr.querySelector(sel);
+      if (!cell) return;
+      cell.classList.remove("muted");
+      cell.textContent = text;
+    };
+    set(".col-active", fmtDuration(num(s.activeMs)));
+    set(".col-chats", String(num(s.promptCount)));
+    set(".col-tools", String(num(s.toolCount)));
+    set(".col-agents", String(num(s.subagents ? s.subagents.total : 0)));
   });
 }
 
 // ---- Per-repo view ---------------------------------------------------------
 
+// Column order follows the canonical stat sequence (Tokens · Cost · Sessions · Chats · Tools ·
+// Agents · Active · Last active) shared with the Live ribbon/cards and the Sessions table, with
+// Repository as the leading label column. Reordering these entries reorders the rendered
+// columns; sort still resolves by `key`, so the default (activeMs desc) is unaffected.
 const REPO_COLS = [
   { key: "repoName", label: "Repository", type: "str", get: (r) => r.repoName },
-  { key: "activeMs", label: "Active", type: "num", get: (r) => r.activeMs, fmt: fmtDuration },
-  { key: "prompts", label: "Chats", type: "num", get: (r) => r.prompts, fmt: (v) => (v == null ? "—" : String(v)) },
-  { key: "sessions", label: "Sessions", type: "num", get: (r) => r.sessions, fmt: (v) => (v == null ? "—" : String(v)) },
   { key: "tokensTotal", label: "Tokens", type: "num", get: (r) => r.tokensTotal, fmt: (v) => (v == null ? "—" : fmtTokens(v)) },
-  { key: "agents", label: "Agents", type: "num", get: (r) => r.agents, fmt: (v) => (v == null ? "—" : String(v)) },
-  { key: "toolsTotal", label: "Tools", type: "num", get: (r) => r.toolsTotal, fmt: (v) => (v == null ? "—" : String(v)) },
   { key: "cost", label: "Cost", type: "num", get: (r) => r.cost, fmt: fmtCost },
+  { key: "sessions", label: "Sessions", type: "num", get: (r) => r.sessions, fmt: (v) => (v == null ? "—" : String(v)) },
+  { key: "prompts", label: "Chats", type: "num", get: (r) => r.prompts, fmt: (v) => (v == null ? "—" : String(v)) },
+  { key: "toolsTotal", label: "Tools", type: "num", get: (r) => r.toolsTotal, fmt: (v) => (v == null ? "—" : String(v)) },
+  { key: "agents", label: "Agents", type: "num", get: (r) => r.agents, fmt: (v) => (v == null ? "—" : String(v)) },
+  { key: "activeMs", label: "Active", type: "num", get: (r) => r.activeMs, fmt: fmtDuration },
   { key: "lastActive", label: "Last active", type: "time", get: (r) => r.lastActive, fmt: (v) => (v ? relTime(v) : "—") },
 ];
 

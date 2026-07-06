@@ -500,15 +500,20 @@ function accumulateActiveFromEvents(rollup, events) {
   return rollup;
 }
 
-// Per-SESSION engaged active time (ms) for a day's event stream, keyed by session_id. Uses
-// the SAME fresh-state replay, engaged clock, AND `repoRoot != null` gate as
-// accumulateActiveFromEvents — so a repo's active time equals the sum of its sessions'
-// active time here, and neither counts a span the other drops. EVERY session in the stream
-// gets an entry (0 when it did no engaged work), so a caller can distinguish "observed, did
-// 0 work" (present, 0) from "never observed" (absent). Same fresh-state-per-day semantics: a
-// span crossing midnight loses the slice between its last pre-midnight and first
+// Per-SESSION stats for a day's event stream, keyed by session_id: engaged active time (ms)
+// PLUS the activity counts the Live card shows (chats/tools/agents). Uses the SAME
+// fresh-state replay, engaged clock, AND `repoRoot != null` gate as accumulateActiveFromEvents
+// for activeMs — so a repo's active time equals the sum of its sessions' active time here, and
+// neither counts a span the other drops. The counts are read from each session's FINAL
+// cumulative state after the full replay (chats = promptCount, tools = toolCount,
+// agents = subagents.total) — the very counters the live card renders, and UNGATED by repoRoot
+// exactly as the card is, so a past session's Sessions-view counts match what its card showed.
+// EVERY session in the stream gets an entry (zeros when it did no work), so a caller can
+// distinguish "observed, did nothing" (present, all-zero) from "never observed" (absent).
+// Same fresh-state-per-day semantics as the active clock: summed across days by the caller, an
+// engaged span crossing midnight loses the slice between its last pre-midnight and first
 // post-midnight event (mirrors the live path and the per-repo rollup).
-function accumulateSessionActiveFromEvents(events) {
+function accumulateSessionStatsFromEvents(events) {
   const out = new Map();
   if (!Array.isArray(events)) return out;
   const s = createState();
@@ -520,8 +525,18 @@ function accumulateSessionActiveFromEvents(events) {
     if (!sess) continue;
     // Record the session even at 0 delta (so it counts as "observed"); add engaged ms only
     // under the same repoRoot guard the per-repo fold uses, keeping the two views consistent.
-    const add = sess.activeDelta > 0 && sess.repoRoot != null ? sess.activeDelta : 0;
-    out.set(sid, num(out.get(sid)) + add);
+    const rec = out.get(sid) || { activeMs: 0, chats: 0, tools: 0, agents: 0 };
+    if (sess.activeDelta > 0 && sess.repoRoot != null) rec.activeMs += sess.activeDelta;
+    out.set(sid, rec);
+  }
+  // activeMs must be summed per-event (above); the counts are cumulative on the session state,
+  // so read each observed session's final value once after the replay.
+  for (const [sid, rec] of out) {
+    const sess = s.sessions[sid];
+    if (!sess) continue;
+    rec.chats = num(sess.promptCount);
+    rec.tools = num(sess.toolCount);
+    rec.agents = num(sess.subagents ? sess.subagents.total : 0);
   }
   return out;
 }
@@ -536,5 +551,5 @@ module.exports = {
   accumulateTokensByModel,
   accumulateSession,
   accumulateActiveFromEvents,
-  accumulateSessionActiveFromEvents,
+  accumulateSessionStatsFromEvents,
 };
