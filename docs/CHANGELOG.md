@@ -322,3 +322,12 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     below the ribbon. Scoped as `#cards .empty { grid-column: 1 / -1 }` because `.cards` is a grid — without it
     the box landed in the first ~420px cell (top-left), so its `text-align: center` only centered text inside a
     left-anchored box. Scoped to `#cards` so the Repos/Sessions/loading empty states are untouched.
+
+41. Documented (not yet fixed) a CONFIRMED accounting bug: a `--fork-session --resume <parent>.jsonl` fork
+    (Claude Code backgrounding a session) copies the parent's transcript keeping the same message-uuids, but
+    token dedup is keyed per session_id, so the fork re-counts every inherited message — inflating the shared
+    repo's tokens/cost. Verified live (parent + fork shared 41 uuids, same repo_root).
+    Fix is specced at `docs/specs/2026-07-06-forked-session-accounting.md`: dedup on the globally-unique
+    message-uuid (positional `__idx_*` fallback ids namespaced per-session so they don't false-collide), plus a
+    symmetric `sharesHistory` badge on the Live card (forks share the parent's name, so twins looked identical).
+    Active time is intentionally NOT changed — concurrent sessions on one repo correctly sum active time.

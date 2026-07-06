@@ -1,6 +1,6 @@
 {
   "name": "claude-code-cockpit",
-  "version": "0.11.1",
+  "version": "0.11.2",
   "private": true,
   "description": "Live, cross-platform dashboard of all running Claude Code sessions — status, timers, and per-repo token/time/cost accounting, with optional OS notifications and sounds.",
   "engines": {
