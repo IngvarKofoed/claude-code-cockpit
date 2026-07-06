@@ -21,6 +21,7 @@ const DEFAULT_CONFIG = {
   sound: true,
   browserSounds: true,
   activityDetail: 'tool', // 'tool' | 'args'
+  usagePace: 'both', // 'both' | 'tick' | 'delta' | 'off' — Live usage-bar pace cue
   events: { sessionFinished: true, needsInput: true, longRunning: false, turnFailed: true },
   longRunningThresholdMs: 300000,
   cost: {
@@ -190,6 +191,14 @@ function validateConfig(input) {
       cfg.activityDetail = input.activityDetail;
     } else {
       errors.push('activityDetail must be "tool" or "args"');
+    }
+  }
+
+  if ('usagePace' in input) {
+    if (['both', 'tick', 'delta', 'off'].includes(input.usagePace)) {
+      cfg.usagePace = input.usagePace;
+    } else {
+      errors.push('usagePace must be "both", "tick", "delta", or "off"');
     }
   }
 

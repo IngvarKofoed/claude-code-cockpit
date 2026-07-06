@@ -27,6 +27,7 @@ const transcript = require('./transcript');
 const pricing = require('./pricing');
 const notify = require('./notify');
 const repoLib = require('./repo');
+const usageLib = require('./usage');
 
 const VERSION = require('../package.json').version;
 const PLUGIN_PATH = process.env.CLAUDE_PLUGIN_ROOT || path.join(__dirname, '..');
@@ -74,6 +75,7 @@ const sessionsParseCache = new Map(); // transcriptPath -> { mtimeMs, size, meta
 const sessionActiveDayCache = new Map(); // dateStr (PAST day only) -> Map<sid, activeMs>, memoized event-log-derived engaged time
 let sessionActiveTotalsCache = null; // { at, map: Map<sid, activeMs> } short-TTL sum across days (includes the live current day)
 let repoTotalsCache = null; // memoized all-time per-repo totals for /api/state; invalidated on any token/rollup/cost-config change (see repoTotalsAllTime)
+let rateLimitUsage = null; // latest GLOBAL rate-limit snapshot from the statusline forwarder (POST /internal/usage); null until one arrives. Named distinctly from the many function-local `usage` vars in this file so a dropped `let` can't silently clobber it. Served on buildStatePayload().usage.
 
 let replaying = false; // true while replaying the log on boot: suppress side effects
 
@@ -282,6 +284,9 @@ function loadSnapshot() {
   if (snap.currentDate === currentDate && snap.offsets && typeof snap.offsets === 'object') {
     Object.assign(offsets, snap.offsets);
   }
+  // Restore the last-known usage snapshot so a restart keeps the bars until the
+  // next statusline tick. Tolerate an absent key (older snapshot) -> stays null.
+  if (snap.usage && typeof snap.usage === 'object') rateLimitUsage = snap.usage;
 }
 
 // Apply one persisted usage record to a rollup. A `backfill` record (historical
@@ -1240,6 +1245,7 @@ function buildStatePayload() {
     repos: reposSummary(),
     repoTotals: repoTotalsAllTime(),
     config: cfg,
+    usage: rateLimitUsage, // latest global rate-limit snapshot (or null) for the Live usage bars
     daemon: { version: VERSION, pluginPath: PLUGIN_PATH, port: PORT },
   };
 }
@@ -1531,6 +1537,31 @@ function handleInternalEvent(req, res) {
     } catch (e) {
       log('nudge tail failed ' + e);
     }
+  });
+}
+
+// Statusline forwarder push of the account-wide rate-limit numbers. One global
+// snapshot, last write wins (rate limits are account-wide, so every session's
+// payload reports the same numbers). Privacy: only rate_limits is stored.
+// Normalization lives in the pure usage.js module (unit-tested there).
+function handleInternalUsage(req, res) {
+  readBody(req, (raw) => {
+    json(res, { ok: true }); // ack fast; the forwarder is fire-and-forget on a tight budget
+    let body;
+    try {
+      body = JSON.parse(raw || '');
+    } catch (_e) {
+      return; // unparseable -> drop, no update
+    }
+    const windows = usageLib.normalizeUsage(body);
+    if (!windows) return; // structurally malformed -> drop, never a partial update
+    // The forwarder posts on every statusline render (frequently). Broadcast ONLY when the
+    // numbers actually change — else an unchanged push would rebuild the whole Live card grid
+    // several times/sec (wiping text selection mid-turn). updatedAt still advances so a later
+    // broadcast carries fresh liveness for the "updated Xm ago" staleness display.
+    const changed = !rateLimitUsage || !usageLib.sameUsageWindows(rateLimitUsage, windows);
+    rateLimitUsage = { ...windows, updatedAt: Date.now() };
+    if (changed) markDirty();
   });
 }
 
@@ -1906,6 +1937,7 @@ function handleRequest(req, res) {
     if (req.method === 'POST' && pathname === '/api/data/cleanup') return handleDataCleanup(req, res);
     if (req.method === 'POST' && pathname === '/api/repos/delete') return handleReposDelete(req, res);
     if (req.method === 'POST' && pathname === '/internal/event') return handleInternalEvent(req, res);
+    if (req.method === 'POST' && pathname === '/internal/usage') return handleInternalUsage(req, res);
     if (req.method === 'POST' && pathname === '/internal/backfill') return handleBackfill(req, res);
 
     res.writeHead(404);
@@ -1982,6 +2014,7 @@ function saveSnapshot() {
     offsets,
     extra: Object.fromEntries(extra),
     seenIds: Object.fromEntries([...seenIds].map(([sid, set]) => [sid, [...set]])),
+    usage: rateLimitUsage,
   };
   try {
     const file = paths.snapshotPath();

@@ -331,3 +331,59 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     message-uuid (positional `__idx_*` fallback ids namespaced per-session so they don't false-collide), plus a
     symmetric `sharesHistory` badge on the Live card (forks share the parent's name, so twins looked identical).
     Active time is intentionally NOT changed — concurrent sessions on one repo correctly sum active time.
+
+42. Live page now shows account-wide rate-limit usage — a Session (5h) + Week bar on the ribbon, fed by an
+    OPT-IN statusline forwarder that POSTs only `rate_limits` to a new `POST /internal/usage` (behind the
+    existing bearer/origin gate). ONE global snapshot (rate limits are account-wide, so every session reports
+    the same numbers), served on `/api/state` `usage` and persisted in the snapshot. Source is the Claude Code
+    statusline payload — the only LOCAL carrier of this data (hooks/transcripts don't have it and we never call
+    the API). The 5h bar carries a pace cue (a tick at elapsed-% + a signed burn-rate delta), settable via a new
+    `usagePace` config (`both`|`tick`|`delta`|`off`); it is FROZEN once a bar goes stale so a moving delta can't
+    animate an ever-more-wrong "under pace" against known-stale data. Honest degradation (the "no wrong zero"
+    rule): no snapshot → an "install the statusline" affordance, never a fake 0; a passed reset → "reset •
+    awaiting update"; a >10-min-old snapshot → dimmed "updated Xm ago". Only `five_hour`+`seven_day` aggregate
+    exist (NO per-model bar), and only for Pro/Max after the first API response. The daemon broadcasts only when
+    the numbers actually CHANGE (the forwarder posts on every render — an unchanged push must not rebuild the
+    Live grid). Normalization (resets_at seconds→ms, used_percentage clamp 0–100, malformed-body drop, per-window
+    independent) is the pure, unit-tested `scripts/usage.js`; the module-level snapshot var is `rateLimitUsage`
+    (named distinctly from the file's many local `usage` vars so a dropped `let` can't clobber it).
+
+43. Statusline tooling shipped under `statusline/` (colored-line renderer + README + install.sh) — installing it
+    is what feeds entry 42's usage bars. Install is an ABSOLUTE path written into `~/.claude/settings.json`
+    `statusLine.command`: verified `statusLine.command` supports NEITHER `${CLAUDE_PLUGIN_ROOT}` NOR a
+    plugin-shipped top-level `statusLine` (a plugin can only ship `subagentStatusLine`), so it must be re-run
+    after a plugin upgrade (the install dir is hashed and GC'd ~7 days later). Cross-platform via `node <path>`
+    (no bash wrapper); `install.sh` is a Unix-only convenience (timestamped backup, idempotent skip-if-ours) and
+    the manual README edit is the all-OS path. The renderer reads the branch from `.git/HEAD` via `repo.js` (no
+    per-render `git` subprocess) and fires the best-effort POST only AFTER stdout flushes (a synchronous exit
+    could truncate a piped status line).
+
+44. The weekly (7d) usage bar now carries the SAME pace cue (tick + delta) as the 5h bar, governed by the
+    existing `usagePace` setting — one control now applies to BOTH bars (Settings label generalized from
+    "5h usage pace cue" to "Usage pace cue"). Reverses entry 42's "5h only" scope. Cheap because the cue
+    machinery was already per-window (elapsedFrac over each bar's windowMs); the weekly bar simply stopped
+    being hard-passed "off". A 7-day pace line moves slowly (rarely the thing you react to), kept for consistency.
+
+45. Trimmed the Live view's vertical rhythm so a 2nd row of session cards fits above the fold on laptop
+    screens — reclaims ~75px through the ribbon + first two card rows. Proportional cuts: sticky topbar
+    padding 12→9, main top-pad 22→16, ribbon margin 20→14, tile pad 14→11, the usage bars' padding/margins
+    tightened, card body pad 15→12 + inter-section gap 10→8, card-grid gap 16→12. The big prompt timer (the
+    card's focal point) is deliberately left full-size — space came from chrome and gaps, not the content.
+    Pure CSS.
+
+46. A stale usage bar (>10 min since the last statusline push) is no longer DIMMED — instead it keeps its
+    fill + a live-drifting pace cue and shows a now-legible "updated Xm ago" note (bumped ink-muted→ink-2) as
+    the sole "old data" signal. The pace tick/delta keep advancing on a stale bar: usedPct is frozen but
+    elapsed grows, so the over-pace amber delta walks down toward/under 0 over time until reset — which is the
+    intended pace reading, not a bug. This DELIBERATELY reverses entry 42/44's freeze-on-stale (the earlier
+    code-review "don't drift a wrong under-pace" fix): per the user, the drift IS the desired behavior and the
+    age note flags the staleness, so do NOT re-freeze it. `reset`/`nodata` bars stay dimmed (no live fill).
+
+47. Reordered the statusline to `cwd · ctx · usage(5h) · tokens · cost · branch · model` (was
+    `model · repo · branch · tokens · cost · active · ctx · 5h`); the active-time segment was dropped
+    (with its now-unused `dur()` helper). The cwd segment now shows the directory
+    where Claude was STARTED — sourced from `workspace.project_dir` (the original project dir), falling back
+    to `current_dir` then `cwd`, basename only (the three coincide unless a session starts in a subdir/worktree).
+    Edits the in-repo `statusline/statusline-render.js` — the file the installed `statusLine.command` points at.
+    Colours unchanged; also merged a duplicate `context_window` read and tightened the segment divider
+    from `  ·  ` to ` · ` to fit more values on the line.

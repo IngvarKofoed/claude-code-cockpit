@@ -74,7 +74,7 @@ body {
   display: flex;
   align-items: center;
   gap: 20px;
-  padding: 12px 22px;
+  padding: 9px 22px;
   background: rgba(11, 14, 20, 0.82);
   backdrop-filter: blur(10px);
   border-bottom: 1px solid var(--border);
@@ -155,7 +155,7 @@ body {
 
 .main {
   flex: 1;
-  padding: 22px;
+  padding: 16px 22px 22px;
   max-width: 1400px;
   width: 100%;
   margin: 0 auto;
@@ -183,14 +183,14 @@ body {
 .ribbon {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 12px;
-  margin-bottom: 20px;
+  gap: 10px;
+  margin-bottom: 14px;
 }
 .tile {
   background: var(--surface-1);
   border: 1px solid var(--border);
   border-radius: var(--r);
-  padding: 14px 16px;
+  padding: 11px 16px;
 }
 .tile__label {
   font-size: 11px;
@@ -211,6 +211,114 @@ body {
 }
 .tile--alert .tile__value { color: var(--st-waiting); }
 
+/* ---------- Live usage bars (session 5h + weekly, from the statusline) ---------- */
+
+/* Full-width row below the tiles; the two windows sit side by side, stacking when narrow. */
+.usage {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+}
+.usage--install { display: block; }
+.usage-install {
+  display: block;
+  padding: 13px 16px;
+  background: var(--surface-1);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--r);
+  color: var(--ink-muted);
+  font-size: 13px;
+}
+
+.usage-bar {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: 10px 14px;
+}
+/* Expired / absent windows are dimmed (they carry no live fill). A `stale` bar is NOT dimmed —
+   it keeps its fill + a live-drifting pace cue, and the "updated Xm ago" note flags it as old. */
+.usage-bar[data-state="reset"],
+.usage-bar[data-state="nodata"] { opacity: 0.55; }
+
+.usage-bar__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.usage-bar__label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-muted);
+}
+.usage-bar__pct {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 650;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-bar__track {
+  position: relative;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.usage-bar__fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  min-width: 2px;
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+/* The on-pace marker: a thin high-contrast rule with a surface halo so it reads over any
+   fill colour. Sits above the fill (later in the DOM). */
+.usage-bar__tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  transform: translateX(-1px);
+  background: var(--ink);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
+}
+
+.usage-bar__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 14px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+.usage-bar__foot-info { display: inline-flex; gap: 8px; align-items: baseline; }
+.usage-bar__reset { font-variant-numeric: tabular-nums; }
+.usage-bar__age { color: var(--ink-2); font-style: italic; }
+.usage-bar__note { color: var(--ink-muted); }
+.usage-bar__delta {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.usage-bar__delta--over { color: var(--st-waiting); }
+.usage-bar__delta--under { color: var(--st-running); }
+.usage-bar__delta--on { color: var(--ink-2); }
+
+@media (prefers-reduced-motion: reduce) {
+  .usage-bar__fill { transition: none; }
+}
+
 /* ---------- Live cards ---------- */
 
 .cards {
@@ -220,7 +328,7 @@ body {
      the stat grid uses a tight gap + compact mono values to fit. min(...,100%) keeps
      a single card from overflowing a narrow viewport. */
   grid-template-columns: repeat(auto-fill, minmax(min(420px, 100%), 1fr));
-  gap: 16px;
+  gap: 12px;
 }
 
 .card {
@@ -287,10 +395,10 @@ body {
 .card__body {
   flex: 1;
   min-width: 0;
-  padding: 15px 16px;
+  padding: 12px 16px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
 }
 
 .card__head {

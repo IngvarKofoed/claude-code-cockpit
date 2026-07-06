@@ -68,6 +68,23 @@ test('validateConfig: rejects bad types', () => {
   assert.strictEqual(res.config.activityDetail, 'tool');
 });
 
+test('validateConfig: usagePace accepts the enum values, defaults to "both"', () => {
+  assert.strictEqual(DEFAULT_CONFIG.usagePace, 'both');
+  for (const v of ['both', 'tick', 'delta', 'off']) {
+    const res = validateConfig({ usagePace: v });
+    assert.strictEqual(res.valid, true);
+    assert.strictEqual(res.config.usagePace, v);
+  }
+});
+
+test('validateConfig: invalid usagePace rejected, falls back to default', () => {
+  const res = validateConfig({ usagePace: 'nope' });
+  assert.strictEqual(res.valid, false);
+  assert.ok(res.errors.some((e) => e.includes('usagePace')));
+  // Bad value falls back to the default so the config stays complete.
+  assert.strictEqual(res.config.usagePace, 'both');
+});
+
 test('validateConfig: non-object input -> invalid, defaults returned', () => {
   const res = validateConfig(null);
   assert.strictEqual(res.valid, false);

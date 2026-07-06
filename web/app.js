@@ -28,6 +28,7 @@ const App = {
   flash: {}, // sessionId -> { until: epoch ms window ends, cls: variant class } for the status-change pulse
   longFired: {}, // sessionId -> promptStartMs already alerted for longRunning
   timers: [], // [{ el, start, kind }] updated once per second
+  usageRender: null, // { updatedAt, bars:[{kind, win, windowMs, state, els}] } — live-ticked usage bars
   settingsRendered: false,
   es: null,
   failures: 0,
@@ -353,6 +354,7 @@ function tick() {
     const ms = now - t.start;
     t.el.textContent = t.kind === "age" ? fmtAge(ms) : fmtDuration(ms);
   }
+  tickUsage(now); // advance the usage bars' reset countdown + pace cue on the same loop
   checkLongRunning(now);
 }
 
@@ -531,6 +533,238 @@ function tile(label, value, alert) {
   return `<div class="tile ${alert ? "tile--alert" : ""}"><div class="tile__label">${esc(label)}</div><div class="tile__value">${esc(String(value))}</div></div>`;
 }
 
+// ---- Live usage bars (session 5h + weekly, from the statusline) -------------
+// Anthropic's real rate-limit usage, forwarded by the cockpit statusline and served on
+// /api/state as `usage`. Two bars — the session (5h) and weekly (7d) windows — both carrying
+// the same pace cue (governed by the `usagePace` setting). `usedPct` only changes when a new
+// snapshot arrives; the reset countdown and the pace tick/delta advance every second via the
+// shared tick() loop (elapsed-time only moves, the % holds). Never fabricates a 0 — see states.
+
+const FIVE_HOUR_MS = 5 * 3600 * 1000;
+const SEVEN_DAY_MS = 7 * 24 * 3600 * 1000;
+const USAGE_STALE_MS = 10 * 60 * 1000; // snapshot older than this -> dim + "updated Xm ago"
+
+function clamp01(x) {
+  return x < 0 ? 0 : x > 1 ? 1 : x;
+}
+
+// Fraction of a fixed-length rolling window already elapsed at `now`, measured back from
+// its end (resetsAt). On-pace usage equals this fraction (payload carries no window length,
+// so windowMs is a named constant, not derived).
+function elapsedFrac(resetsAt, windowMs, now) {
+  return clamp01((now - (resetsAt - windowMs)) / windowMs);
+}
+
+// Fill colour by the statusline convention: green < 50, amber < 80, red >= 80.
+function usageColor(pct) {
+  return pct >= 80 ? "var(--st-error)" : pct >= 50 ? "var(--st-waiting)" : "var(--st-running)";
+}
+
+// The active config's pace mode, defaulting unknown/missing to "both".
+function usagePaceMode() {
+  const p = App.cfg && App.cfg.usagePace;
+  return p === "tick" || p === "delta" || p === "off" ? p : "both";
+}
+
+// Per-window display state, in precedence order: `reset` (resetsAt already passed — the % is
+// known-stale, overrides age) > `stale` (snapshot older than 10 min) > `live`; a window absent
+// from the snapshot is `nodata`. Rate limits don't move without usage, so only clearly-old
+// snapshots are flagged.
+function usageWindowState(w, now, updatedAt) {
+  if (!w) return "nodata";
+  const hasReset = Number.isFinite(w.resetsAt) && w.resetsAt > 0;
+  if (hasReset && w.resetsAt <= now) return "reset";
+  if (Number.isFinite(updatedAt) && now - updatedAt > USAGE_STALE_MS) return "stale";
+  return "live";
+}
+
+// Countdown text: "6d 5h" / "4h 32m" / "12m 30s" / "45s"; clamps negative to 0.
+function fmtResetIn(ms) {
+  if (!(ms > 0)) ms = 0;
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${String(m).padStart(2, "0")}m`;
+  if (m) return `${m}m ${String(sec).padStart(2, "0")}s`;
+  return `${sec}s`;
+}
+
+// Signed pace gap (usedPct − on-pace%): over pace reads as caution (amber), under as calm
+// (green), exactly on pace is neutral. Written into the delta chip both at render and on tick.
+function applyDelta(el, d) {
+  el.classList.remove("usage-bar__delta--over", "usage-bar__delta--under", "usage-bar__delta--on");
+  if (d > 0) {
+    el.classList.add("usage-bar__delta--over");
+    el.textContent = "▲ +" + d + "%";
+    el.title = d + "% ahead of an even burn rate";
+  } else if (d < 0) {
+    el.classList.add("usage-bar__delta--under");
+    el.textContent = "▼ −" + Math.abs(d) + "%";
+    el.title = Math.abs(d) + "% below an even burn rate";
+  } else {
+    el.classList.add("usage-bar__delta--on");
+    el.textContent = "on pace";
+    el.title = "usage is tracking the clock";
+  }
+}
+
+// Empty-state shell (nodata / reset): label + inert track + a note, with NO percentage or
+// fill — the honest "no confidently-wrong bar" rule (never a fabricated 0 or a stale high %).
+function usageShellHTML(kind, state, label, note) {
+  return (
+    `<div class="usage-bar" data-kind="${kind}" data-state="${state}">` +
+    `<div class="usage-bar__head"><span class="usage-bar__label">${esc(label)}</span></div>` +
+    `<div class="usage-bar__track"></div>` +
+    `<div class="usage-bar__foot"><span class="usage-bar__note">${esc(note)}</span></div>` +
+    `</div>`
+  );
+}
+
+// One usage bar. `pace` (both|tick|delta|off) enables the pace cue (tick + delta) on the bar.
+function usageBarHTML(kind, w, windowMs, label, now, updatedAt, pace) {
+  const state = usageWindowState(w, now, updatedAt);
+  if (state === "nodata") return usageShellHTML(kind, state, label, "awaiting data…");
+  if (state === "reset") return usageShellHTML(kind, state, label, "reset • awaiting update");
+  // live | stale — render the last-known fill + percentage. A stale bar is NOT dimmed; the
+  // "updated Xm ago" note (below) carries the "old data" signal instead.
+  const pct = clamp(num(w.usedPct), 0, 100);
+  const hasReset = Number.isFinite(w.resetsAt) && w.resetsAt > 0;
+  // Pace cue on any bar with a real fill + reset (live OR stale). On a stale bar usedPct is frozen
+  // but elapsed keeps advancing, so the delta naturally walks down toward/under 0 as the window
+  // elapses until reset — intended, and flagged as old by the age note (not hidden).
+  const showTick = hasReset && (pace === "both" || pace === "tick");
+  const showDelta = hasReset && (pace === "both" || pace === "delta");
+  const ef = hasReset ? elapsedFrac(w.resetsAt, windowMs, now) : 0;
+  const tickHTML = showTick ? `<div class="usage-bar__tick" style="left:${(ef * 100).toFixed(2)}%"></div>` : "";
+  const footInfo =
+    (hasReset ? `<span class="usage-bar__reset">resets in ${esc(fmtResetIn(w.resetsAt - now))}</span>` : "") +
+    (state === "stale" ? `<span class="usage-bar__age">updated ${esc(fmtAge(now - updatedAt))} ago</span>` : "");
+  // The delta chip is filled by applyDelta so render + tick share one implementation.
+  let deltaHTML = "";
+  if (showDelta) {
+    deltaHTML = `<span class="usage-bar__delta"></span>`;
+  }
+  const bar =
+    `<div class="usage-bar" data-kind="${kind}" data-state="${state}">` +
+    `<div class="usage-bar__head">` +
+    `<span class="usage-bar__label">${esc(label)}</span>` +
+    `<span class="usage-bar__pct">${Math.round(pct)}%</span>` +
+    `</div>` +
+    `<div class="usage-bar__track">` +
+    `<div class="usage-bar__fill" style="width:${pct}%;background:${usageColor(pct)}"></div>` +
+    tickHTML +
+    `</div>` +
+    `<div class="usage-bar__foot"><span class="usage-bar__foot-info">${footInfo}</span>${deltaHTML}</div>` +
+    `</div>`;
+  return bar;
+}
+
+// The whole usage block: the install affordance when no snapshot has ever arrived (NOT a
+// fabricated 0), otherwise the two bars. Rendered as a full-width row inside the ribbon grid.
+function usageBlockHTML(now) {
+  const u = App.state && App.state.usage;
+  if (!u)
+    return (
+      `<div class="usage usage--install">` +
+      `<span class="usage-install" title="The cockpit statusline forwards Anthropic's real rate-limit usage to the dashboard. See statusline/README.md to install it.">Install the cockpit statusline to see live usage</span>` +
+      `</div>`
+    );
+  const pace = usagePaceMode();
+  const updatedAt = num(u.updatedAt);
+  return (
+    `<div class="usage">` +
+    usageBarHTML("fiveHour", u.fiveHour, FIVE_HOUR_MS, "Session (5h)", now, updatedAt, pace) +
+    usageBarHTML("sevenDay", u.sevenDay, SEVEN_DAY_MS, "Week", now, updatedAt, pace) +
+    `</div>`
+  );
+}
+
+// After the usage block's HTML is in the DOM, capture the window data + element refs the tick
+// loop needs. usage == null (install affordance) leaves nothing to tick.
+function bindUsage() {
+  const u = App.state && App.state.usage;
+  const ribbon = $("liveRibbon");
+  if (!u || !ribbon) {
+    App.usageRender = null;
+    return;
+  }
+  const defs = [
+    { kind: "fiveHour", win: u.fiveHour, windowMs: FIVE_HOUR_MS },
+    { kind: "sevenDay", win: u.sevenDay, windowMs: SEVEN_DAY_MS },
+  ];
+  const bars = [];
+  for (const d of defs) {
+    const elBar = ribbon.querySelector('.usage-bar[data-kind="' + d.kind + '"]');
+    if (!elBar) continue;
+    bars.push({
+      kind: d.kind,
+      win: d.win,
+      windowMs: d.windowMs,
+      state: elBar.dataset.state,
+      els: {
+        reset: elBar.querySelector(".usage-bar__reset"),
+        age: elBar.querySelector(".usage-bar__age"),
+        tick: elBar.querySelector(".usage-bar__tick"),
+        delta: elBar.querySelector(".usage-bar__delta"),
+      },
+    });
+  }
+  App.usageRender = { updatedAt: num(u.updatedAt), bars };
+}
+
+// Rebuild only the usage block (leave the tiles), for a purely time-driven state change
+// (resetsAt passing, or a snapshot ageing past 10 min) with no new frame to trigger a render.
+function renderUsage() {
+  const ribbon = $("liveRibbon");
+  if (!ribbon) return;
+  const wrap = document.createElement("div");
+  wrap.innerHTML = usageBlockHTML(estNow());
+  const fresh = wrap.firstElementChild;
+  const existing = ribbon.querySelector(".usage");
+  if (existing && fresh) existing.replaceWith(fresh);
+  else if (fresh) ribbon.appendChild(fresh);
+  bindUsage();
+}
+
+// Advance the live-moving parts (reset countdown, "updated Xm ago", 5h tick + delta) in place;
+// the % / fill only change on a new snapshot.
+function advanceUsageBars(now) {
+  const r = App.usageRender;
+  if (!r) return;
+  for (const b of r.bars) {
+    const w = b.win;
+    if (!w) continue;
+    const hasReset = Number.isFinite(w.resetsAt) && w.resetsAt > 0;
+    if (b.els.reset && hasReset) b.els.reset.textContent = "resets in " + fmtResetIn(w.resetsAt - now);
+    if (b.els.age) b.els.age.textContent = "updated " + fmtAge(now - r.updatedAt) + " ago";
+    // Advance the pace cue whenever the bar shows one (live OR stale). On a stale bar usedPct is
+    // frozen but elapsed advances, so the delta walks down over time until reset — intended.
+    if (hasReset && (b.els.tick || b.els.delta)) {
+      const ef = elapsedFrac(w.resetsAt, b.windowMs, now);
+      if (b.els.tick) b.els.tick.style.left = (ef * 100).toFixed(2) + "%";
+      if (b.els.delta) applyDelta(b.els.delta, Math.round(clamp(num(w.usedPct), 0, 100) - ef * 100));
+    }
+  }
+}
+
+// Called each second from tick(): rebuild the block if a window crossed a state threshold
+// (reset/stale) since the last snapshot, else just advance the live-moving parts.
+function tickUsage(now) {
+  const r = App.usageRender;
+  if (!r) return;
+  for (const b of r.bars) {
+    if (usageWindowState(b.win, now, r.updatedAt) !== b.state) {
+      renderUsage();
+      advanceUsageBars(now); // paint the freshly rebuilt bars immediately
+      return;
+    }
+  }
+  advanceUsageBars(now);
+}
+
 function renderLiveRibbon(sessions) {
   // The Live page is the main screen, so its ribbon doubles as a "today at a glance" summary.
   // Running / Waiting are the only momentary tiles — status counts over the live session set,
@@ -574,7 +808,10 @@ function renderLiveRibbon(sessions) {
     tile("Tokens", fmtTokens(tok)),
   ];
   if (costEnabled()) tiles.push(tile("Cost", hasCost ? fmtCost(cost) : "—"));
-  $("liveRibbon").innerHTML = tiles.join("");
+  // The usage block is a full-width row that flows below the tiles inside the ribbon grid.
+  $("liveRibbon").innerHTML = tiles.join("") + usageBlockHTML(estNow());
+  bindUsage();
+  advanceUsageBars(estNow()); // fill the delta chips (empty in the shell) + paint now
 }
 
 function renderLive() {
@@ -1284,6 +1521,7 @@ function ratesTableHTML(rates) {
 function settingsHTML(cfg) {
   const ev = cfg.events || {};
   const cost = cfg.cost || {};
+  const pace = ["both", "tick", "delta", "off"].includes(cfg.usagePace) ? cfg.usagePace : "both";
   const notifications = section(
     "Notifications",
     "OS notifications are emitted by the daemon, so they work whether or not this dashboard is open.",
@@ -1305,6 +1543,16 @@ function settingsHTML(cfg) {
         `<select class="select" id="set-liveSort">
            <option value="status" ${App.liveSort === "status" ? "selected" : ""}>Status (waiting first)</option>
            <option value="name" ${App.liveSort === "name" ? "selected" : ""}>Repository name</option>
+         </select>`
+      ) +
+      fieldRow(
+        "Usage pace cue",
+        "Tick and/or over-under delta on the session (5h) and weekly usage bars",
+        `<select class="select" id="set-usagePace">
+           <option value="both" ${pace === "both" ? "selected" : ""}>Tick + delta</option>
+           <option value="tick" ${pace === "tick" ? "selected" : ""}>Tick only</option>
+           <option value="delta" ${pace === "delta" ? "selected" : ""}>Delta only</option>
+           <option value="off" ${pace === "off" ? "selected" : ""}>Off</option>
          </select>`
       ) +
       fieldRow(
@@ -1410,6 +1658,7 @@ function readSettingsForm() {
     sound: cb("set-sound"),
     browserSounds: cb("set-browserSounds"),
     activityDetail: $("set-activityDetail").value,
+    usagePace: $("set-usagePace").value,
     events: {
       sessionFinished: cb("set-ev-sessionFinished"),
       needsInput: cb("set-ev-needsInput"),
