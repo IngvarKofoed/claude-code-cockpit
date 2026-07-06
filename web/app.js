@@ -765,23 +765,18 @@ function tickUsage(now) {
   advanceUsageBars(now);
 }
 
-function renderLiveRibbon(sessions) {
-  // The Live page is the main screen, so its ribbon doubles as a "today at a glance" summary.
-  // Running / Waiting are the only momentary tiles — status counts over the live session set,
-  // which only make sense "right now". Everything else (Sessions, Agents, Active time, Tokens,
-  // Cost) is TODAY's total across all of today's sessions, read from the today per-repo rollup
-  // (App.state.repos) — so a session that already ended today still counts, unlike the old
-  // sum-over-live-sessions. Sessions/Agents sum the per-repo counts (a session touching two
-  // repos counts once per repo — rare, and matches the Repos table's per-repo figures).
-  let running = 0;
-  let waiting = 0;
-  for (const s of sessions) {
-    const st = effectiveStatus(s);
-    if (st === "running") running++;
-    else if (st === "waiting") waiting++;
-  }
+function renderLiveRibbon() {
+  // The Live page is the main screen, so its ribbon is a "today at a glance" summary:
+  // every tile is TODAY's total across all of today's sessions, read from the today
+  // per-repo rollup (App.state.repos) — so a session that already ended today still
+  // counts, unlike a sum over only the live sessions. Sessions/Chats/Tools/Agents sum
+  // the per-repo counts (a session touching two repos counts once per repo — rare, and
+  // matches the Repos table's per-repo figures). The momentary Running/Waiting status
+  // tiles were deliberately dropped — the ribbon is now purely today's accounting.
   const repos = (App.state && App.state.repos) || [];
   let sessionsToday = 0;
+  let chats = 0;
+  let tools = 0;
   let agents = 0;
   let activeMs = 0;
   let tok = 0;
@@ -791,6 +786,8 @@ function renderLiveRibbon(sessions) {
     // r.sessions may arrive as an array (older payloads) or a number (current) — mirror
     // normalizeRepoRow so the ribbon and the Repos table read the field identically.
     sessionsToday += Array.isArray(r.sessions) ? r.sessions.length : num(r.sessions);
+    chats += num(r.prompts);
+    tools += num(sumTools(r.byTool)); // sumTools -> null when absent; num() folds it to 0
     agents += num(r.subagents);
     activeMs += num(r.activeMs);
     tok += sumTokens(r.tokens);
@@ -799,15 +796,15 @@ function renderLiveRibbon(sessions) {
       hasCost = true;
     }
   }
-  const tiles = [
-    tile("Sessions", sessionsToday),
-    tile("Running", running),
-    tile("Waiting", waiting, waiting > 0),
-    tile("Agents", agents),
-    tile("Active time", fmtDuration(activeMs)),
-    tile("Tokens", fmtTokens(tok)),
-  ];
+  // Order: Tokens | Cost | Sessions | Chats | Tools | Agents | Active time. Cost sits
+  // second (after Tokens) and drops out (leaving the rest in order) when disabled.
+  const tiles = [tile("Tokens", fmtTokens(tok))];
   if (costEnabled()) tiles.push(tile("Cost", hasCost ? fmtCost(cost) : "—"));
+  tiles.push(tile("Sessions", sessionsToday));
+  tiles.push(tile("Chats", chats));
+  tiles.push(tile("Tools", tools));
+  tiles.push(tile("Agents", agents));
+  tiles.push(tile("Active time", fmtDuration(activeMs)));
   // The usage block is a full-width row that flows below the tiles inside the ribbon grid.
   $("liveRibbon").innerHTML = tiles.join("") + usageBlockHTML(estNow());
   bindUsage();
@@ -816,7 +813,7 @@ function renderLiveRibbon(sessions) {
 
 function renderLive() {
   const sessions = (App.state && App.state.sessions) || [];
-  renderLiveRibbon(sessions);
+  renderLiveRibbon();
   const cards = $("cards");
   if (!sessions.length) {
     cards.innerHTML =

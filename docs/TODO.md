@@ -5,7 +5,7 @@
 - [x] Somehow save a little v space, so the 2nd row of session cards are fully visible on my mac screen
 - [x] Change the status bar script to show: cwd | ctx | usage | tokens | cost | active time | branch | model. And cwd should be the name of the directory where claude was started
 
-- [ ] Add Tools to mini cards and change arragement to: Sessions | Chats | Tokens | Cost | Tools | Agents | Active time
+- [x] Add Tools to mini cards and change arragement to: Sessions | Chats | Tokens | Cost | Tools | Agents | Active time
 - [ ] Change arragement for the details stats for cards in live sessions to: Chats | Tokens | Cost | Tool | Agents | Active
 
 - [ ] "1 in fligh", will it ever be more than 1? And its shown for workflows and?
