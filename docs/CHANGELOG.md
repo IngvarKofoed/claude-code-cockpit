@@ -309,3 +309,16 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     the Repos table can't disagree on a stale payload. Known edge: a session live but idle since before midnight
     logs no event today, so it's absent from today's rollup — its card still shows but it isn't in the Sessions
     count (the inverse of an ended-today session, which does count).
+
+39. Settled a recurring ask: the live "in flight" pill CANNOT reliably count subagents specifically. A
+    foreground Task/Agent subagent (e.g. an `Explore` review) fires SubagentStart/Stop but never enters Claude
+    Code's `background_tasks` registry (verified via a temporary emit.js capture: bg_tasks=0 throughout its
+    run), and the start/stop counter drifts on dropped Stops. The registry holds only BACKGROUNDED work —
+    Workflows (`type:"workflow"`) + run_in_background shells — which is exactly what bgTasks / the pill already
+    show. Registry elements DO carry a `type`/`status` discriminator, so a future per-type breakdown
+    ("1 workflow") is possible — but it still can't see Task subagents. Don't re-attempt from these signals.
+
+40. The Live "No active sessions" empty state now spans the full content column (centered) and sits lower,
+    below the ribbon. Scoped as `#cards .empty { grid-column: 1 / -1 }` because `.cards` is a grid — without it
+    the box landed in the first ~420px cell (top-left), so its `text-align: center` only centered text inside a
+    left-anchored box. Scoped to `#cards` so the Repos/Sessions/loading empty states are untouched.

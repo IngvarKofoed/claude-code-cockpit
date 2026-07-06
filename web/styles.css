@@ -491,6 +491,14 @@ body {
 }
 .empty strong { display: block; color: var(--ink-2); font-weight: 600; margin-bottom: 4px; }
 
+/* Live empty state: span the whole grid (not just the first cell) so it centers
+   in the content column, and nudge it down from the ribbon so it sits mid-view. */
+#cards .empty {
+  grid-column: 1 / -1;
+  margin-top: 10vh;
+  padding: 64px 24px;
+}
+
 /* ---------- Range control ---------- */
 
 .range {

@@ -12,6 +12,7 @@
 
 const fs = require('fs');
 const http = require('http');
+const path = require('path');
 const paths = require('./paths');
 const { resolveRepo } = require('./repo');
 
@@ -106,12 +107,16 @@ function buildRecord(payload) {
   return record;
 }
 
+// Append one object as a single JSON line to a JSONL file, creating its parent
+// dir first. A single small-line append is atomic on local filesystems; the
+// daemon's reader tolerates a torn final line where it isn't guaranteed.
+function writeJsonlLine(filePath, obj) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.appendFileSync(filePath, JSON.stringify(obj) + '\n');
+}
+
 function appendEvent(record) {
-  const line = JSON.stringify(record) + '\n';
-  fs.mkdirSync(paths.eventsDir(), { recursive: true });
-  // A single small-line append is atomic on local filesystems; the daemon's
-  // reader tolerates a torn final line where it isn't guaranteed.
-  fs.appendFileSync(paths.eventLogPath(paths.dateStr()), line);
+  writeJsonlLine(paths.eventLogPath(paths.dateStr()), record);
 }
 
 // Wake-up nudge only — carries no authoritative data (body is ignored by the
