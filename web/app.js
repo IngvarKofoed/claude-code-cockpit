@@ -581,18 +581,20 @@ function usageWindowState(w, now, updatedAt) {
   return "live";
 }
 
+// Floor-decompose a duration into days/hours/minutes/seconds (negative/NaN clamp to 0) — shared
+// by the reset countdown (fmtResetIn) and the pace-gap chip (fmtPaceGap) so their tiering can't drift.
+function splitDuration(ms) {
+  const s = Math.floor((ms > 0 ? ms : 0) / 1000);
+  return { d: Math.floor(s / 86400), h: Math.floor((s % 86400) / 3600), m: Math.floor((s % 3600) / 60), s: s % 60 };
+}
+
 // Countdown text: "6d 5h" / "4h 32m" / "12m 30s" / "45s"; clamps negative to 0.
 function fmtResetIn(ms) {
-  if (!(ms > 0)) ms = 0;
-  const s = Math.floor(ms / 1000);
-  const d = Math.floor(s / 86400);
-  const h = Math.floor((s % 86400) / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  if (d) return `${d}d ${h}h`;
-  if (h) return `${h}h ${String(m).padStart(2, "0")}m`;
-  if (m) return `${m}m ${String(sec).padStart(2, "0")}s`;
-  return `${sec}s`;
+  const t = splitDuration(ms);
+  if (t.d) return `${t.d}d ${t.h}h`;
+  if (t.h) return `${t.h}h ${String(t.m).padStart(2, "0")}m`;
+  if (t.m) return `${t.m}m ${String(t.s).padStart(2, "0")}s`;
+  return `${t.s}s`;
 }
 
 const RESET_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -622,18 +624,45 @@ function fmtResetLine(resetsAt, now, withDate) {
   return `resets in ${fmtResetIn(resetsAt - now)} · ${fmtResetAt(resetsAt, now, withDate)}`;
 }
 
-// Signed pace gap (usedPct − on-pace%): over pace reads as caution (amber), under as calm
-// (green), exactly on pace is neutral. Written into the delta chip both at render and on tick.
-function applyDelta(el, d) {
+// On-pace dead zone: a RELATIVE band (~0.5% of the window, matching the old integer-percentage
+// rounding), floored at 60s so the minute-resolution figure never shows "0m". Relative is the
+// point — a fixed 60s is ~0.01% of the 7d window, so the weekly bar would essentially never read
+// "on pace" and would show minute-scale noise; ~0.5% keeps a proportionate ~50min band there.
+const PACE_ONPACE_FRAC = 0.005;
+const PACE_ONPACE_FLOOR_MS = 60 * 1000;
+function paceTolerance(windowMs) {
+  return Math.max(PACE_ONPACE_FLOOR_MS, windowMs * PACE_ONPACE_FRAC);
+}
+
+// Compact magnitude for the pace delta: the fill-vs-tick gap rescaled to time (see applyDelta).
+// Minute resolution, no seconds — "2d 4h" / "1h 13m" / "24m". Same tiering as fmtResetIn above.
+function fmtPaceGap(ms) {
+  const t = splitDuration(ms);
+  if (t.d) return `${t.d}d ${t.h}h`;
+  if (t.h) return `${t.h}h ${String(t.m).padStart(2, "0")}m`;
+  return `${t.m}m`;
+}
+
+// Signed pace gap: the horizontal fill-vs-tick gap shown as BOTH a percentage and time —
+// "▲ 5% · 21m ahead". The % is the gap in percentage points (usedPct − elapsedFrac×100); the time
+// is that same gap × windowMs (how much sooner/later than an even burn you hit this usage level).
+// Over pace ("ahead") reads as caution (amber), under ("behind") as calm (green), within the
+// per-window on-pace band as neutral. `gapMs` is signed (+ ahead, − behind); `windowMs` scales both
+// the band and the % (pct = |gapMs|/windowMs). Written into the chip at render and on tick.
+function applyDelta(el, gapMs, windowMs) {
   el.classList.remove("usage-bar__delta--over", "usage-bar__delta--under", "usage-bar__delta--on");
-  if (d > 0) {
+  const tol = paceTolerance(windowMs);
+  const pct = Math.round((Math.abs(gapMs) / windowMs) * 100);
+  if (gapMs >= tol) {
+    const t = fmtPaceGap(gapMs);
     el.classList.add("usage-bar__delta--over");
-    el.textContent = "▲ +" + d + "%";
-    el.title = d + "% ahead of an even burn rate";
-  } else if (d < 0) {
+    el.textContent = "▲ " + pct + "% · " + t + " ahead";
+    el.title = pct + "% ahead of an even burn rate";
+  } else if (gapMs <= -tol) {
+    const t = fmtPaceGap(-gapMs);
     el.classList.add("usage-bar__delta--under");
-    el.textContent = "▼ −" + Math.abs(d) + "%";
-    el.title = Math.abs(d) + "% below an even burn rate";
+    el.textContent = "▼ " + pct + "% · " + t + " behind";
+    el.title = pct + "% behind an even burn rate";
   } else {
     el.classList.add("usage-bar__delta--on");
     el.textContent = "on pace";
@@ -777,7 +806,9 @@ function advanceUsageBars(now) {
     if (hasReset && (b.els.tick || b.els.delta)) {
       const ef = elapsedFrac(w.resetsAt, b.windowMs, now);
       if (b.els.tick) b.els.tick.style.left = (ef * 100).toFixed(2) + "%";
-      if (b.els.delta) applyDelta(b.els.delta, Math.round(clamp(num(w.usedPct), 0, 100) - ef * 100));
+      // Same gap the tick shows (fill − tick), rescaled from a fraction of the window to time;
+      // windowMs also scales the on-pace band so the 7d bar isn't judged against a 5h tolerance.
+      if (b.els.delta) applyDelta(b.els.delta, (clamp(num(w.usedPct), 0, 100) / 100 - ef) * b.windowMs, b.windowMs);
     }
   }
 }
