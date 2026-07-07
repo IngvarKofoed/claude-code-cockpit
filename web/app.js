@@ -595,6 +595,33 @@ function fmtResetIn(ms) {
   return `${sec}s`;
 }
 
+const RESET_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const RESET_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// True when two epoch-ms instants fall on the same local calendar day.
+function sameLocalDay(a, b) {
+  const x = new Date(a);
+  const y = new Date(b);
+  return x.getFullYear() === y.getFullYear() && x.getMonth() === y.getMonth() && x.getDate() === y.getDate();
+}
+
+// Absolute reset moment in the viewer's local zone, 24-hour clock. The weekly window (`withDate`)
+// always shows the full date ("Mon 13 Jul, 14:32"). The 5h window shows a bare time ("14:32"),
+// but a rolling 5h window entered in the evening resets after midnight — so when the reset lands
+// on another local day than `now`, a weekday is prefixed ("Thu 03:00") to keep it unambiguous.
+function fmtResetAt(resetsAt, now, withDate) {
+  const dt = new Date(resetsAt);
+  const time = `${String(dt.getHours()).padStart(2, "0")}:${String(dt.getMinutes()).padStart(2, "0")}`;
+  if (withDate) return `${RESET_WEEKDAYS[dt.getDay()]} ${dt.getDate()} ${RESET_MONTHS[dt.getMonth()]}, ${time}`;
+  return sameLocalDay(resetsAt, now) ? time : `${RESET_WEEKDAYS[dt.getDay()]} ${time}`;
+}
+
+// The full reset line: the live countdown plus the absolute reset moment ("resets in 4h 32m ·
+// 14:32"). Shared by render (usageBarHTML) and tick (advanceUsageBars) so both stay in sync.
+function fmtResetLine(resetsAt, now, withDate) {
+  return `resets in ${fmtResetIn(resetsAt - now)} · ${fmtResetAt(resetsAt, now, withDate)}`;
+}
+
 // Signed pace gap (usedPct − on-pace%): over pace reads as caution (amber), under as calm
 // (green), exactly on pace is neutral. Written into the delta chip both at render and on tick.
 function applyDelta(el, d) {
@@ -627,7 +654,8 @@ function usageShellHTML(kind, state, label, note) {
 }
 
 // One usage bar. `pace` (both|tick|delta|off) enables the pace cue (tick + delta) on the bar.
-function usageBarHTML(kind, w, windowMs, label, now, updatedAt, pace) {
+// `withDate` appends a dated reset moment (weekly) vs. a time-only one (5h) to the countdown.
+function usageBarHTML(kind, w, windowMs, label, now, updatedAt, pace, withDate) {
   const state = usageWindowState(w, now, updatedAt);
   if (state === "nodata") return usageShellHTML(kind, state, label, "awaiting data…");
   if (state === "reset") return usageShellHTML(kind, state, label, "reset • awaiting update");
@@ -643,7 +671,7 @@ function usageBarHTML(kind, w, windowMs, label, now, updatedAt, pace) {
   const ef = hasReset ? elapsedFrac(w.resetsAt, windowMs, now) : 0;
   const tickHTML = showTick ? `<div class="usage-bar__tick" style="left:${(ef * 100).toFixed(2)}%"></div>` : "";
   const footInfo =
-    (hasReset ? `<span class="usage-bar__reset">resets in ${esc(fmtResetIn(w.resetsAt - now))}</span>` : "") +
+    (hasReset ? `<span class="usage-bar__reset">${esc(fmtResetLine(w.resetsAt, now, withDate))}</span>` : "") +
     (state === "stale" ? `<span class="usage-bar__age">updated ${esc(fmtAge(now - updatedAt))} ago</span>` : "");
   // The delta chip is filled by applyDelta so render + tick share one implementation.
   let deltaHTML = "";
@@ -679,8 +707,8 @@ function usageBlockHTML(now) {
   const updatedAt = num(u.updatedAt);
   return (
     `<div class="usage">` +
-    usageBarHTML("fiveHour", u.fiveHour, FIVE_HOUR_MS, "Session (5h)", now, updatedAt, pace) +
-    usageBarHTML("sevenDay", u.sevenDay, SEVEN_DAY_MS, "Week", now, updatedAt, pace) +
+    usageBarHTML("fiveHour", u.fiveHour, FIVE_HOUR_MS, "Session (5h)", now, updatedAt, pace, false) +
+    usageBarHTML("sevenDay", u.sevenDay, SEVEN_DAY_MS, "Week", now, updatedAt, pace, true) +
     `</div>`
   );
 }
@@ -695,8 +723,8 @@ function bindUsage() {
     return;
   }
   const defs = [
-    { kind: "fiveHour", win: u.fiveHour, windowMs: FIVE_HOUR_MS },
-    { kind: "sevenDay", win: u.sevenDay, windowMs: SEVEN_DAY_MS },
+    { kind: "fiveHour", win: u.fiveHour, windowMs: FIVE_HOUR_MS, withDate: false },
+    { kind: "sevenDay", win: u.sevenDay, windowMs: SEVEN_DAY_MS, withDate: true },
   ];
   const bars = [];
   for (const d of defs) {
@@ -706,6 +734,7 @@ function bindUsage() {
       kind: d.kind,
       win: d.win,
       windowMs: d.windowMs,
+      withDate: d.withDate,
       state: elBar.dataset.state,
       els: {
         reset: elBar.querySelector(".usage-bar__reset"),
@@ -741,7 +770,7 @@ function advanceUsageBars(now) {
     const w = b.win;
     if (!w) continue;
     const hasReset = Number.isFinite(w.resetsAt) && w.resetsAt > 0;
-    if (b.els.reset && hasReset) b.els.reset.textContent = "resets in " + fmtResetIn(w.resetsAt - now);
+    if (b.els.reset && hasReset) b.els.reset.textContent = fmtResetLine(w.resetsAt, now, b.withDate);
     if (b.els.age) b.els.age.textContent = "updated " + fmtAge(now - r.updatedAt) + " ago";
     // Advance the pace cue whenever the bar shows one (live OR stale). On a stale bar usedPct is
     // frozen but elapsed advances, so the delta walks down over time until reset — intended.

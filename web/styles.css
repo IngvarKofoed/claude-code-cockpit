@@ -294,8 +294,8 @@ body {
 .usage-bar__foot {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 4px 8px;
   min-height: 14px;
   margin-top: 6px;
   font-size: 12px;
@@ -306,6 +306,7 @@ body {
 .usage-bar__age { color: var(--ink-2); font-style: italic; }
 .usage-bar__note { color: var(--ink-muted); }
 .usage-bar__delta {
+  margin-left: auto; /* stays right-aligned whether it shares the line or wraps below */
   font-family: var(--font-mono);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
