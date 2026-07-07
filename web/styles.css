@@ -315,6 +315,20 @@ body {
 .usage-bar__delta--over { color: var(--st-waiting); }
 .usage-bar__delta--under { color: var(--st-running); }
 .usage-bar__delta--on { color: var(--ink-2); }
+/* "Time left at current velocity" ETA — a secondary readout riding after the pace delta. It only
+   lights up (amber) when the budget would run out before the window resets; otherwise it stays
+   muted ("won't run out"). Empty (blank) in the window's jumpy-early guard. */
+.usage-bar__eta {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--ink-2);
+}
+.usage-bar__eta:empty { display: none; }
+.usage-bar__eta--risk { color: var(--st-waiting); }
+.usage-bar__eta--ok { color: var(--ink-2); }
+.usage-bar__eta--limit { color: var(--st-error); font-weight: 600; }
 
 @media (prefers-reduced-motion: reduce) {
   .usage-bar__fill { transition: none; }

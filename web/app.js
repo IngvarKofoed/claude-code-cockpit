@@ -539,9 +539,11 @@ function tile(label, value, alert) {
 // ---- Live usage bars (session 5h + weekly, from the statusline) -------------
 // Anthropic's real rate-limit usage, forwarded by the cockpit statusline and served on
 // /api/state as `usage`. Two bars — the session (5h) and weekly (7d) windows — both carrying
-// the same pace cue (governed by the `usagePace` setting). `usedPct` only changes when a new
-// snapshot arrives; the reset countdown and the pace tick/delta advance every second via the
-// shared tick() loop (elapsed-time only moves, the % holds). Never fabricates a 0 — see states.
+// the same pace cue (governed by the `usagePace` setting): a tick (on-pace mark), a delta
+// (how far off an even burn), and a "time left" ETA that projects the burn rate to exhaustion.
+// `usedPct` only changes when a new snapshot arrives; the reset countdown and the pace tick/delta/
+// ETA advance every second via the shared tick() loop (elapsed-time only moves, the % holds).
+// Never fabricates a 0 — see states.
 
 const FIVE_HOUR_MS = 5 * 3600 * 1000;
 const SEVEN_DAY_MS = 7 * 24 * 3600 * 1000;
@@ -670,6 +672,61 @@ function applyDelta(el, gapMs, windowMs) {
   }
 }
 
+// "Time left at the current velocity" — the pace delta says how far off an even burn you are;
+// this projects it forward to an ETA. Simple linear velocity: burnRate = usedFrac / elapsed, so
+// timeLeft = remainingFrac / burnRate = ((1 − usedFrac) / usedFrac) × elapsed. The over/under-pace
+// verdict is decided by the SAME signed fill-vs-tick gap and on-pace tolerance band the delta chip
+// uses (`applyDelta`), so the two cues on one bar can't contradict — a bare timeLeft<timeToReset
+// boundary would fire the amber "running out" readout while the delta beside it still read "on pace".
+// (gap>0 ⟺ timeLeft<timeToReset, i.e. over pace ⟺ exhausts before reset — mathematically the same
+// crossing, just banded.) Over pace shows "≈3h left" (amber) with the shortfall in the tooltip;
+// under pace reads "won't run out" (muted), no misleadingly huge projection in text OR tooltip;
+// within the on-pace band it shows the (reset-sized) "≈X left" muted, not a warning. Gated to a
+// settled reading — under ~1% used or the window's first 1% it stays blank, since the projection
+// swings wildly early on (the "jumpy early in a window" caveat that deferred this per changelog #52).
+// On a STALE bar it keeps advancing in lockstep with the delta (usedPct frozen, elapsed grows), per
+// the deliberate entry-46 no-re-freeze rule; the "updated Xm ago" age note carries the staleness.
+function applyEta(el, usedPct, resetsAt, windowMs, now) {
+  el.classList.remove("usage-bar__eta--risk", "usage-bar__eta--ok", "usage-bar__eta--limit");
+  const pct = clamp(num(usedPct), 0, 100);
+  const elapsed = windowMs - (resetsAt - now); // ms since the window opened
+  if (pct < 1 || elapsed <= windowMs * 0.01) {
+    el.textContent = "";
+    el.removeAttribute("title");
+    return;
+  }
+  if (pct >= 100) {
+    el.classList.add("usage-bar__eta--limit");
+    el.textContent = "at limit";
+    el.title = "budget exhausted for this window";
+    return;
+  }
+  const usedFrac = pct / 100;
+  const timeLeft = ((1 - usedFrac) / usedFrac) * elapsed; // remaining budget ÷ current burn rate
+  const timeToReset = resetsAt - now;
+  // fmtPaceGap floors to whole minutes, so a sub-60s projection would read "≈0m left" — show
+  // "<1m left" instead so a near-exhausted bar doesn't look like a zero/glitch before "at limit".
+  const leftTxt = timeLeft < 60000 ? "<1m left" : "≈" + fmtPaceGap(timeLeft) + " left";
+  const gapMs = (usedFrac - elapsedFrac(resetsAt, windowMs, now)) * windowMs;
+  const tol = paceTolerance(windowMs);
+  if (gapMs >= tol) {
+    // Over pace: the budget runs out before the window resets — the actionable case.
+    el.classList.add("usage-bar__eta--risk");
+    el.textContent = leftTxt;
+    el.title = "at the current rate the budget runs out " + fmtPaceGap(timeToReset - timeLeft) + " before it resets";
+  } else if (gapMs <= -tol) {
+    // Under pace: the window resets before the cap — no risk this window.
+    el.classList.add("usage-bar__eta--ok");
+    el.textContent = "won't run out";
+    el.title = "at the current rate the budget outlasts the reset — no risk this window";
+  } else {
+    // On pace: the budget lasts about to the reset; neutral, not a warning.
+    el.classList.add("usage-bar__eta--ok");
+    el.textContent = leftTxt;
+    el.title = "at the current rate the budget lasts about to the reset";
+  }
+}
+
 // Empty-state shell (nodata / reset): label + inert track + a note, with NO percentage or
 // fill — the honest "no confidently-wrong bar" rule (never a fabricated 0 or a stale high %).
 function usageShellHTML(kind, state, label, note) {
@@ -702,10 +759,11 @@ function usageBarHTML(kind, w, windowMs, label, now, updatedAt, pace, withDate) 
   const footInfo =
     (hasReset ? `<span class="usage-bar__reset">${esc(fmtResetLine(w.resetsAt, now, withDate))}</span>` : "") +
     (state === "stale" ? `<span class="usage-bar__age">updated ${esc(fmtAge(now - updatedAt))} ago</span>` : "");
-  // The delta chip is filled by applyDelta so render + tick share one implementation.
+  // The delta chip + the "time left" ETA are filled by applyDelta/applyEta so render + tick
+  // share one implementation. The ETA rides alongside the delta (same over/under-pace signal).
   let deltaHTML = "";
   if (showDelta) {
-    deltaHTML = `<span class="usage-bar__delta"></span>`;
+    deltaHTML = `<span class="usage-bar__delta"></span><span class="usage-bar__eta"></span>`;
   }
   const bar =
     `<div class="usage-bar" data-kind="${kind}" data-state="${state}">` +
@@ -770,6 +828,7 @@ function bindUsage() {
         age: elBar.querySelector(".usage-bar__age"),
         tick: elBar.querySelector(".usage-bar__tick"),
         delta: elBar.querySelector(".usage-bar__delta"),
+        eta: elBar.querySelector(".usage-bar__eta"),
       },
     });
   }
@@ -803,12 +862,14 @@ function advanceUsageBars(now) {
     if (b.els.age) b.els.age.textContent = "updated " + fmtAge(now - r.updatedAt) + " ago";
     // Advance the pace cue whenever the bar shows one (live OR stale). On a stale bar usedPct is
     // frozen but elapsed advances, so the delta walks down over time until reset — intended.
-    if (hasReset && (b.els.tick || b.els.delta)) {
+    if (hasReset && (b.els.tick || b.els.delta || b.els.eta)) {
       const ef = elapsedFrac(w.resetsAt, b.windowMs, now);
       if (b.els.tick) b.els.tick.style.left = (ef * 100).toFixed(2) + "%";
       // Same gap the tick shows (fill − tick), rescaled from a fraction of the window to time;
       // windowMs also scales the on-pace band so the 7d bar isn't judged against a 5h tolerance.
       if (b.els.delta) applyDelta(b.els.delta, (clamp(num(w.usedPct), 0, 100) / 100 - ef) * b.windowMs, b.windowMs);
+      // Project the current burn rate forward to a "time left" ETA (see applyEta).
+      if (b.els.eta) applyEta(b.els.eta, w.usedPct, w.resetsAt, b.windowMs, now);
     }
   }
 }

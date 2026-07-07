@@ -6,7 +6,7 @@
 - [x] Change the status bar script to show: cwd | ctx | usage | tokens | cost | active time | branch | model. And cwd should be the name of the directory where claude was started
 
 - [x] Add Tools to mini cards and change arragement to: Sessions | Chats | Tokens | Cost | Tools | Agents | Active time
-- [x] Change arragement for the details stats for cards in live sessions to: Tokens | Cost | Chats | Tool | Agents | Active
+- [ ] Change arragement for the details stats for cards in live sessions to:  Tokens | Cost | Chats | Tool | Agents | Active
 
 - [ ] "1 in fligh", will it ever be more than 1? And its shown for workflows and?
 
