@@ -315,20 +315,29 @@ body {
 .usage-bar__delta--over { color: var(--st-waiting); }
 .usage-bar__delta--under { color: var(--st-running); }
 .usage-bar__delta--on { color: var(--ink-2); }
-/* "Time left at current velocity" ETA — a secondary readout riding after the pace delta. It only
-   lights up (amber) when the budget would run out before the window resets; otherwise it stays
-   muted ("won't run out"). Empty (blank) in the window's jumpy-early guard. */
-.usage-bar__eta {
+/* Burn-rate multiplier — a secondary readout riding after the pace delta (it replaced the time-left
+   ETA that used to sit here). Current velocity vs the even rate (1.0× = on pace); shares the delta's
+   over/under/on palette, but its verdict is the displayed ratio (see applyMult), not the delta's
+   additive gap. "at limit" (error colour) at the cap. Empty (blank) in the jumpy-early guard. */
+.usage-bar__mult {
   font-family: var(--font-mono);
-  font-weight: 500;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   color: var(--ink-2);
 }
-.usage-bar__eta:empty { display: none; }
-.usage-bar__eta--risk { color: var(--st-waiting); }
-.usage-bar__eta--ok { color: var(--ink-2); }
-.usage-bar__eta--limit { color: var(--st-error); font-weight: 600; }
+/* A muted "·" joins the delta to the multiplier so the two read as one line ("▲ 6% · 18m · 1.3×").
+   Neutral (not the value's amber/green) like the reset line's separators. It's part of the multiplier
+   element, so :empty hides it too — no dangling dot in the jumpy-early guard. */
+.usage-bar__mult::before {
+  content: "· ";
+  color: var(--ink-muted);
+}
+.usage-bar__mult:empty { display: none; }
+.usage-bar__mult--over { color: var(--st-waiting); }
+.usage-bar__mult--under { color: var(--st-running); }
+.usage-bar__mult--on { color: var(--ink-2); }
+.usage-bar__mult--limit { color: var(--st-error); font-weight: 600; }
 
 @media (prefers-reduced-motion: reduce) {
   .usage-bar__fill { transition: none; }
