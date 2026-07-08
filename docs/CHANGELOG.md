@@ -489,3 +489,9 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     only in the hover title ("6% ahead of an even burn rate") to disambiguate the colour. The joining "·" is
     a `.usage-bar__mult::before` (muted, like the reset line's separators), so it vanishes with the
     multiplier under `:empty` (jumpy-early guard) — no dangling dot.
+
+56. Root CLAUDE.md gained a "Multi-agent workflows" section: when fanning work across subagents (the
+    Workflow tool), tier each agent's model/effort — strong for contracts/review, mid for verify/apply,
+    cheap for docs/changelog. And INVOKING a named workflow (e.g. code-review) still bills every stage at
+    the session model unless its scriptPath is edited to tier the checking stages down. Inert unless a
+    multi-agent workflow actually runs.
