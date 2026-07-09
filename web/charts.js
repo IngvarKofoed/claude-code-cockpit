@@ -1,15 +1,14 @@
 // charts.js — hand-rolled inline-SVG charts, no libraries, no external assets.
-// Exports: barChart, lineChart (existing, unchanged), plus stacked, grouped, donut,
-// punch, calendar (History-view primitives). Each renders into a host element.
+// Exports: barChart, lineChart, stacked, punch, calendar. Each renders into a host element.
 
 const NS = "http://www.w3.org/2000/svg";
 const W = 640; // fallback viewBox width when a container can't be measured yet
 
-// Responsive viewBox width: render at the host's actual pixel width so a line chart
-// fills its card 1:1 (crisp text, no aspect-ratio stretch, no empty gutter), instead
-// of drawing at a fixed 640 and letting CSS scale it. Falls back to W when the host
-// isn't laid out yet (clientWidth 0). Used by lineChart; the fixed-geometry charts
-// (bars/stacked/donut/punch/calendar) keep the 640 grid and scale via CSS.
+// Responsive viewBox width: render at the host's actual pixel width so a chart fills
+// its card 1:1 (crisp text, no aspect-ratio stretch, no empty gutter), instead of
+// drawing at a fixed 640 and letting CSS scale it. Falls back to W when the host
+// isn't laid out yet (clientWidth 0). Used by lineChart / barChart / stacked; punch
+// and calendar keep the fixed 640 grid and scale via CSS.
 function vw(host) {
   const w = host && host.clientWidth;
   return w && w > 80 ? Math.round(w) : W;
@@ -85,7 +84,7 @@ function bindTip(node, k, v) {
   node.addEventListener("mouseleave", hideTip);
 }
 
-// Legend row under a multi-series chart (stacked / grouped): one swatch + name per series.
+// Legend row under a multi-series chart (stacked / multi-line): one swatch + name per series.
 function appendLegend(host, items) {
   const d = document.createElement("div");
   d.className = "chart-legend";
@@ -128,7 +127,7 @@ export function barChart(host, data, opts) {
     return emptyState(host, opts.empty);
   }
   const W = vw(host); // render at the card's real width (shadows the module fallback)
-  const fmt = opts.format || commas;
+  const fmt = opts.fmt || opts.format || commas;
   const color = opts.color || "var(--series-1)";
   const horizontal = !!opts.horizontal;
   const H = opts.height || 240;
@@ -255,7 +254,9 @@ export function lineChart(host, series, opts) {
     }
   }
 
-  const base = series[0].points;
+  // x-axis labels use the LONGEST series' points, so they span all n x-slots even if
+  // series[0] happens to be shorter than a later series.
+  const base = series.reduce((a, s) => (s.points.length > a.length ? s.points : a), series[0].points);
   const every = base.length <= 12 ? 1 : Math.ceil(base.length / 9);
   base.forEach((p, i) => {
     if (i % every === 0) svg.appendChild(text(xAt(i), H - 8, p.short || p.label));
@@ -358,106 +359,6 @@ export function stacked(host, cats, series, opts) {
   svg.appendChild(el("line", { x1: ml, y1: mt + ph, x2: ml + pw, y2: mt + ph, class: "c-axis" }));
   host.replaceChildren(svg);
   appendLegend(host, series.map((s) => ({ name: s.name, color: s.color })));
-}
-
-// ---- grouped bars (vertical, series side-by-side within each category) ----
-
-export function grouped(host, cats, series, opts) {
-  opts = opts || {};
-  if (!host) return;
-  const hasData = cats && cats.length && series && series.length &&
-    series.some((s) => (s.values || []).some((v) => v));
-  if (!hasData) return emptyState(host, opts.empty);
-
-  const fmt = opts.fmt || commas;
-  const H = opts.height || 210;
-  const ml = 40, mr = 12, mt = 12, mb = 26;
-  const pw = W - ml - mr, ph = H - mt - mb;
-  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
-  styleTicks(svg);
-
-  const max = Math.max(...cats.map((_, ci) => Math.max(...series.map((s) => s.values[ci] || 0))), 0);
-  const scale = niceScale(max);
-  for (let v = 0; v <= scale.max + 1e-9; v += scale.step) {
-    const y = mt + ph - (v / scale.max) * ph;
-    svg.appendChild(el("line", { x1: ml, y1: y, x2: ml + pw, y2: y, class: "c-grid" }));
-    svg.appendChild(text(ml - 8, y + 4, fmt(v), "", "end"));
-  }
-  const band = pw / cats.length;
-  const groupW = band * 0.66;
-  const bw = (groupW - 2 * (series.length - 1)) / series.length;
-  const every = cats.length <= 12 ? 1 : Math.ceil(cats.length / 9);
-  cats.forEach((cat, ci) => {
-    const gx = ml + band * ci + (band - groupW) / 2;
-    series.forEach((s, si) => {
-      const x = gx + si * (bw + 2);
-      const bh = Math.max(0, ((s.values[ci] || 0) / scale.max) * ph);
-      const y = mt + ph - bh;
-      const p = el("path", { d: topRound(x, y, bw, bh, 3), fill: s.color });
-      bindTip(p, `${cat.label} · ${s.name}`, fmt(s.values[ci] || 0));
-      svg.appendChild(p);
-    });
-    if (ci % every === 0) svg.appendChild(text(ml + band * ci + band / 2, H - 8, cat.short || cat.label));
-  });
-  svg.appendChild(el("line", { x1: ml, y1: mt + ph, x2: ml + pw, y2: mt + ph, class: "c-axis" }));
-  host.replaceChildren(svg);
-  appendLegend(host, series.map((s) => ({ name: s.name, color: s.color })));
-}
-
-// ---- donut (share of a whole) ----------------------------------------------
-
-export function donut(host, slices, opts) {
-  opts = opts || {};
-  if (!host) return;
-  const total = (slices || []).reduce((a, s) => a + (s.value || 0), 0);
-  if (!slices || !slices.length || !total) return emptyState(host, opts.empty);
-
-  const fmt = opts.fmt || commas;
-  const H = 210, cx = 150, cy = H / 2, rO = 82, rI = 50;
-  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
-  styleTicks(svg);
-
-  let ang = -Math.PI / 2;
-  const gap = 0.028;
-  slices.forEach((s) => {
-    const frac = s.value / total;
-    const a0 = ang + gap / 2, a1 = ang + frac * 2 * Math.PI - gap / 2;
-    ang += frac * 2 * Math.PI;
-    const large = a1 - a0 > Math.PI ? 1 : 0;
-    const d =
-      `M${cx + rI * Math.cos(a0)},${cy + rI * Math.sin(a0)}` +
-      `L${cx + rO * Math.cos(a0)},${cy + rO * Math.sin(a0)}` +
-      `A${rO},${rO} 0 ${large} 1 ${cx + rO * Math.cos(a1)},${cy + rO * Math.sin(a1)}` +
-      `L${cx + rI * Math.cos(a1)},${cy + rI * Math.sin(a1)}` +
-      `A${rI},${rI} 0 ${large} 0 ${cx + rI * Math.cos(a0)},${cy + rI * Math.sin(a0)}Z`;
-    const p = el("path", { d, fill: s.color });
-    bindTip(p, s.name, `${fmt(s.value)} · ${Math.round(frac * 100)}%`);
-    svg.appendChild(p);
-  });
-
-  const c1 = text(cx, cy - 4, fmt(total), "", "middle");
-  c1.style.fill = "var(--ink)";
-  c1.style.fontSize = "17px";
-  c1.style.fontWeight = "600";
-  const c2 = text(cx, cy + 14, opts.centerLabel || "total", "", "middle");
-  svg.append(c1, c2);
-
-  // legend column on the right, with value + share per slice. Fit the rows inside
-  // the viewBox height — a capped list runs up to 7 rows (6 series + "Other"), which
-  // at the old fixed 30px step overflowed H=210 and clipped the last row; scale the
-  // step down and vertically center instead.
-  const lstep = Math.min(30, (H - 24) / Math.max(1, slices.length));
-  const ly0 = (H - lstep * (slices.length - 1)) / 2;
-  slices.forEach((s, i) => {
-    const y = ly0 + i * lstep;
-    svg.appendChild(el("rect", { x: 300, y: y - 9, width: 11, height: 11, rx: 3, fill: s.color }));
-    const t1 = text(318, y, s.name, "", "start");
-    t1.style.fill = "var(--ink-2)";
-    const t2 = text(W - 6, y, `${fmt(s.value)} · ${Math.round((s.value / total) * 100)}%`, "", "end");
-    t2.style.fill = "var(--ink)";
-    svg.append(t1, t2);
-  });
-  host.replaceChildren(svg);
 }
 
 // ---- hour heatmap ramp (sequential blue, dark surface -> bright) ----------

@@ -1755,17 +1755,23 @@ function drawHistory(h) {
     punch($("hc-punch"), matrix, fo(fmtDuration, { empty: "No activity yet." }));
   }
 
-  // Calendar heatmap — pad leading days so dayVals[0] is the Monday of its week
-  // (charts.calendar lays cells out Monday-first; else every day lands a row off).
+  // Calendar heatmap — charts.calendar lays cells out by sequential index in
+  // Monday-start weeks, so it needs a CONTIGUOUS daily series. The range (esp. "all")
+  // omits inactive days, so build a full day-by-day series from the first day to the
+  // last (missing days = 0), starting from the Monday of the first day's week — else a
+  // gap would shift every later day into the wrong weekday/week.
   {
-    const dayVals = perDay.map((d) => ({ date: parseLocalDate(d.date), value: num(d.activeMs) }));
-    if (dayVals.length) {
-      const first = dayVals[0].date;
-      const lead = (first.getDay() + 6) % 7; // days since Monday (Mon=0 … Sun=6)
-      for (let i = 1; i <= lead; i++) {
-        const pd = new Date(first);
-        pd.setDate(first.getDate() - i);
-        dayVals.unshift({ date: pd, value: 0 });
+    const dayVals = [];
+    if (perDay.length) {
+      const byDate = new Map(perDay.map((d) => [d.date, num(d.activeMs)]));
+      const first = parseLocalDate(perDay[0].date);
+      const last = parseLocalDate(perDay[perDay.length - 1].date);
+      const cur = new Date(first);
+      cur.setDate(cur.getDate() - ((first.getDay() + 6) % 7)); // back up to Monday
+      while (cur <= last) {
+        const key = `${cur.getFullYear()}-${String(cur.getMonth() + 1).padStart(2, "0")}-${String(cur.getDate()).padStart(2, "0")}`;
+        dayVals.push({ date: new Date(cur), value: byDate.get(key) || 0 });
+        cur.setDate(cur.getDate() + 1);
       }
     }
     calendar($("hc-calendar"), dayVals, fo(fmtDuration, { empty: "No activity yet." }));
