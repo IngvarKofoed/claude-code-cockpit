@@ -909,6 +909,14 @@ function handleEvent(ev) {
     const r = todayRollup.repos[session.repoRoot];
     if (r) {
       r.subagents = num(r.subagents) + 1;
+      // byAgentType on the SAME live branch (mirrors the byTool/subagents tallies).
+      // Without it, today's per-type breakdown stays frozen at the boot rebuild and
+      // only self-corrects on the next restart — so a subagent spawned during the
+      // running day is missing from the "Subagents by type" chart / agentType pivot.
+      if (ev.agent_type != null) {
+        if (!r.byAgentType) r.byAgentType = {};
+        r.byAgentType[ev.agent_type] = num(r.byAgentType[ev.agent_type]) + 1;
+      }
       repoTotalsCache = null;
     }
   }
@@ -1325,20 +1333,6 @@ function datesInRange(range) {
   return out.sort();
 }
 
-// Total estimated cost for one day's rollup, combining models across repos.
-function dayCost(rollup) {
-  if (!cfg.cost.enabled || !rollup || !rollup.repos) return null;
-  const combined = {};
-  for (const root of Object.keys(rollup.repos)) {
-    const bm = rollup.repos[root].byModel || {};
-    for (const m of Object.keys(bm)) {
-      const dst = combined[m] || (combined[m] = emptyTokens());
-      addTokens(dst, bm[m]);
-    }
-  }
-  return pricing.estimateCost(combined, cfg.cost.rates).total;
-}
-
 // Aggregate per-repo tokens (total + per-model) and active time across a set of days,
 // keyed by repoRoot. Shared by the History range view and the Live cards' all-time
 // totals so the two can't diverge. getRollup memoizes past days, so this is O(days).
@@ -1373,6 +1367,36 @@ function aggregateReposAcrossDates(dates, { trackSessions = true } = {}) {
   return agg;
 }
 
+// Token classes in the canonical order pricing.js uses; local copy since it isn't
+// exported. Drives the costByType split below.
+const TOKEN_CLASSES = ['input', 'output', 'cacheRead', 'cacheWrite'];
+
+// Sum a { key -> count } map defensively (used for a repo's total tool count = Σ byTool).
+function sumCounts(map) {
+  let s = 0;
+  if (map && typeof map === 'object') for (const k of Object.keys(map)) s += num(map[k]);
+  return s;
+}
+
+// Cost split across the four token classes for a combined { model -> tokens } map,
+// priced from cfg.cost.rates. For each PRICED model (a complete rate — determined by
+// pricing.estimateCost, so unpriced/partial-rate models are skipped identically to it),
+// add tokens[class] × rate[class] / 1e6 per class. Σ over the classes therefore equals
+// pricing.estimateCost(byModel).total. Assumes cfg.cost.enabled (caller gates on it).
+function costByTypeFor(byModel, pricedIn) {
+  const out = emptyTokens();
+  // priced = { model: cost|null } from estimateCost; buildHistory passes the map it
+  // already computed for the day total so the same combined map isn't priced twice.
+  const priced = pricedIn || pricing.estimateCost(byModel, cfg.cost.rates).byModel;
+  for (const model of Object.keys(byModel || {})) {
+    if (priced[model] == null) continue; // unpriced -> skipped, matching estimateCost
+    const rate = cfg.cost.rates[model] || {};
+    const usage = byModel[model] || {};
+    for (const k of TOKEN_CLASSES) out[k] += (num(usage[k]) * num(rate[k])) / 1e6;
+  }
+  return out;
+}
+
 function buildHistory(rangeRaw) {
   const range = ['today', '7d', '30d', 'all'].includes(rangeRaw) ? rangeRaw : '7d';
   const dates = datesInRange(range);
@@ -1382,31 +1406,102 @@ function buildHistory(rangeRaw) {
     const rollup = getRollup(date);
     const tokens = emptyTokens();
     let activeMs = 0;
+    let prompts = 0;
+    let sessions = 0;
+    let tools = 0;
+    let subagents = 0;
+    const byModel = {}; // model -> { tokens, cost }
+    const byRepo = {}; // repoRoot -> { repoName, tokens, cost, activeMs, prompts, tools, subagents }
+    const byTool = {}; // tool -> count
+    const byAgentType = {}; // agentType -> count
+    const combinedByModel = {}; // model -> tokens, across all repos this day (for day cost + costByType)
+
     if (rollup && rollup.repos) {
       for (const root of Object.keys(rollup.repos)) {
         const rr = rollup.repos[root];
         addTokens(tokens, rr.tokens);
         activeMs += num(rr.activeMs);
+        prompts += num(rr.prompts);
+        sessions += Array.isArray(rr.sessions) ? rr.sessions.length : 0;
+        subagents += num(rr.subagents);
+
+        const repoTools = sumCounts(rr.byTool);
+        tools += repoTools;
+
+        const repoTokens = emptyTokens();
+        const rBM = rr.byModel || {};
+        for (const m of Object.keys(rBM)) {
+          addTokens(repoTokens, rBM[m]);
+          addTokens(combinedByModel[m] || (combinedByModel[m] = emptyTokens()), rBM[m]);
+          addTokens((byModel[m] || (byModel[m] = { tokens: emptyTokens(), cost: null })).tokens, rBM[m]);
+        }
+
+        byRepo[root] = {
+          repoName: rr.repoName != null ? rr.repoName : null,
+          tokens: repoTokens,
+          cost: null, // priced below when cost display is enabled
+          activeMs: num(rr.activeMs),
+          prompts: num(rr.prompts),
+          tools: repoTools,
+          subagents: num(rr.subagents),
+        };
+
+        const bt = rr.byTool || {};
+        for (const t of Object.keys(bt)) byTool[t] = num(byTool[t]) + num(bt[t]);
+        const bat = rr.byAgentType || {};
+        for (const ty of Object.keys(bat)) byAgentType[ty] = num(byAgentType[ty]) + num(bat[ty]);
       }
     }
-    perDay.push({ date, tokens, activeMs, cost: dayCost(rollup) });
+
+    // Cost is priced server-side (client never sees the rate table). Price the day's
+    // combined-by-model map ONCE and reuse it for both the day total and costByType,
+    // instead of re-pricing it via dayCost() + a second estimateCost inside costByTypeFor.
+    // When cost display is disabled every cost field stays null.
+    let dayTotalCost = null;
+    let costByType = null;
+    if (cfg.cost.enabled) {
+      const est = pricing.estimateCost(combinedByModel, cfg.cost.rates);
+      dayTotalCost = est.total; // combinedByModel is the same map dayCost() used to rebuild
+      costByType = costByTypeFor(combinedByModel, est.byModel);
+      for (const m of Object.keys(byModel)) byModel[m].cost = est.byModel[m] != null ? est.byModel[m] : null;
+      for (const root of Object.keys(byRepo)) {
+        byRepo[root].cost = pricing.estimateCost((rollup.repos[root] || {}).byModel || {}, cfg.cost.rates).total;
+      }
+    }
+
+    perDay.push({
+      date,
+      tokens,
+      cost: dayTotalCost,
+      costByType,
+      activeMs,
+      prompts,
+      sessions,
+      tools,
+      subagents,
+      byModel,
+      byRepo,
+      byTool,
+      byAgentType,
+    });
   }
 
   const repoAgg = aggregateReposAcrossDates(dates);
 
-  // Hour-of-day histogram. Active per hour comes from the rollup's pre-bucketed
-  // hourActive (built once in the same cached event replay that produced the per-repo
-  // active — no extra event-log scan, so this stays O(days)); it therefore matches the
-  // daily/per-repo active figures exactly. Tokens per hour come from the small usage log.
-  const byHour = Array.from({ length: 24 }, (_, hour) => ({ hour, activeMs: 0, tokens: 0 }));
+  // Day×hour punchcard: a 7×24 matrix of active ms, folding each date's pre-bucketed
+  // hourActive[24] (from the cached rollup — no extra event scan, so this stays O(days))
+  // into matrix[weekday]. weekday MUST be the date's LOCAL day-of-week: parse the
+  // YYYY-MM-DD as a local calendar date (new Date(y, m-1, d)), NOT new Date(dateStr)
+  // which parses as UTC and shifts the weekday in any non-UTC zone — and the rollup's
+  // dates and hours are both local.
+  const byDowHour = Array.from({ length: 7 }, () => new Array(24).fill(0));
   for (const date of dates) {
     const ha = getRollup(date).hourActive;
-    if (Array.isArray(ha)) for (let h = 0; h < 24; h++) byHour[h].activeMs += num(ha[h]);
-    for (const u of readJsonl(paths.usageLogPath(date))) {
-      const t = Date.parse(u.ts);
-      if (!Number.isFinite(t)) continue;
-      byHour[new Date(t).getHours()].tokens += num(u.input) + num(u.output) + num(u.cacheRead) + num(u.cacheWrite);
-    }
+    if (!Array.isArray(ha)) continue;
+    const parts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+    if (!parts) continue;
+    const weekday = new Date(Number(parts[1]), Number(parts[2]) - 1, Number(parts[3])).getDay();
+    for (let h = 0; h < 24; h++) byDowHour[weekday][h] += num(ha[h]);
   }
 
   // The FULL per-repo list for the range, sorted by active time — NOT capped here.
@@ -1428,7 +1523,7 @@ function buildHistory(rangeRaw) {
     }))
     .sort((x, y) => y.activeMs - x.activeMs);
 
-  return { range, perDay, byHour, topRepos };
+  return { range, perDay, byDowHour, topRepos };
 }
 
 // ---- HTTP -------------------------------------------------------------------
@@ -1487,7 +1582,11 @@ function serveStatic(res, pathname) {
     res.end('not found');
     return;
   }
-  res.writeHead(200, { 'Content-Type': type });
+  // no-cache so dashboard asset edits (JS/CSS/HTML) show on a normal reload instead
+  // of a stale browser copy — the daemon is local and the assets are tiny, so
+  // freshness beats caching. (serveStatic previously sent no cache directive at all,
+  // which let browsers heuristically cache styles.css across upgrades.)
+  res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache' });
   res.end(body);
 }
 

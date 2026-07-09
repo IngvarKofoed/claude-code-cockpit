@@ -3,7 +3,7 @@
 // edits config via PUT /api/config. All fetches carry the bearer token; the SSE
 // URL carries it as ?token= (EventSource can't set headers).
 
-import { barChart, lineChart, hourHeatmap } from "./charts.js";
+import { barChart, lineChart, stacked, punch, calendar } from "./charts.js";
 
 // ---- app state -------------------------------------------------------------
 
@@ -15,6 +15,8 @@ const App = {
   view: "live",
   repoRange: "all",
   histRange: "7d",
+  histData: null, // last /api/history payload — the pivot re-slices this with no refetch
+  histBuilt: false, // History view scaffolding (family cards + pivot toolbar) built once
   liveSort: "status", // "status" (server waiting-first) | "name" (alpha); set from localStorage in init
   repoRows: [], // normalized rows currently shown in the per-repo table
   repoSort: { key: "activeMs", dir: -1 }, // dir: 1 asc, -1 desc
@@ -1607,32 +1609,187 @@ function renderStorageInfo(st) {
 
 // ---- History view ----------------------------------------------------------
 
-function drawHistory(h) {
-  const perDay = (h && h.perDay) || [];
-  const byHour = (h && h.byHour) || [];
-  const topRepos = (h && h.topRepos) || [];
+// Fixed categorical palette, assigned to stacked/grouped/donut series in order.
+// An overflow ("Other") tail slice uses the muted ink so it never cycles a hue.
+const SERIES = [
+  "var(--series-1)",
+  "var(--series-2)",
+  "var(--series-3)",
+  "var(--series-4)",
+  "var(--series-5)",
+  "var(--series-6)",
+];
 
-  lineChart(
-    $("chartTokens"),
-    [{ points: perDay.map((d) => ({ label: d.date, short: dayShort(d.date), value: sumTokens(d.tokens) })) }],
-    { format: fmtTokens, empty: "No token history yet." }
-  );
-  barChart(
-    $("chartTime"),
-    perDay.map((d) => ({ label: d.date, short: dayShort(d.date), value: num(d.activeMs) })),
-    { format: fmtDuration, color: "var(--series-2)", empty: "No activity yet." }
-  );
-  hourHeatmap(
-    $("chartHour"),
-    byHour.map((x) => ({ hour: x.hour, value: num(x.activeMs) })),
-    { format: fmtDuration, empty: "No activity yet." }
-  );
-  barChart(
-    $("chartRepos"),
-    // topRepos is the full sorted list; this chart shows only the top 10 by active time.
-    topRepos.slice(0, 10).map((r) => ({ label: r.repoName || basename(r.repoRoot), value: num(r.activeMs) })),
-    { horizontal: true, format: fmtDuration, empty: "No repositories yet." }
-  );
+// Small formatter used by the History charts.
+const intFmt = (n) => String(Math.round(num(n)));
+
+// Some charts.js primitives are ported from the gallery (opts.fmt) while the
+// reused barChart/lineChart historically read opts.format; pass both so the
+// formatter lands whichever key the primitive reads.
+function fo(fmt, extra) {
+  return Object.assign({ fmt, format: fmt }, extra || {});
+}
+
+// The History view is one flat, full-width list of charts (no grouping/headers).
+// Each card's plot host is `#<id>`; drawHistory renders into it, in this order.
+const HIST_CARDS = [
+  { id: "hc-tokens-cost", title: "Tokens & cost per day" },
+  { id: "hc-tokens-cost-hour", title: "Tokens & cost per active hour" },
+  { id: "hc-tokens-chat", title: "Tokens per chat" },
+  { id: "hc-cost-type", title: "Cost per day, by type" },
+  { id: "hc-punch", title: "Day-of-week × hour", sub: "The classic punchcard" },
+  { id: "hc-calendar", title: "Calendar heatmap", sub: "Active time per day" },
+  { id: "hc-agents-type", title: "Subagents by type" },
+  { id: "hc-tool-usage", title: "Tool usage" },
+];
+
+// Parse a "YYYY-MM-DD" rollup date as a LOCAL calendar date (not UTC) so the
+// calendar heatmap's weekday columns match the daemon's local day boundaries.
+function parseLocalDate(s) {
+  const p = String(s).split("-");
+  return new Date(+p[0], +p[1] - 1, +p[2]);
+}
+
+// Avg prompt/context tokens per chat for a day: (input + cacheRead + cacheWrite) / chats
+// — the prompt-side tokens (output excluded), a proxy for typical context size per turn.
+// An ESTIMATE: a daily average across that day's sessions, not true per-message depth.
+function avgContext(d) {
+  const t = d.tokens || {};
+  const chats = num(d.prompts);
+  return chats > 0 ? (num(t.input) + num(t.cacheRead) + num(t.cacheWrite)) / chats : 0;
+}
+
+function histCats(perDay) {
+  return perDay.map((d) => ({ label: d.date, short: dayShort(d.date) }));
+}
+
+// Union of the keys of a per-day sub-map (e.g. d.byModel) across the range.
+function unionKeys(perDay, mapFn) {
+  const set = new Set();
+  perDay.forEach((d) => {
+    const m = mapFn(d) || {};
+    Object.keys(m).forEach((k) => set.add(k));
+  });
+  return [...set];
+}
+
+// Build the (full-width) chart cards once; drawHistory then fills each plot.
+function buildHistoryScaffold() {
+  if (App.histBuilt) return;
+  const card = (c) =>
+    `<div class="card"><div class="card__top"><div class="card__title">${esc(c.title)}</div>` +
+    (c.sub ? `<div class="card__sub">${esc(c.sub)}</div>` : "") +
+    `</div><div class="plot" id="${c.id}"></div></div>`;
+  $("histBody").innerHTML = `<div class="grid">${HIST_CARDS.map(card).join("")}</div>`;
+  App.histBuilt = true;
+}
+
+// ---- draw all charts -------------------------------------------------------
+
+function drawHistory(h) {
+  App.histData = h || { perDay: [], byDowHour: [], topRepos: [] };
+  buildHistoryScaffold();
+  const perDay = App.histData.perDay || [];
+  const cats = histCats(perDay);
+  const costOn = costEnabled();
+  const COST_OFF = "Cost display is off.";
+
+  // Tokens & cost per day — DUAL-AXIS (tokens left, cost right, each self-scaled), with
+  // Chats + Avg context as quiet dotted, axis-less correlation lines. Tooltip shows the
+  // real values. (Dual-axis is a deliberate, user-chosen tradeoff.)
+  {
+    const series = [
+      { name: "Tokens", color: "var(--series-1)", fmt: fmtTokens, points: perDay.map((d) => ({ label: d.date, short: dayShort(d.date), value: sumTokens(d.tokens) })) },
+    ];
+    if (costOn) {
+      series.push({ name: "Cost", color: "var(--series-2)", fmt: fmtCost, points: perDay.map((d) => ({ label: d.date, short: dayShort(d.date), value: num(d.cost) })) });
+    }
+    series.push({ name: "Chats", color: "var(--series-3)", fmt: intFmt, dot: true, noAxis: true, points: perDay.map((d) => ({ label: d.date, short: dayShort(d.date), value: num(d.prompts) })) });
+    series.push({ name: "Avg context", color: "var(--series-5)", fmt: fmtTokens, dot: true, noAxis: true, points: perDay.map((d) => ({ label: d.date, short: dayShort(d.date), value: avgContext(d) })) });
+    lineChart($("hc-tokens-cost"), series, { height: 360, empty: "No history yet." });
+  }
+
+  // Tokens & cost per active hour — same style, each day's totals ÷ that day's ACTIVE
+  // time (a per-hour burn rate). Days with 0 active time drop off the x-axis.
+  {
+    const days = perDay.filter((d) => num(d.activeMs) > 0);
+    const perHr = (v, d) => v / (num(d.activeMs) / 3600000);
+    const series = [
+      { name: "Tokens", color: "var(--series-1)", fmt: fmtTokens, points: days.map((d) => ({ label: d.date, short: dayShort(d.date), value: perHr(sumTokens(d.tokens), d) })) },
+    ];
+    if (costOn) {
+      series.push({ name: "Cost", color: "var(--series-2)", fmt: fmtCost, points: days.map((d) => ({ label: d.date, short: dayShort(d.date), value: perHr(num(d.cost), d) })) });
+    }
+    series.push({ name: "Chats", color: "var(--series-3)", fmt: intFmt, dot: true, noAxis: true, points: days.map((d) => ({ label: d.date, short: dayShort(d.date), value: num(d.prompts) })) });
+    series.push({ name: "Avg context", color: "var(--series-5)", fmt: fmtTokens, dot: true, noAxis: true, points: days.map((d) => ({ label: d.date, short: dayShort(d.date), value: avgContext(d) })) });
+    lineChart($("hc-tokens-cost-hour"), series, { height: 360, empty: "No active time yet." });
+  }
+
+  // Tokens per chat, with tools & active time per chat as quiet dotted correlation
+  // lines. Only days with ≥1 chat contribute (avoids divide-by-zero).
+  {
+    const days = perDay.filter((d) => num(d.prompts) > 0);
+    const per = (v, d) => v / num(d.prompts);
+    const series = [
+      { name: "Tokens", color: "var(--series-1)", fmt: fmtTokens, points: days.map((d) => ({ label: d.date, short: dayShort(d.date), value: per(sumTokens(d.tokens), d) })) },
+      { name: "Tools", color: "var(--series-3)", fmt: intFmt, dot: true, noAxis: true, points: days.map((d) => ({ label: d.date, short: dayShort(d.date), value: per(num(d.tools), d) })) },
+      { name: "Active", color: "var(--series-5)", fmt: fmtDuration, dot: true, noAxis: true, points: days.map((d) => ({ label: d.date, short: dayShort(d.date), value: per(num(d.activeMs), d) })) },
+    ];
+    lineChart($("hc-tokens-chat"), series, { height: 360, empty: "Not enough data yet." });
+  }
+
+  // Cost per day, by type — where spend actually lands. Output/input dominate COST even
+  // though cache-read dominates token COUNT (cache-read is ~50× cheaper per token).
+  if (!costOn) {
+    stacked($("hc-cost-type"), cats, [], fo(fmtCost, { height: 360, empty: COST_OFF }));
+  } else {
+    const classes = [["cacheRead", "Cache read"], ["input", "Input"], ["output", "Output"], ["cacheWrite", "Cache write"]];
+    const series = classes.map(([k, name], i) => ({ name, color: SERIES[i], values: perDay.map((d) => num((d.costByType || {})[k])) }));
+    stacked($("hc-cost-type"), cats, series, fo(fmtCost, { height: 360, empty: "No cost history yet." }));
+  }
+
+  // Day-of-week × hour punchcard
+  {
+    const raw = App.histData.byDowHour;
+    const matrix = Array.isArray(raw) && raw.length === 7 ? raw : Array.from({ length: 7 }, () => new Array(24).fill(0));
+    punch($("hc-punch"), matrix, fo(fmtDuration, { empty: "No activity yet." }));
+  }
+
+  // Calendar heatmap — pad leading days so dayVals[0] is the Monday of its week
+  // (charts.calendar lays cells out Monday-first; else every day lands a row off).
+  {
+    const dayVals = perDay.map((d) => ({ date: parseLocalDate(d.date), value: num(d.activeMs) }));
+    if (dayVals.length) {
+      const first = dayVals[0].date;
+      const lead = (first.getDay() + 6) % 7; // days since Monday (Mon=0 … Sun=6)
+      for (let i = 1; i <= lead; i++) {
+        const pd = new Date(first);
+        pd.setDate(first.getDate() - i);
+        dayVals.unshift({ date: pd, value: 0 });
+      }
+    }
+    calendar($("hc-calendar"), dayVals, fo(fmtDuration, { empty: "No activity yet." }));
+  }
+
+  // Subagents by type (full-width horizontal bars; each bar shows its share of total)
+  {
+    const types = unionKeys(perDay, (d) => d.byAgentType);
+    const data = types
+      .map((t) => ({ label: t, value: perDay.reduce((a, d) => a + num((d.byAgentType || {})[t]), 0) }))
+      .filter((x) => x.value > 0)
+      .sort((a, b) => b.value - a.value);
+    barChart($("hc-agents-type"), data, fo(intFmt, { horizontal: true, color: "var(--series-5)", percent: true, empty: "No subagents yet." }));
+  }
+
+  // Tool usage (full-width horizontal bars, tall so every tool gets a row)
+  {
+    const tools = unionKeys(perDay, (d) => d.byTool);
+    const data = tools
+      .map((t) => ({ label: t, value: perDay.reduce((a, d) => a + num((d.byTool || {})[t]), 0) }))
+      .filter((x) => x.value > 0)
+      .sort((a, b) => b.value - a.value);
+    barChart($("hc-tool-usage"), data, fo(intFmt, { horizontal: true, height: 480, empty: "No tool usage yet." }));
+  }
 }
 
 function loadHistory() {
@@ -1934,6 +2091,9 @@ function onConfigChanged() {
   // Refetch (not just re-render): cost is computed server-side per request, so a pricing
   // rate edit or a cost enable/disable only reaches the client's rows by re-fetching.
   if (App.view === "sessions") loadSessions(App.sessionsPage);
+  // History cost fields are computed server-side per request, so a cost enable/disable
+  // or rate edit only reaches the charts + pivot by refetching.
+  if (App.view === "history") loadHistory();
   if (App.view === "settings") maybeRenderSettings();
 }
 

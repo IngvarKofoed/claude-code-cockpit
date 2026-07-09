@@ -495,3 +495,76 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     cheap for docs/changelog. And INVOKING a named workflow (e.g. code-review) still bills every stage at
     the session model unless its scriptPath is edited to tier the checking stages down. Inert unless a
     multi-agent workflow actually runs.
+
+57. History view expanded from 4 charts to 15 in four families — Time-series, Distributions, Rhythm,
+    Efficiency ratios — plus an interactive PIVOT (one stacked chart re-decomposed live by Measure ×
+    Group-by × Normalize). Spec: docs/specs/2026-07-08-history-charts-expansion.md (v0.19.0).
+    One enriched `/api/history?range=` payload feeds all of it: each `perDay` now carries per-group
+    breakdowns (`byModel` {tokens,cost}, `byRepo`, `byTool`, `byAgentType`, `costByType`) + scalars
+    (prompts/sessions/tools/subagents), and a top-level `byDowHour` 7×24 matrix REPLACES `byHour`. The
+    pivot re-slices this in the browser — only a range change refetches. History stays off the SSE path.
+    New rollup field `byAgentType` (event-derived from `SubagentStart.agent_type`, same unconditional
+    pattern as `byTool`/`subagents`) — added on BOTH the live handleEvent branch and the boot rescan, else
+    today's per-type breakdown lags until restart. Per-day per-model AND per-token-type cost are priced
+    server-side; the day's combined map is priced ONCE and reused (dropped the redundant `dayCost`).
+    `byDowHour`/calendar weekday is computed LOCAL (new Date(y,m-1,d)), never `new Date(str)` (UTC-shifts).
+    The pivot is HONESTY-CONSTRAINED (measure-led): only attributable Measure×Group cells are selectable —
+    active/chats aren't attributable to a model/tool, tokens/cost aren't attributable to a tool/agent — so
+    an unbacked cell is absent, never a wrong zero; a group invalid under the current measure falls back to
+    Repo. Overflow past 6 series folds into a muted "Other" slice.
+    `charts.js` gained `stacked` (opt `normalize`=100% share), `grouped`, `donut`, `punch` (day×hour,
+    generalizes+replaces `hourHeatmap`), `calendar` (caller must Monday-align the days); `styles.css` gained
+    the validated categorical tokens `--series-3..6`. Distributions/ratios are pure client-side sums/ratios
+    of `perDay` (cache efficiency, burn rate, tokens/chat — divide-by-zero guarded); cost-dependent charts
+    show an empty state when cost display is off.
+    Known limit: live in-browser render/interaction was NOT verified this session (Chrome extension
+    disconnected); verified via 147 unit tests, a sandboxed daemon `/api/history` end-to-end check, and a
+    DOM-shim run of every chart primitive.
+
+58. New "Tokens & cost per day" chart at the top of the History view (above the families): a FULL-WIDTH card
+    with the title inside it (above the graph), no subtitle, the chart filling the card width and 50% taller
+    than a normal card (height 360 vs the 240 default) (v0.20.0). Two lines,
+    DUAL-AXIS: tokens on the left axis, cost on the right, each scaled to its
+    OWN range so both fill the plot and sit close; axis tick labels are colour-matched to their line and the
+    tooltip shows both real values. Dual-axis is a deliberate, user-chosen tradeoff over the honest one-axis
+    default (indexed %) dataviz prefers — the two scales are independent, so the crossing point carries no
+    meaning (noted at the call site + in charts.js).
+    `lineChart` now renders TWO series as this dual-axis chart (per-series scale/fmt/colour, left+right axes,
+    legend, one crosshair dot per series); ONE series is unchanged (single axis, area wash, no legend).
+    The History card grid became an explicit 12-column layout (normal card spans 4 = 1/3, `half` 6 = 1/2,
+    `wide` the full row; collapses 2-up ≤1100px then 1-up ≤680px), replacing the auto-fill minmax(340px) grid
+    so a card can be sized to a fraction of the row.
+
+59. Dashboard static assets (index.html / app.js / charts.js / styles.css) are now served with
+    `Cache-Control: no-cache` (v0.20.0). serveStatic previously sent NO cache directive, so browsers
+    heuristically cached styles.css / app.js across daemon upgrades — a UI edit could render with the new JS
+    but STALE CSS (e.g. a chart not filling its card) until a manual hard reload. no-cache makes an ordinary
+    reload always fetch fresh; the daemon is local and the assets are tiny, so freshness beats caching.
+
+60. Fixed History charts rendering shrunken and not filling their card (v0.20.0). `#histBody .card` reused
+    the global `.card` name (the Live-session card, which is display:flex), so History cards became flex
+    ROWS — title in a left column, chart at only its intrinsic width, the card half-empty. Root cause: a
+    class-name collision the `#histBody` scoping didn't neutralize because it never overrode `display`; now
+    `#histBody .card` sets `display: block`.
+    `lineChart` now also renders at its container's REAL pixel width (`vw(host)`) instead of a fixed 640
+    viewBox CSS-scaled to fit — so the full-width "Tokens & cost per day" hero fills the width crisply at its
+    360px height rather than aspect-scaling into a ~750px-tall giant. The fixed-geometry charts (bars/
+    stacked/donut/punch/calendar) keep the 640 grid + CSS scaling.
+
+61. History view pared to a FLAT, full-width list of 8 charts — no grouping, headers, or pivot (v0.20.0):
+    Tokens & cost per day · per active hour · Tokens per chat · Cost per day by type · Day-of-week × hour ·
+    Calendar heatmap · Subagents by type · Tool usage.
+    The three "Tokens & …" line charts are DUAL-AXIS (tokens left, cost right, each self-scaled) with quiet
+    DOTTED, axis-less correlation lines — Chats + Avg context on the per-day/per-hour ones, Tools + Active on
+    per-chat — read for shape, real values in the tooltip. `lineChart` gained per-series `noAxis` (a
+    self-scaled line with no tick axis) and `dash`/`dot` styling; `avgContext` = (input+cacheRead+cacheWrite)
+    /chats (prompt-side tokens per turn, an estimate).
+    Cost-by-type REPLACED tokens-by-type: token counts are ~all cache-read (a flat one-band chart), but COST
+    splits meaningfully because output is ~50× cache-read per token — so the cost split is where the signal
+    is for single-model, cache-heavy usage.
+    REMOVED as low-signal for that usage: the Measure×Group pivot, the family grouping, and the small
+    distribution/efficiency charts (cost/day, cost-by-model, active-by-repo, cumulative cost, chats&sessions,
+    model share, cache efficiency, cost/active-hour) — model/token breakdowns are trivial with one model and
+    cache-efficiency sits at ~100%. The daemon still emits every breakdown, so they're re-addable.
+    `barChart` now auto-sizes its label gutter to the longest category name (capped) and takes an optional
+    per-bar `%`-of-total; `barChart`/`stacked` (like `lineChart`) render at the card's real pixel width.

@@ -813,6 +813,50 @@ test('accumulateActiveFromEvents: tallies per-repo subagent count from SubagentS
   assert.strictEqual(rollup.repos['/code/acme-api'].subagents, 2); // 2 spawned (stop doesn't reduce it)
 });
 
+test('accumulateActiveFromEvents: tallies byAgentType per agent_type, per repo', () => {
+  const events = [
+    ev('SessionStart', { ts: '2026-07-02T10:00:00.000Z' }),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('SubagentStart', { ts: '2026-07-02T10:00:01.000Z', agent_type: 'Explore' }),
+    ev('SubagentStart', { ts: '2026-07-02T10:00:02.000Z', agent_type: 'Explore' }),
+    ev('SubagentStart', { ts: '2026-07-02T10:00:03.000Z', agent_type: 'workflow-subagent' }),
+    ev('SubagentStop', { ts: '2026-07-02T10:00:09.000Z' }), // stop does NOT decrement the cumulative count
+    ev('Stop', { ts: '2026-07-02T10:00:10.000Z' }),
+    // A second repo/session tallies into its own byAgentType bucket.
+    { ts: '2026-07-02T10:00:00.000Z', event: 'UserPromptSubmit', session_id: 'b', repo_root: '/code/other', repo_name: 'other', prompt_id: 'p1' },
+    { ts: '2026-07-02T10:00:01.000Z', event: 'SubagentStart', session_id: 'b', repo_root: '/code/other', repo_name: 'other', agent_type: 'Review' },
+    { ts: '2026-07-02T10:00:02.000Z', event: 'Stop', session_id: 'b', repo_root: '/code/other', repo_name: 'other' },
+  ];
+  const rollup = accumulateActiveFromEvents(createRollup('2026-07-02'), events);
+  assert.deepStrictEqual(rollup.repos['/code/acme-api'].byAgentType, { Explore: 2, 'workflow-subagent': 1 });
+  assert.deepStrictEqual(rollup.repos['/code/other'].byAgentType, { Review: 1 });
+});
+
+test('accumulateActiveFromEvents: byAgentType ignores a SubagentStart with no agent_type', () => {
+  const events = [
+    ev('SessionStart', { ts: '2026-07-02T10:00:00.000Z' }),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('SubagentStart', { ts: '2026-07-02T10:00:01.000Z' }), // no agent_type -> not tallied
+    ev('SubagentStart', { ts: '2026-07-02T10:00:02.000Z', agent_type: 'Explore' }),
+    ev('Stop', { ts: '2026-07-02T10:00:10.000Z' }),
+  ];
+  const rollup = accumulateActiveFromEvents(createRollup('2026-07-02'), events);
+  // The type-less SubagentStart still bumps the plain subagents count, but not byAgentType.
+  assert.strictEqual(rollup.repos['/code/acme-api'].subagents, 2);
+  assert.deepStrictEqual(rollup.repos['/code/acme-api'].byAgentType, { Explore: 1 });
+});
+
+test('accumulateActiveFromEvents: byAgentType is {} when a repo has no subagents', () => {
+  const events = [
+    ev('SessionStart', { ts: '2026-07-02T10:00:00.000Z' }),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:01.000Z', tool_name: 'Bash' }),
+    ev('Stop', { ts: '2026-07-02T10:00:04.000Z' }),
+  ];
+  const rollup = accumulateActiveFromEvents(createRollup('2026-07-02'), events);
+  assert.deepStrictEqual(rollup.repos['/code/acme-api'].byAgentType, {});
+});
+
 test('accumulateActiveFromEvents: byTool counts a PreToolUse even when activeDelta is 0 (unconditional)', () => {
   // A PreToolUse fired from an idle session settles activeDelta === 0 (there was no
   // prior engaged span to close), yet byTool must still count it — the deliberate
