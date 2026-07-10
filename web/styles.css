@@ -234,12 +234,15 @@ body {
 }
 .tile--alert .tile__value { color: var(--st-waiting); }
 
-/* Active-subscription chip: a full-width row so it sits on its own line above the
-   usage bars without warping the tile grid columns. Uses the plain, muted .chip look
-   (context, not an alert) — no dedicated colour treatment. */
-.sub-chip-row {
-  grid-column: 1 / -1;
-  margin-top: -2px;
+/* The active-subscription tile shows a NAME, not a number: keep it on one line, ellipsize a
+   long name so it never overflows the tile, and size it a touch smaller than the numeric stat
+   values so it reads as an identity label rather than a metric. */
+.tile--sub .tile__value {
+  font-size: 22px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* ---------- Live usage bars (session 5h + weekly, from the statusline) ---------- */

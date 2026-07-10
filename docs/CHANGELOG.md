@@ -661,3 +661,27 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     `subscriptionLabelPattern`) and every cost figure — so without it an already-open dashboard kept
     showing stale labels/costs until the next event or a reload. Found in browser verification:
     editing the label pattern didn't relabel the Live chip live; now it does.
+
+70. Turns with NO known subscription are now EXCLUDED from the per-subscription breakdown (v0.24.0):
+    the `'unknown'` bucket is gone, dropped at the `aggregate.addBySubscription` source (`subId==null`
+    → skip), so it vanishes from `subscriptionTotals`, the History chart, and per-repo `bySubscription`
+    at once (past days recompute, no migration). Scoped to the subscription DIMENSION only — those
+    tokens/cost still count in repo totals via `addByModel`, so a split can sum to LESS than the total.
+
+71. History subscription chart reworked (v0.24.0): the "Tokens & cost per subscription" BARS became a
+    "Cost per subscription" LINE chart — one line per subscription over days (shared $ axis, tokens in
+    tooltip), moved up under "Tokens & cost per day". `buildHistory` now emits a priced per-day
+    `bySubscription` on each `perDay` (was top-level range-aggregate only); `lineChart` gained `sharedScale`
+    (N same-unit lines, one axis + legend, no area wash) + per-point `value2`/`fmt2`. >6 subs fold to "Other".
+
+72. The "Cost per subscription" card is HIDDEN unless the range has 2+ subscriptions with token activity
+    (v0.24.0) — with one, its line just restates "Tokens & cost per day", so the whole card is removed
+    (`display:none`), not emptied; re-evaluated each draw. With cost ON it also needs one nonzero cost (an
+    all-unpriced range → hidden, not an empty chart on a visible card; an unpriced sub among priced ones
+    still plots a flat $0 line). Cost OFF shows the standard cost-off placeholder.
+
+73. The active subscription now leads the Live ribbon as a proper **Subscription** tile (name, e.g.
+    "Phoenix"), replacing the small muted chip that sat on its own near-empty row (v0.24.0). It's an
+    identity tile — outside the canonical accounting-stat order, first — and is omitted when no live
+    session has a known subscription (API-key / pre-feature). All-time tokens/cost stay in its tooltip;
+    a long name ellipsizes (value is a name, sized below the numeric tiles).

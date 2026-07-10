@@ -1004,17 +1004,14 @@ function tickUsage(now) {
   advanceUsageBars(now);
 }
 
-// The "active subscription" chip: which subscription the newest live session is on
-// (server-derived, `App.state.subscription = { id, label } | null`). Hidden entirely
-// when null (no live session with a captured subscription — e.g. pre-feature sessions,
-// an API-key session, or before the daemon ships this field). Muted, like the other
-// ribbon chips — this is context, not an alert. Full-width row so it sits on its own
-// line above the usage bars without warping the tile grid.
-// The tooltip carries this subscription's ALL-TIME total (tokens + cost, from
-// `App.state.subscriptionTotals[sub.id]` — a range-free total distinct from the
-// History chart's range-scoped breakdown, per the spec's Design C), falling back to
-// the plain description when totals aren't available yet (e.g. right after startup).
-function subscriptionChipHTML() {
+// The active subscription rendered as a leading ribbon TILE (matching the stat tiles) — it
+// identifies whose account the row's totals belong to (server-derived, `App.state.subscription =
+// { id, label } | null`). Returns "" when null — no live session has a known subscription
+// (API-key / pre-feature) — so the tile just doesn't appear rather than showing a blank. The
+// tooltip carries this subscription's ALL-TIME tokens/cost (`App.state.subscriptionTotals[sub.id]`,
+// a range-free total distinct from the History chart's range-scoped breakdown), falling back to the
+// plain description before totals are available. Its value is a name, not a stat.
+function subscriptionTileHTML() {
   const sub = App.state && App.state.subscription;
   if (!sub || !sub.label) return "";
   const totals = App.state && App.state.subscriptionTotals && App.state.subscriptionTotals[sub.id];
@@ -1024,8 +1021,9 @@ function subscriptionChipHTML() {
     if (typeof totals.cost === "number" && Number.isFinite(totals.cost)) title += `, ${fmtCost(totals.cost)}`;
   }
   return (
-    `<div class="sub-chip-row">` +
-    `<span class="chip" title="${esc(title)}">${esc(sub.label)}</span>` +
+    `<div class="tile tile--sub" title="${esc(title)}">` +
+    `<div class="tile__label">Subscription</div>` +
+    `<div class="tile__value">${esc(sub.label)}</div>` +
     `</div>`
   );
 }
@@ -1061,9 +1059,14 @@ function renderLiveRibbon() {
       hasCost = true;
     }
   }
-  // Order: Tokens | Cost | Sessions | Chats | Tools | Agents | Active time. Cost sits
-  // second (after Tokens) and drops out (leaving the rest in order) when disabled.
-  const tiles = [tile("Tokens", fmtTokens(tok))];
+  // Lead with the active-subscription tile (identity for the row's totals; omitted when no live
+  // session has a known subscription), then the accounting tiles in the canonical order:
+  // Tokens | Cost | Sessions | Chats | Tools | Agents | Active time. Cost sits after Tokens and
+  // drops out (leaving the rest in order) when disabled.
+  const tiles = [];
+  const subTile = subscriptionTileHTML();
+  if (subTile) tiles.push(subTile);
+  tiles.push(tile("Tokens", fmtTokens(tok)));
   if (costEnabled()) tiles.push(tile("Cost", hasCost ? fmtCost(cost) : "—"));
   tiles.push(tile("Sessions", sessionsToday));
   tiles.push(tile("Chats", chats));
@@ -1071,7 +1074,7 @@ function renderLiveRibbon() {
   tiles.push(tile("Agents", agents));
   tiles.push(tile("Active time", fmtDuration(activeMs)));
   // The usage block is a full-width row that flows below the tiles inside the ribbon grid.
-  $("liveRibbon").innerHTML = tiles.join("") + subscriptionChipHTML() + usageBlockHTML(estNow());
+  $("liveRibbon").innerHTML = tiles.join("") + usageBlockHTML(estNow());
   bindUsage();
   advanceUsageBars(estNow()); // fill the delta chips (empty in the shell) + paint now
 }
@@ -1779,6 +1782,7 @@ function fo(fmt, extra) {
 // Each card's plot host is `#<id>`; drawHistory renders into it, in this order.
 const HIST_CARDS = [
   { id: "hc-tokens-cost", title: "Tokens & cost per day" },
+  { id: "hc-sub-usage", title: "Cost per subscription" },
   { id: "hc-tokens-cost-hour", title: "Tokens & cost per active hour" },
   { id: "hc-tokens-chat", title: "Tokens per chat" },
   { id: "hc-cost-type", title: "Cost per day, by type" },
@@ -1786,7 +1790,6 @@ const HIST_CARDS = [
   { id: "hc-calendar", title: "Calendar heatmap", sub: "Active time per day" },
   { id: "hc-agents-type", title: "Subagents by type" },
   { id: "hc-tool-usage", title: "Tool usage" },
-  { id: "hc-sub-usage", title: "Tokens & cost per subscription" },
 ];
 
 // Parse a "YYYY-MM-DD" rollup date as a LOCAL calendar date (not UTC) so the
@@ -1943,23 +1946,77 @@ function drawHistory(h) {
     barChart($("hc-tool-usage"), data, fo(intFmt, { horizontal: true, height: 480, empty: "No tool usage yet." }));
   }
 
-  // Tokens & cost per subscription (horizontal bars, sorted by tokens; each bar's
-  // trailing text also shows that subscription's cost). Cost-dependent like "Cost per
-  // day, by type" — hidden behind the empty state when cost display is off, even though
-  // tokens alone would still be knowable, per the canonical Tokens·Cost pairing.
-  // `App.histData.bySubscription` is a TOP-LEVEL, range-aggregated map keyed by
-  // subscription id — { [id]: { label, tokens, cost } } — built server-side by
-  // buildHistory's mergeBySubscription + priceSubscriptionMap; it is NOT a per-day field
-  // (perDay entries carry no bySubscription breakdown).
-  if (!costOn) {
-    barChart($("hc-sub-usage"), [], fo(fmtTokens, { horizontal: true, empty: COST_OFF }));
-  } else {
+  // Cost per subscription, by day — ONE line per subscription, all on a shared $ axis so
+  // the subscriptions compare directly; each point's tokens ride in the tooltip. Sits right
+  // under "Tokens & cost per day" and matches its 360px height. Cost-dependent like the other
+  // cost charts, so it shows the cost-off empty state when cost display is off.
+  // `App.histData.bySubscription` is the TOP-LEVEL range aggregate — { [id]: { label, tokens,
+  // cost } } — used here only for the ORDERED set of subscriptions + their labels/colours; each
+  // line's daily values come from `perDay[i].bySubscription` (a per-day { [id]: { label, tokens,
+  // cost } } map that buildHistory now emits). Overflow past the 6-colour palette folds into a
+  // single muted "Other" line.
+  {
     const bySub = App.histData.bySubscription || {};
-    const data = Object.keys(bySub)
-      .map((id) => ({ label: bySub[id].label || id, value: sumTokens(bySub[id].tokens), value2: num(bySub[id].cost) }))
-      .filter((x) => x.value > 0)
-      .sort((a, b) => b.value - a.value);
-    barChart($("hc-sub-usage"), data, fo(fmtTokens, { horizontal: true, fmt2: fmtCost, color: "var(--series-4)", empty: "No subscription history yet." }));
+    // Include any subscription with token ACTIVITY in the range (not cost>0): a subscription
+    // whose usage is entirely on an unpriced/unlisted model has cost 0, and filtering on cost
+    // would silently drop it from the chart though it has real usage everywhere else. It still
+    // plots (a flat $0 line) — matching the old bars' tokens>0 filter. Ordered by cost desc
+    // (the chart's measure); unpriced subs sort to the end and fold into "Other" first.
+    const ids = Object.keys(bySub)
+      .filter((id) => sumTokens(bySub[id].tokens) > 0)
+      .sort((a, b) => num(bySub[b].cost) - num(bySub[a].cost));
+    // Show this card only when the range has MULTIPLE subscriptions with activity — with one,
+    // its single line just restates "Tokens & cost per day". When cost display is ON also require
+    // at least one nonzero cost: an all-unpriced range has no cost signal, so HIDE it rather than
+    // render an empty "no history" chart on a visible card. When cost is OFF still show the card as
+    // the standard cost-off placeholder (like the sibling cost charts). Re-evaluated each draw, so
+    // switching range reveals/hides it. Toggling display (not an early return from drawHistory)
+    // keeps this block self-contained and robust to any chart added after it.
+    const hasCost = ids.some((id) => num(bySub[id].cost) > 0);
+    const show = ids.length >= 2 && (!costOn || hasCost);
+    const card = $("hc-sub-usage").closest(".card");
+    if (card) card.style.display = show ? "" : "none";
+    if (show && !costOn) {
+      lineChart($("hc-sub-usage"), [], { height: 360, empty: COST_OFF });
+    } else if (show) {
+      const PAL = ["var(--series-1)", "var(--series-2)", "var(--series-3)", "var(--series-4)", "var(--series-5)", "var(--series-6)"];
+      // Keep the top (PAL.length − 1) named and fold the rest into "Other"; if they all fit, keep all.
+      const named = ids.length > PAL.length ? ids.slice(0, PAL.length - 1) : ids;
+      const rest = ids.slice(named.length);
+      // A subscription with token activity but no configured rate has cost 0; since some other
+      // shown subscription has cost (the `hasCost` gate above), it isn't dropped — it plots as a
+      // flat $0 line rather than vanishing.
+      const pt = (d, id) => {
+        const rec = (d.bySubscription || {})[id];
+        return { label: d.date, short: dayShort(d.date), value: rec ? num(rec.cost) : 0, value2: rec ? sumTokens(rec.tokens) : 0 };
+      };
+      const series = named.map((id, i) => ({
+        name: bySub[id].label || id,
+        color: PAL[i],
+        fmt: fmtCost,
+        fmt2: fmtTokens,
+        points: perDay.map((d) => pt(d, id)),
+      }));
+      if (rest.length) {
+        series.push({
+          name: "Other",
+          color: "var(--ink-2)",
+          fmt: fmtCost,
+          fmt2: fmtTokens,
+          // Fold the overflow subscriptions per day via the SAME pt() extraction the named
+          // lines use, so the Other line can't diverge from them on a future field change.
+          points: perDay.map((d) =>
+            rest.reduce((acc, id) => {
+              const p = pt(d, id);
+              acc.value += p.value;
+              acc.value2 += p.value2;
+              return acc;
+            }, { label: d.date, short: dayShort(d.date), value: 0, value2: 0 })
+          ),
+        });
+      }
+      lineChart($("hc-sub-usage"), series, { height: 360, sharedScale: true, empty: "No subscription history yet." });
+    }
   }
 }
 

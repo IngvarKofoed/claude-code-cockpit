@@ -224,12 +224,16 @@ export function lineChart(host, series, opts) {
 
   const W = vw(host); // render at the card's real width (shadows the module fallback)
   const fmt = opts.format || opts.fmt || commas; // fallback y formatter
-  const dual = series.length > 1; // 2+ series => each scaled to its own range
+  // sharedScale: N same-UNIT series share ONE scale + one (left) axis, so the lines are
+  // directly comparable (the per-subscription cost lines). Otherwise 2+ series are dual-axis
+  // (each self-scaled to its own range); a lone series keeps its single-axis area style.
+  const shared = opts.sharedScale === true;
+  const dual = series.length > 1 && !shared;
   // Axis-bearing series (those without `noAxis`) claim the left/right tick scales; a
   // `noAxis` series is still drawn + self-scaled to fill the plot, but labels no axis.
   const axisIdx = series.map((_s, i) => i).filter((i) => !series[i].noAxis);
   const leftI = axisIdx.length ? axisIdx[0] : 0;
-  const rightI = axisIdx.length > 1 ? axisIdx[1] : -1;
+  const rightI = !shared && axisIdx.length > 1 ? axisIdx[1] : -1; // no right axis in shared mode
   const hasRight = rightI >= 0;
   const H = opts.height || 240;
   const ml = 46, mr = hasRight ? 54 : 14, mt = 12, mb = 26;
@@ -238,9 +242,14 @@ export function lineChart(host, series, opts) {
   styleTicks(svg);
 
   const n = Math.max(...series.map((s) => s.points.length));
-  // Per-series scale in dual mode (each fills the plot); one shared scale otherwise.
-  const scales = series.map((s) => niceScale(Math.max(...s.points.map((p) => p.value || 0), 0)));
-  const scaleFor = (si) => (dual ? scales[si] : scales[0]);
+  // Per-series scale in dual mode (each fills the plot). In shared mode one scale spans the
+  // max across ALL series so every line reads on the same axis; single-series uses its own.
+  // Per-series scales feed dual mode (each axis) and the single-series case (scales[0]); shared
+  // mode uses only sharedScaleObj, so each computes exactly what it needs and skips the other's
+  // per-point max scan.
+  const scales = shared ? null : series.map((s) => niceScale(Math.max(...s.points.map((p) => p.value || 0), 0)));
+  const sharedScaleObj = shared ? niceScale(Math.max(...series.flatMap((s) => s.points.map((p) => p.value || 0)), 0)) : null;
+  const scaleFor = (si) => (dual ? scales[si] : shared ? sharedScaleObj : scales[0]);
   const xAt = (i) => (n === 1 ? ml + pw / 2 : ml + (pw / (n - 1)) * i);
   const yAt = (si, v) => mt + ph - (v / scaleFor(si).max) * ph;
 
@@ -274,8 +283,9 @@ export function lineChart(host, series, opts) {
     const pts = s.points;
     const m = pts.length;
     const line = pts.map((p, i) => `${i ? "L" : "M"}${xAt(i)},${yAt(si, p.value)}`).join("");
-    if (!dual) {
-      // area wash under a lone line (10% opacity, per mark spec)
+    if (!dual && series.length === 1) {
+      // area wash under a LONE line (10% opacity, per mark spec) — skipped for multiple
+      // shared-scale lines, where overlapping washes would muddy the comparison.
       svg.appendChild(el("path", { d: line + `L${xAt(m - 1)},${mt + ph}L${xAt(0)},${mt + ph}Z`, fill: color, "fill-opacity": 0.1 }));
     }
     const dashArr = s.dash ? "5 4" : s.dot ? "1 6" : null; // dot = fine round-capped dots
@@ -301,8 +311,10 @@ export function lineChart(host, series, opts) {
     const parts = series.map((s, si) => {
       const p = s.points[Math.min(i, s.points.length - 1)];
       dots[si].setAttribute("cx", xAt(i)); dots[si].setAttribute("cy", yAt(si, p.value)); dots[si].setAttribute("opacity", 1);
-      const shown = s.fmt ? s.fmt(p.value) : fmt(p.value);
-      return dual && s.name ? `${s.name} ${shown}` : shown;
+      let shown = s.fmt ? s.fmt(p.value) : fmt(p.value);
+      // Optional secondary value per point (e.g. tokens beside a cost line), shown in parens.
+      if (s.fmt2 && p.value2 != null) shown += ` (${s.fmt2(p.value2)})`;
+      return (dual || shared) && s.name ? `${s.name} ${shown}` : shown;
     });
     showTip(base[Math.min(i, base.length - 1)].label, parts.join("  ·  "));
     moveTip(e);
@@ -310,7 +322,7 @@ export function lineChart(host, series, opts) {
   hit.addEventListener("mouseleave", () => { cross.setAttribute("opacity", 0); dots.forEach((d) => d.setAttribute("opacity", 0)); hideTip(); });
   svg.appendChild(hit);
   host.replaceChildren(svg);
-  if (dual && series.some((s) => s.name)) appendLegend(host, series.map((s) => ({ name: s.name, color: s.color || "var(--series-1)" })));
+  if ((dual || shared) && series.some((s) => s.name)) appendLegend(host, series.map((s) => ({ name: s.name, color: s.color || "var(--series-1)" })));
 }
 
 // ---- stacked bars (vertical, one segment per series; opts.normalize = 100% share) ----

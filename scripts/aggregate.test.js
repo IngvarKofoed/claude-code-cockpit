@@ -1049,14 +1049,26 @@ test('bySubscription: two subscriptions on one repo stay separate', () => {
   assert.strictEqual(r.repos['/r'].byModel.m.input, 107);
 });
 
-test('bySubscription: a turn with no subId buckets under "unknown"', () => {
+test('bySubscription: a turn with no subId is EXCLUDED from the breakdown (no "unknown" bucket)', () => {
   const r = accumulateTurnByModel(createRollup('2026-07-02'), {
     repoRoot: '/r', repoName: 'r', byModel: { m: T({ input: 3 }) }, ts: '2026-07-02T10:00:00.000Z',
   });
-  const sub = r.repos['/r'].bySubscription.unknown;
-  assert.ok(sub); // present under the sentinel key
-  assert.strictEqual(sub.name, 'unknown'); // no subName -> falls back to the key
-  assert.strictEqual(sub.byModel.m.input, 3);
+  // No subscription bucket at all — the null-sub dimension is dropped so per-subscription
+  // stats/graphs show only real, attributed subscriptions.
+  assert.deepStrictEqual(r.repos['/r'].bySubscription, {});
+  // ...but the tokens STILL count in the repo's overall total (only the subscription split drops them).
+  assert.strictEqual(r.repos['/r'].byModel.m.input, 3);
+  assert.strictEqual(r.repos['/r'].tokens.input, 3);
+});
+
+test('bySubscription: unattributed turns do not dilute an attributed subscription on the same repo', () => {
+  let r = accumulateTurnByModel(createRollup('2026-07-02'), {
+    repoRoot: '/r', repoName: 'r', subId: 'org-1', subName: 'FOSS', byModel: { m: T({ input: 100 }) }, ts: '2026-07-02T10:00:00.000Z',
+  });
+  r = accumulateTurnByModel(r, { repoRoot: '/r', repoName: 'r', byModel: { m: T({ input: 40 }) }, ts: '2026-07-02T10:01:00.000Z' });
+  assert.deepStrictEqual(Object.keys(r.repos['/r'].bySubscription), ['org-1']); // only the known sub
+  assert.strictEqual(r.repos['/r'].bySubscription['org-1'].byModel.m.input, 100); // unchanged by the null-sub turn
+  assert.strictEqual(r.repos['/r'].byModel.m.input, 140); // repo total includes both
 });
 
 test('accumulateTokensByModel (backfill) also folds bySubscription (from the usage record)', () => {

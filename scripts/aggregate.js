@@ -429,7 +429,7 @@ function ensureRepo(rollup, repoRoot, repoName) {
       // subId -> { name, byModel } — the same per-model token split as byModel, but
       // partitioned by the SESSION's captured subscription (raw base name kept for
       // read-time labelling). Mirrors byModel/byRepo; priced server-side. A turn with
-      // no known subscription buckets under the 'unknown' key. See addBySubscription.
+      // no known subscription is EXCLUDED (no 'unknown' bucket). See addBySubscription.
       bySubscription: {},
       byTool: {}, // toolName -> count, tallied from PreToolUse (event-derived, unconditional)
       byAgentType: {}, // agentType -> count, tallied from SubagentStart.agent_type (event-derived, unconditional)
@@ -487,11 +487,17 @@ function addByModel(repo, byModel) {
 // Fold a turn's per-model token map into the repo's per-SUBSCRIPTION breakdown, under
 // the session's captured subscription id (turn.subId) + raw base name (turn.subName,
 // sourced from the session by the daemon caller — raw, NOT the patterned label, so the
-// label stays a read-time transform). A turn with no known subscription buckets under
-// 'unknown'. Called from BOTH turn accumulators so attribution is identical on the live
-// and backfill paths (a backfill turn reads u.subscription off its usage record).
+// label stays a read-time transform). Called from BOTH turn accumulators so attribution
+// is identical on the live and backfill paths (a backfill turn reads u.subscription off
+// its usage record).
+// A turn with NO known subscription (pre-feature / API-key / capture failed) is EXCLUDED
+// from the per-subscription breakdown — no 'unknown' bucket — so per-subscription stats
+// and the History chart show only real, attributed subscriptions. Its tokens/cost still
+// count in the repo's overall totals via addByModel; only the subscription dimension
+// drops it. (This means a bySubscription split can sum to LESS than the repo total.)
 function addBySubscription(repo, turn) {
-  const subId = turn.subId != null ? turn.subId : 'unknown';
+  if (turn.subId == null) return;
+  const subId = turn.subId;
   const rec = repo.bySubscription[subId] || (repo.bySubscription[subId] = { name: null, byModel: {} });
   // Keep the latest known raw name; fall back to an earlier one, then to the id itself,
   // so a record always carries a non-null name to label.
