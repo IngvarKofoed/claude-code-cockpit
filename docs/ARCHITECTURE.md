@@ -117,7 +117,7 @@ Every command is `node "${CLAUDE_PLUGIN_ROOT}/scripts/emit.js"`, except `Session
 
 | Event | Why we listen | Drives |
 | --- | --- | --- |
-| `SessionStart` | Register session; capture `source`, `model`, `cwd` | Session created; also triggers `ensure.js` |
+| `SessionStart` | Register session; capture `source`, `model`, `cwd`, subscription | Session created; also triggers `ensure.js`; subscription sourced from `~/.claude.json` `oauthAccount` (durable, replay-safe) |
 | `UserPromptSubmit` | A prompt begins (has `prompt_id`) | Status → `running`; start prompt timer |
 | `PreToolUse` (`emit.js`) | Claude is about to use a tool (`tool_name`) | Live activity ("running Bash", "editing…") |
 | `PreToolUse` (`gate.js`) | Blocking pause gate | Reads control file; blocks tool if paused and `pauseGateEnabled` |
@@ -159,6 +159,7 @@ The daemon is *not* on the hook's critical path: the log is the durable source o
   "permission_mode": "default",
   "effort_level": "medium",
   "model": "claude-sonnet-5",
+  "sub": { "id": "org-uuid", "orgType": "…", "displayName": "…", "email": "…" },
   "tool_name": "Bash",
   "notification_type": "permission_prompt",
   "stop_reason": "end_turn",
@@ -174,8 +175,8 @@ The daemon is *not* on the hook's critical path: the log is the durable source o
 
 **Derived time-series & rollups (daemon-owned).** The event log above is hook-written (many short-lived processes appending concurrently — see the append-safety note above). The daemon owns two further stores, so each has exactly **one writer** and there is no cross-process contention:
 
-- `stateDir/usage/YYYY-MM-DD.jsonl` — one **timestamped token-usage record per closed turn**: `{ ts, session_id, repo_root, model, input, output, cacheRead, cacheWrite }`, written when the daemon computes a turn's token delta at `Stop`. This is what makes *tokens-over-time* graphs possible; the live totals alone hold only current sums. (Tokens/prompts/cost derive from this log; **active time does not** — see *Active-time accounting*.)
-- `stateDir/rollups/YYYY-MM-DD.json` — a **materialized daily aggregate** per repo (active ms, prompt/session counts, tokens by model, estimated cost), updated incrementally as events and usage records arrive. A repo tracks two session id sets: `sessions` (every session observed via the event log) and `tokenSessions` (the subset that actually spent tokens, from the usage log). The reported **session count is their intersection** (`aggregate.countedSessions`), so a 0-token session (opened, never worked) is excluded everywhere counts appear (Repos, History, Live ribbon) — while a backfill-only session (tokens but no events) still contributes tokens/cost but no session count, as before.
+- `stateDir/usage/YYYY-MM-DD.jsonl` — one **timestamped token-usage record per closed turn**: `{ ts, session_id, repo_root, subscription, subscriptionName, model, input, output, cacheRead, cacheWrite }`, written when the daemon computes a turn's token delta at `Stop`. The `subscription` field is the session's captured organizational id (subscription key), or null for pre-feature/API-key sessions; `subscriptionName` is the raw base name persisted alongside it, so a **recomputed past day keeps a real label** (not just the id) even when that subscription never appears on the live path within the aggregated range. This is what makes *tokens-over-time* graphs possible; the live totals alone hold only current sums. (Tokens/prompts/cost derive from this log; **active time does not** — see *Active-time accounting*.)
+- `stateDir/rollups/YYYY-MM-DD.json` — a **materialized daily aggregate** per repo (active ms, prompt/session counts, tokens by model, estimated cost), updated incrementally as events and usage records arrive. A repo tracks two session id sets: `sessions` (every session observed via the event log) and `tokenSessions` (the subset that actually spent tokens, from the usage log). The reported **session count is their intersection** (`aggregate.countedSessions`), so a 0-token session (opened, never worked) is excluded everywhere counts appear (Repos, History, Live ribbon) — while a backfill-only session (tokens but no events) still contributes tokens/cost but no session count, as before. Each repo's record also carries `bySubscription` (breakdown by subscription id, keyed by organizational uuid), per-subscription tokens by model (priced server-side like per-repo), enabling per-subscription stats and History charts.
 
 **Manual data management (daemon-owned deletes).** Three authenticated endpoints let the dashboard report and reclaim disk, replacing the removed auto-pruner:
 
@@ -256,6 +257,10 @@ Mitigations, all concentrated in `transcript.js` behind a stable internal interf
 
 A pure function over a **configurable pricing table**: `model → { input, output, cacheRead, cacheWrite }` in USD per million tokens. `cost = Σ tokens × rate`, always labelled an **estimate**. Config can override rates, change currency, or disable cost display entirely. An **unknown model** renders as `—` (never `$0`) with a "no rate configured" note, so missing rates are visible rather than silently wrong.
 
+## Rate-limit usage bars (subscription-filtered)
+
+The Live 5h and weekly usage bars are fed only by the statusline forwarder's `POST /internal/usage` (entry 42). When a rate-limit push arrives, `handleInternalUsage` checks whether the pushing session's captured `subscription.id` matches the **current subscription** (the newest live session's subscription, a pure state function). If the push is from an OLD subscription after a switch, it is **dropped** (no bar update) — eliminating the cross-subscription clobber that occurs when old sessions' statuslines lag. **Fail-open:** if either subscription is unknown (pre-feature session, API-key session, captured or current), the push is accepted as today's activity — the feature never makes the bar worse than the current last-write-wins baseline. The bar is implicitly per-subscription now: after a switch, the new subscription's bar updates correctly as new sessions report, while old sessions' late pushes are silently dropped.
+
 ## Notifications & sounds
 
 **OS notifications are emitted by the daemon, not by the browser** — this is the crux of the design. The daemon is the always-on component (spawned and revived by `SessionStart`, so it is up during any active session), whereas the dashboard is a purely optional client. Consequently the OS-notification path — and its sound — works **whether or not a browser tab is open**. We deliberately do *not* use the browser's Web Notifications API for this, because that would only fire when a tab happened to be open, defeating ambient awareness. In-browser Web Audio cues are the only notification channel that requires an open tab.
@@ -312,11 +317,14 @@ Reuses the notifier's `paths.js` / `config.js` pattern with `APP_NAME = "claude-
       "claude-sonnet-5": { "input": 3, "output": 15, "cacheRead": 0.3, "cacheWrite": 3.75 }
     }
   },
+  "subscriptionLabelPattern": "\\(([^)]+)\\)",
   "idleShutdownHours": 0
 }
 ```
 
 **All configuration is edited in the dashboard's Settings view** (see above), through `GET`/`PUT /api/config`. There is intentionally **no TTY wizard** — the UI is the single, discoverable place to change settings, which is why the `prompts` dependency and a `/cockpit:configure` command are absent from this design. `config.json` remains a plain, hand-editable file as a fallback for headless setups, but the dashboard is the intended editor. `config.js` owns read / merge / **validate** / write so that both the daemon's boot-time load and the `PUT /api/config` handler share one schema and one set of defaults; an invalid `PUT` is rejected and the on-disk config is left untouched.
+
+**`subscriptionLabelPattern`** (string, default `\(([^)]+)\)`) is a regex pattern used to extract a clean label from a subscription name at payload-build time (never at capture or storage). The pattern's **capture group 1** (if present) or group 0 (whole match) is used; no match, empty pattern, or a regex compilation error returns the name unchanged — so a label is never blank and a bad pattern can't break the UI. The default extracts the contents of the first parenthesized group, so `"FOSS Analytical (Lyra)"` renders as `"Lyra"` out of the box. A name without parentheses simply doesn't match and falls back to the raw name. Setting the field to `""` disables extraction. Because the pattern is applied at read time only, changing it relabels every surface immediately without touching stored records.
 
 ## Commands (`commands/*.md`)
 

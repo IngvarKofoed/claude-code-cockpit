@@ -147,7 +147,14 @@ export function barChart(host, data, opts) {
     const pw = W - ml - mr, ph = H - mt - mb;
     // opts.percent: append each bar's share of the total to its value label + tooltip.
     const total = opts.percent ? data.reduce((s, d) => s + (d.value || 0), 0) : 0;
-    const valTxt = (d) => (opts.percent && total > 0 ? `${fmt(d.value)} · ${Math.round((d.value / total) * 100)}%` : fmt(d.value));
+    // opts.fmt2: an optional SECOND metric per datum (d.value2), formatted and appended
+    // after the primary value — e.g. "12.3M · $4.20" (tokens as bar length, cost alongside).
+    // Bar length/scale/sort are still driven by d.value only; value2 is display-only.
+    const valTxt = (d) => {
+      let s = opts.percent && total > 0 ? `${fmt(d.value)} · ${Math.round((d.value / total) * 100)}%` : fmt(d.value);
+      if (d.value2 != null && opts.fmt2) s += ` · ${opts.fmt2(d.value2)}`;
+      return s;
+    };
     // vertical gridlines
     for (let v = 0; v <= scale.max + 1e-9; v += scale.step) {
       const x = ml + (v / scale.max) * pw;

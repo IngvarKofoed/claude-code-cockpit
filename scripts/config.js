@@ -22,6 +22,12 @@ const DEFAULT_CONFIG = {
   browserSounds: true,
   activityDetail: 'tool', // 'tool' | 'args'
   usagePace: 'both', // 'both' | 'tick' | 'delta' | 'off' — Live usage-bar pace cue
+  // Regex SOURCE string applied to a subscription's raw name to extract a clean
+  // display label (see usage.subLabel/applyPattern). Default pulls the first
+  // parenthesized group's contents, so "FOSS Analytical (Lyra)" renders as "Lyra";
+  // a name without parens simply doesn't match and falls back unchanged. '' = off
+  // (identity). Applied at payload-build time only — never migrates stored data.
+  subscriptionLabelPattern: '\\(([^)]+)\\)',
   events: { sessionFinished: true, needsInput: true, longRunning: false, turnFailed: true },
   longRunningThresholdMs: 300000,
   // Pause gate: opt-in master switch (default off) + optional usage auto-pilot.
@@ -203,6 +209,25 @@ function validateConfig(input) {
       cfg.usagePace = input.usagePace;
     } else {
       errors.push('usagePace must be "both", "tick", "delta", or "off"');
+    }
+  }
+
+  // Must compile as a RegExp; a value that doesn't is rejected (leaving the on-disk
+  // config untouched, per the validate discipline) so a bad pattern can never be
+  // persisted. '' is allowed and means identity (extraction off).
+  if ('subscriptionLabelPattern' in input) {
+    const p = input.subscriptionLabelPattern;
+    if (typeof p !== 'string') {
+      errors.push('subscriptionLabelPattern must be a string');
+    } else if (p === '') {
+      cfg.subscriptionLabelPattern = '';
+    } else {
+      try {
+        new RegExp(p);
+        cfg.subscriptionLabelPattern = p;
+      } catch (_e) {
+        errors.push('subscriptionLabelPattern must be a valid regular expression');
+      }
     }
   }
 

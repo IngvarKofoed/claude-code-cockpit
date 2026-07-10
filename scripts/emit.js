@@ -12,6 +12,7 @@
 
 const fs = require('fs');
 const http = require('http');
+const os = require('os');
 const path = require('path');
 const paths = require('./paths');
 const { resolveRepo } = require('./repo');
@@ -66,6 +67,53 @@ function setIf(obj, key, val) {
   if (val !== undefined && val !== null) obj[key] = val;
 }
 
+// Claude Code's global config file, honoring CLAUDE_CONFIG_DIR (else ~/.claude.json).
+function claudeConfigPath() {
+  const dir = process.env.CLAUDE_CONFIG_DIR;
+  return dir ? path.join(dir, '.claude.json') : path.join(os.homedir(), '.claude.json');
+}
+
+// Never slurp a pathologically huge config file (best-effort guard; SessionStart-only anyway).
+const MAX_CONFIG_BYTES = 50 * 1024 * 1024;
+
+// The subscription/account this session runs under, read from ~/.claude.json's `oauthAccount`
+// (the ONLY local carrier of it — the hook payload and transcript don't have it). Called on
+// SessionStart ONLY: the file is a 200K+ global blob, so it must never touch the per-tool hot
+// path. Returns the compact `sub` object the daemon keys/labels on (see aggregate.subBaseName /
+// currentSubscription), or null on ANY failure (missing / unreadable / oversized / garbage
+// file, or no oauthAccount) — the capture is best-effort and the hook must never throw.
+//
+// PRIVACY: `sub` is ACCOUNT / SUBSCRIPTION METADATA (org or account name + rate-limit tier
+// codes) — explicitly permitted, and NOT message content, so it does not breach the
+// no-user_input/message/tool_input/tool_output boundary this file guards.
+//
+// `orgType` is normalized into the pure core's vocabulary (aggregate.TEAM_ORG_TYPES expects
+// bare "team"/"enterprise"/…): Claude Code reports e.g. "claude_team", so we lowercase and
+// strip a leading "claude_". Without this a team org would fall through to personal labeling.
+// A value that still doesn't match (personal plans) correctly reads as personal.
+function readSubscription() {
+  try {
+    const file = claudeConfigPath();
+    if (fs.statSync(file).size > MAX_CONFIG_BYTES) return null;
+    const acct = JSON.parse(fs.readFileSync(file, 'utf8')).oauthAccount;
+    if (!acct || typeof acct !== 'object') return null;
+    const sub = {};
+    setIf(sub, 'id', acct.organizationUuid);
+    if (typeof acct.organizationType === 'string' && acct.organizationType) {
+      sub.orgType = acct.organizationType.toLowerCase().replace(/^claude_/, '');
+    }
+    setIf(sub, 'orgName', acct.organizationName);
+    setIf(sub, 'displayName', acct.displayName);
+    setIf(sub, 'email', acct.emailAddress);
+    setIf(sub, 'seatTier', acct.seatTier);
+    setIf(sub, 'userTier', acct.userRateLimitTier);
+    setIf(sub, 'orgTier', acct.organizationRateLimitTier);
+    return Object.keys(sub).length ? sub : null;
+  } catch (_e) {
+    return null;
+  }
+}
+
 function buildRecord(payload) {
   const record = { ts: new Date().toISOString() };
   setIf(record, 'event', payload.hook_event_name);
@@ -104,6 +152,9 @@ function buildRecord(payload) {
   // would breach the "no message content" privacy boundary. A present array (including empty)
   // is authoritative; absent (older Claude Code) leaves the daemon's last known count intact.
   if (Array.isArray(payload.background_tasks)) record.bg_tasks = payload.background_tasks.length;
+  // SessionStart captures the account/subscription once for the session's life (the daemon
+  // never re-reads the file, so this durable capture is replay-correct after a switch).
+  if (payload.hook_event_name === 'SessionStart') setIf(record, 'sub', readSubscription());
   return record;
 }
 

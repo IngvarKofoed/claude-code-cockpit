@@ -38,6 +38,12 @@ function newSession(event) {
     branch: null,
     model: null,
     source: null,
+    // Subscription (account/org) this session runs under, captured ONCE from the
+    // SessionStart event's `sub` (emit.js reads ~/.claude.json oauthAccount there —
+    // see updateMeta). A compact `{ id, orgType, orgName, displayName, email, ... }`
+    // object, or null when unknown (pre-feature / API-key session / capture failed).
+    // Persists for the session's life — only SessionStart carries it.
+    subscription: null,
     ownerPid: null,
     permissionMode: null,
     effortLevel: null,
@@ -99,6 +105,52 @@ function updateMeta(session, event) {
   // (e.g. after a snapshot loss) still carries a PID the reaper can check.
   if (event.owner_pid != null) session.ownerPid = event.owner_pid;
   if (event.source != null) session.source = event.source;
+  // Subscription rides on the SessionStart event only (emit.js embeds it there);
+  // capture it whenever present and guarded like the other metadata, so it is
+  // durable and replay-correct. Later events don't carry it, so this effectively
+  // captures once at SessionStart and persists for the session's life.
+  if (event.sub != null && typeof event.sub === 'object') session.subscription = event.sub;
+}
+
+// A subscription's orgType is a "team/org" (label from organizationName) rather than a
+// personal subscription (label from the person's name/email). Matched case-insensitively
+// against the known team/org type codes; anything else — including an absent orgType —
+// reads as personal, so subBaseName falls back to displayName/email safely.
+const TEAM_ORG_TYPES = new Set(['team', 'enterprise', 'business', 'organization', 'org', 'company']);
+
+// The RAW base name for a subscription — the org's name for a team/org, else the
+// person's displayName, email, or the literal 'Personal'. This is what gets STORED
+// (in bySubscription records); the display label applies subscriptionLabelPattern to
+// it at payload-build time (see usage.subLabel), never here. A null/garbage sub reads
+// as 'Personal' so a label is never blank.
+function subBaseName(sub) {
+  if (!sub || typeof sub !== 'object') return 'Personal';
+  const orgType = typeof sub.orgType === 'string' ? sub.orgType.toLowerCase() : '';
+  if (TEAM_ORG_TYPES.has(orgType) && sub.orgName) return sub.orgName;
+  return sub.displayName || sub.email || 'Personal';
+}
+
+// The "current" subscription: the `sub` of the LIVE (non-ended) session with the
+// greatest startedAt that has a KNOWN subscription (id present), or null. This is a
+// pure function of session state — no file read — so "which subscription is active"
+// stays event-derived and deterministic (see the spec's Fork 1(a) rejection). The
+// daemon uses it to label the usage bars and to drop a rate-limit push from a session
+// that isn't on the current subscription.
+function currentSubscription(state) {
+  const map = (state && state.sessions) || {};
+  let best = null;
+  let bestMs = -Infinity;
+  for (const sid of Object.keys(map)) {
+    const s = map[sid];
+    if (!s || s.status === 'ended') continue;
+    if (!s.subscription || s.subscription.id == null) continue;
+    const t = tsMs(s.startedAt);
+    if (t > bestMs) {
+      bestMs = t;
+      best = s.subscription;
+    }
+  }
+  return best;
 }
 
 // A session is "engaged" (accruing active time, ticking the card's big timer) while it is
@@ -374,6 +426,11 @@ function ensureRepo(rollup, repoRoot, repoName) {
       // the counted session count is sessions ∩ tokenSessions — see countedSessions()
       tokens: emptyTokens(),
       byModel: {},
+      // subId -> { name, byModel } — the same per-model token split as byModel, but
+      // partitioned by the SESSION's captured subscription (raw base name kept for
+      // read-time labelling). Mirrors byModel/byRepo; priced server-side. A turn with
+      // no known subscription buckets under the 'unknown' key. See addBySubscription.
+      bySubscription: {},
       byTool: {}, // toolName -> count, tallied from PreToolUse (event-derived, unconditional)
       byAgentType: {}, // agentType -> count, tallied from SubagentStart.agent_type (event-derived, unconditional)
       subagents: 0, // total subagents spawned, tallied from SubagentStart (event-derived)
@@ -427,6 +484,27 @@ function addByModel(repo, byModel) {
   }
 }
 
+// Fold a turn's per-model token map into the repo's per-SUBSCRIPTION breakdown, under
+// the session's captured subscription id (turn.subId) + raw base name (turn.subName,
+// sourced from the session by the daemon caller — raw, NOT the patterned label, so the
+// label stays a read-time transform). A turn with no known subscription buckets under
+// 'unknown'. Called from BOTH turn accumulators so attribution is identical on the live
+// and backfill paths (a backfill turn reads u.subscription off its usage record).
+function addBySubscription(repo, turn) {
+  const subId = turn.subId != null ? turn.subId : 'unknown';
+  const rec = repo.bySubscription[subId] || (repo.bySubscription[subId] = { name: null, byModel: {} });
+  // Keep the latest known raw name; fall back to an earlier one, then to the id itself,
+  // so a record always carries a non-null name to label.
+  if (turn.subName != null) rec.name = turn.subName;
+  else if (rec.name == null) rec.name = subId;
+  const bm = turn.byModel && typeof turn.byModel === 'object' ? turn.byModel : {};
+  for (const model of Object.keys(bm)) {
+    const key = model || 'unknown';
+    const bucket = rec.byModel[key] || (rec.byModel[key] = emptyTokens());
+    addTokens(bucket, bm[model]);
+  }
+}
+
 // Sum every token field across a per-model map (used only to decide whether a record
 // spent anything — the exact total is folded elsewhere).
 function sumByModel(byModel) {
@@ -459,6 +537,7 @@ function accumulateTurnByModel(rollup, turn) {
   const repo = ensureRepo(rollup, turn.repoRoot, turn.repoName);
   repo.prompts += 1; // active time comes from the event stream, not turn duration
   addByModel(repo, turn.byModel);
+  addBySubscription(repo, turn);
   markTokenSession(repo, turn.sessionId, turn.byModel);
   bumpLastActive(repo, turn.ts);
   return rollup;
@@ -472,6 +551,7 @@ function accumulateTokensByModel(rollup, turn) {
   if (!rollup || !turn || turn.repoRoot == null) return rollup;
   const repo = ensureRepo(rollup, turn.repoRoot, turn.repoName);
   addByModel(repo, turn.byModel);
+  addBySubscription(repo, turn);
   markTokenSession(repo, turn.sessionId, turn.byModel);
   bumpLastActive(repo, turn.ts);
   return rollup;
@@ -592,6 +672,8 @@ module.exports = {
   createState,
   applyEvent,
   snapshot,
+  subBaseName,
+  currentSubscription,
   createRollup,
   accumulateTurn,
   accumulateTurnByModel,

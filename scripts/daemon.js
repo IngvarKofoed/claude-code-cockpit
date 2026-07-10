@@ -79,6 +79,7 @@ let sessionsFilteredCache = null; // { snapAt, files, total } — sessionsFileLi
 const sessionActiveDayCache = new Map(); // dateStr (PAST day only) -> Map<sid, {activeMs,chats,tools,agents}>, memoized event-log-derived per-session stats
 let sessionActiveTotalsCache = null; // { at, map: Map<sid, {activeMs,chats,tools,agents}> } short-TTL sum across days (includes the live current day)
 let repoTotalsCache = null; // memoized all-time per-repo totals for /api/state; invalidated on any token/rollup/cost-config change (see repoTotalsAllTime)
+let subscriptionTotalsCache = null; // sibling of repoTotalsCache: memoized all-time per-SUBSCRIPTION totals for /api/state. Rebuilt from the SAME aggregate inside repoTotalsAllTime and gated on repoTotalsCache's validity, so it invalidates in lockstep (nulling repoTotalsCache invalidates both) without editing every invalidation site.
 let rateLimitUsage = null; // latest GLOBAL rate-limit snapshot from the statusline forwarder (POST /internal/usage); null until one arrives. Named distinctly from the many function-local `usage` vars in this file so a dropped `let` can't silently clobber it. Served on buildStatePayload().usage.
 
 // Global pause-gate tracker (session-less: the control file is the sole ENFORCEMENT ruler;
@@ -330,7 +331,16 @@ function applyUsageRecord(rollup, u) {
   const byModel = u.byModel && typeof u.byModel === 'object'
     ? u.byModel
     : { [u.model || 'unknown']: { input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite } };
-  const arg = { repoRoot: u.repo_root, repoName: u.repo_name, sessionId: u.session_id, byModel, ts: u.ts };
+  // subId + the raw base name both come off the usage record (u.subscription / u.subscriptionName),
+  // so a recomputed past day carries a real label — not just the id — even when the subscription
+  // never appears on the live path within the aggregated range. subName may be absent on records
+  // written before this field existed; addBySubscription then falls back to the id (mergeSubName
+  // recovers a real name from any other day that has it). The payload build applies the pattern.
+  const arg = {
+    repoRoot: u.repo_root, repoName: u.repo_name, sessionId: u.session_id, byModel, ts: u.ts,
+    subId: u.subscription != null ? u.subscription : null,
+    subName: u.subscriptionName != null ? u.subscriptionName : null,
+  };
   if (u.backfill) aggregate.accumulateTokensByModel(rollup, arg);
   else aggregate.accumulateTurnByModel(rollup, arg); // durationMs is ignored; active time is event-derived
 }
@@ -1200,6 +1210,12 @@ function recordTurn(sid, stopEvent, usage, fresh, seen, allBackfill = false) {
   const session = state.sessions[sid];
   const repoRoot = (session && session.repoRoot) || stopEvent.repo_root || null;
   const repoName = (session && session.repoName) || stopEvent.repo_name || null;
+  // The session's captured subscription (SessionStart → emit.js). subId is the durable key
+  // written onto every usage record so a past-day recompute reconstructs bySubscription with
+  // no session state; subName is the RAW base name threaded live so today's rollup carries a
+  // real label source (the patterned label stays a read-time transform, never stored).
+  const subId = session && session.subscription && session.subscription.id != null ? session.subscription.id : null;
+  const subName = session && session.subscription ? aggregate.subBaseName(session.subscription) : null;
 
   // Mark everything seen up front so a retry / re-read can never re-count it — but
   // ONLY for live sessions. Historical backfill dedups against a local index built
@@ -1263,6 +1279,8 @@ function recordTurn(sid, stopEvent, usage, fresh, seen, allBackfill = false) {
         session_id: sid,
         repo_root: repoRoot,
         repo_name: repoName,
+        subscription: subId, // the ingesting session's captured subscription id (or null)
+        subscriptionName: subName, // raw base name (or null), so a recomputed past day keeps a real label
         byModel: g.byModel,
         input: g.totals.input,
         output: g.totals.output,
@@ -1275,9 +1293,9 @@ function recordTurn(sid, stopEvent, usage, fresh, seen, allBackfill = false) {
     );
     if (day === currentDate) {
       if (isTurn) {
-        aggregate.accumulateTurnByModel(todayRollup, { repoRoot, repoName, sessionId: sid, byModel: g.byModel, ts });
+        aggregate.accumulateTurnByModel(todayRollup, { repoRoot, repoName, sessionId: sid, byModel: g.byModel, ts, subId, subName });
       } else {
-        aggregate.accumulateTokensByModel(todayRollup, { repoRoot, repoName, sessionId: sid, byModel: g.byModel, ts });
+        aggregate.accumulateTokensByModel(todayRollup, { repoRoot, repoName, sessionId: sid, byModel: g.byModel, ts, subId, subName });
       }
     }
   }
@@ -1443,7 +1461,19 @@ function repoTotalsAllTime() {
     };
   }
   repoTotalsCache = out;
+  // Rebuild the per-subscription all-time totals from the SAME agg (one pass, one lifecycle),
+  // so subscriptionTotalsAllTime never re-scans and the two caches can't drift.
+  subscriptionTotalsCache = priceSubscriptionMap(mergeBySubscription(agg));
   return out;
+}
+
+// All-time per-subscription totals for /api/state (subId -> { label, tokens, cost }). Shares
+// repoTotalsAllTime's cache lifecycle: whenever repoTotalsCache is invalidated (any token/
+// rollup/cost-config change), rebuild BOTH here — so no separate invalidation is needed and
+// this never runs on the SSE broadcast hot path once warm.
+function subscriptionTotalsAllTime() {
+  if (!repoTotalsCache || !subscriptionTotalsCache) repoTotalsAllTime();
+  return subscriptionTotalsCache;
 }
 
 function buildStatePayload() {
@@ -1453,6 +1483,16 @@ function buildStatePayload() {
     sessions: aggregate.snapshot(state, now).sessions,
     repos: reposSummary(),
     repoTotals: repoTotalsAllTime(),
+    // The active subscription (newest live session's captured sub) → { id, label }, or null
+    // when no live session has a known subscription. label is subLabel (raw name +
+    // subscriptionLabelPattern) applied at build time, so a pattern change re-labels live.
+    subscription: (() => {
+      const cur = aggregate.currentSubscription(state);
+      return cur ? { id: cur.id, label: usageLib.subLabel(cur, cfg) } : null;
+    })(),
+    // All-time per-subscription totals (subId -> { label, tokens, cost }); memoized off the
+    // SSE hot path exactly like repoTotals (see subscriptionTotalsAllTime).
+    subscriptionTotals: subscriptionTotalsAllTime(),
     config: cfg,
     usage: rateLimitUsage, // latest global rate-limit snapshot (or null) for the Live usage bars
     // Global pause-gate state (O(1) tracker read — safe on the SSE hot path). The client
@@ -1533,7 +1573,7 @@ function aggregateReposAcrossDates(dates, { trackSessions = true } = {}) {
     if (!rollup || !rollup.repos) continue;
     for (const root of Object.keys(rollup.repos)) {
       const rr = rollup.repos[root];
-      const a = agg[root] || (agg[root] = { repoRoot: root, repoName: rr.repoName, prompts: 0, activeMs: 0, subagents: 0, tokens: emptyTokens(), byModel: {}, byTool: {}, sessionIds: trackSessions ? new Set() : null, lastActive: null });
+      const a = agg[root] || (agg[root] = { repoRoot: root, repoName: rr.repoName, prompts: 0, activeMs: 0, subagents: 0, tokens: emptyTokens(), byModel: {}, byTool: {}, bySubscription: {}, sessionIds: trackSessions ? new Set() : null, lastActive: null });
       if (rr.repoName) a.repoName = rr.repoName;
       a.prompts += num(rr.prompts);
       a.activeMs += num(rr.activeMs);
@@ -1549,6 +1589,16 @@ function aggregateReposAcrossDates(dates, { trackSessions = true } = {}) {
       }
       for (const t of Object.keys(rr.byTool || {})) {
         a.byTool[t] = num(a.byTool[t]) + num(rr.byTool[t]);
+      }
+      // Per-subscription token split (rollup-shaped: subId -> { name, byModel }), unioned
+      // across days keeping the most informative raw name (a real name beats the id fallback).
+      const rbs = rr.bySubscription || {};
+      for (const subId of Object.keys(rbs)) {
+        const dst = a.bySubscription[subId] || (a.bySubscription[subId] = { name: null, byModel: {} });
+        dst.name = mergeSubName(dst.name, rbs[subId].name, subId);
+        for (const m of Object.keys(rbs[subId].byModel || {})) {
+          addTokens(dst.byModel[m] || (dst.byModel[m] = emptyTokens()), rbs[subId].byModel[m]);
+        }
       }
     }
   }
@@ -1581,6 +1631,52 @@ function costByTypeFor(byModel, pricedIn) {
     const rate = cfg.cost.rates[model] || {};
     const usage = byModel[model] || {};
     for (const k of TOKEN_CLASSES) out[k] += (num(usage[k]) * num(rate[k])) / 1e6;
+  }
+  return out;
+}
+
+// Pick the more informative of two raw subscription names for the same id, merging across
+// days/repos: a real name (≠ the id key) beats the id fallback; otherwise keep the first.
+// `incoming` null is ignored. Used by both aggregation passes so name resolution is uniform.
+function mergeSubName(existing, incoming, key) {
+  if (incoming == null) return existing;
+  if (existing == null) return incoming;
+  if (existing === key && incoming !== key) return incoming; // upgrade fallback -> real name
+  return existing;
+}
+
+// Merge per-repo bySubscription maps (rollup-shaped { subId -> { name, byModel } }) from an
+// aggregateReposAcrossDates result into ONE global map, keyed by subscription id.
+function mergeBySubscription(agg) {
+  const bySub = {};
+  for (const root of Object.keys(agg || {})) {
+    const rbs = (agg[root] && agg[root].bySubscription) || {};
+    for (const subId of Object.keys(rbs)) {
+      const dst = bySub[subId] || (bySub[subId] = { name: null, byModel: {} });
+      dst.name = mergeSubName(dst.name, rbs[subId].name, subId);
+      for (const m of Object.keys(rbs[subId].byModel || {})) {
+        addTokens(dst.byModel[m] || (dst.byModel[m] = emptyTokens()), rbs[subId].byModel[m]);
+      }
+    }
+  }
+  return bySub;
+}
+
+// Turn a rollup-shaped bySubscription map ({ subId -> { name, byModel } }) into a priced,
+// labelled payload map ({ subId -> { label, tokens, cost } }). The LABEL is applied at
+// build time (raw stored name + cfg.subscriptionLabelPattern), so nothing stored holds the
+// patterned label and a pattern change re-labels every surface. Cost is null when disabled.
+function priceSubscriptionMap(bySub) {
+  const out = {};
+  for (const subId of Object.keys(bySub || {})) {
+    const rec = bySub[subId] || {};
+    const tokens = emptyTokens();
+    for (const m of Object.keys(rec.byModel || {})) addTokens(tokens, rec.byModel[m]);
+    out[subId] = {
+      label: usageLib.applyPattern(rec.name != null ? rec.name : subId, cfg.subscriptionLabelPattern),
+      tokens,
+      cost: cfg.cost.enabled ? pricing.estimateCost(rec.byModel || {}, cfg.cost.rates).total : null,
+    };
   }
   return out;
 }
@@ -1706,12 +1802,19 @@ function buildHistory(rangeRaw) {
       tokens: a.tokens,
       subagents: a.subagents,
       byTool: a.byTool,
+      // Per-subscription token/cost split for this repo over the range (labels at build time).
+      bySubscription: priceSubscriptionMap(a.bySubscription),
       cost: cfg.cost.enabled ? pricing.estimateCost(a.byModel, cfg.cost.rates).total : null,
       lastActive: a.lastActive,
     }))
     .sort((x, y) => y.activeMs - x.activeMs);
 
-  return { range, perDay, byDowHour, topRepos };
+  // Range-aggregated per-subscription totals (across all repos) → { subId: { label, tokens,
+  // cost } }, feeding the History "Tokens & cost per subscription" chart. Labelled at build
+  // time like every other subscription payload; range-scoped (distinct from state's all-time).
+  const bySubscription = priceSubscriptionMap(mergeBySubscription(repoAgg));
+
+  return { range, perDay, byDowHour, topRepos, bySubscription };
 }
 
 // ---- HTTP -------------------------------------------------------------------
@@ -1837,8 +1940,12 @@ function handlePutConfig(req, res) {
       return;
     }
     cfg = result.config; // hot-reload in-memory config
-    repoTotalsCache = null; // rates / currency / cost.enabled may have changed
+    repoTotalsCache = null; // rates / currency / cost.enabled may have changed (also invalidates subscriptionTotals)
     broadcastConfig(); // every open dashboard reflects the change
+    // Also push a fresh STATE frame: several state fields are server-computed from cfg
+    // (subscription labels via subscriptionLabelPattern, and every cost figure), so without
+    // this they'd stay stale in an already-open dashboard until the next event or a reload.
+    markDirty();
     reconcile(); // toggling pauseGateEnabled changes the EFFECTIVE pause state — apply it now
     json(res, { ok: true, config: cfg });
   });
@@ -1874,12 +1981,27 @@ function handleInternalUsage(req, res) {
     }
     const windows = usageLib.normalizeUsage(body);
     if (!windows) return; // structurally malformed -> drop, never a partial update
+    // De-pollute the bar across a subscription switch: after a switch the OLD subscription's
+    // sessions keep running and their lagging statusline pushes carry the OLD account's
+    // rate-limit numbers, which last-write-wins would let clobber the NEW subscription's bar.
+    // Resolve the pushing session's captured subscription and the CURRENT (newest-live) one;
+    // DROP the push only when BOTH are known and differ. FAIL-OPEN: an unknown either side
+    // (pre-feature / API-key session, a missed SessionStart) accepts the push, so the bar is
+    // never worse than the prior last-write-wins. Dropping also skips auto-pause eval below —
+    // an old subscription's usage must not drive the current one's auto-pilot.
+    const pushSession = windows.sessionId != null ? state.sessions[windows.sessionId] : null;
+    const pushSub = pushSession && pushSession.subscription ? pushSession.subscription.id : null;
+    const cur = aggregate.currentSubscription(state);
+    const curSub = cur ? cur.id : null;
+    if (pushSub != null && curSub != null && pushSub !== curSub) return; // stale non-current push -> drop
     // The forwarder posts on every statusline render (frequently). Broadcast ONLY when the
     // numbers actually change — else an unchanged push would rebuild the whole Live card grid
     // several times/sec (wiping text selection mid-turn). updatedAt still advances so a later
     // broadcast carries fresh liveness for the "updated Xm ago" staleness display.
     const changed = !rateLimitUsage || !usageLib.sameUsageWindows(rateLimitUsage, windows);
-    rateLimitUsage = { ...windows, updatedAt: Date.now() };
+    // Tag the accepted snapshot with the subscription it belongs to (the pushing session's if
+    // known, else the current one) so the bar can be attributed. sameUsageWindows ignores this.
+    rateLimitUsage = { ...windows, subscription: pushSub != null ? pushSub : curSub, updatedAt: Date.now() };
     // Usage auto-pilot: evaluate the 5h window against the auto-pause threshold. Runs on
     // every push (not only `changed`) so the rising-edge memory (prevPct) tracks the latest
     // value; it self-gates on pauseGateEnabled + autoPauseFiveHourPct>0 and does nothing when

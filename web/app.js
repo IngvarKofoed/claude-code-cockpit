@@ -1004,6 +1004,32 @@ function tickUsage(now) {
   advanceUsageBars(now);
 }
 
+// The "active subscription" chip: which subscription the newest live session is on
+// (server-derived, `App.state.subscription = { id, label } | null`). Hidden entirely
+// when null (no live session with a captured subscription — e.g. pre-feature sessions,
+// an API-key session, or before the daemon ships this field). Muted, like the other
+// ribbon chips — this is context, not an alert. Full-width row so it sits on its own
+// line above the usage bars without warping the tile grid.
+// The tooltip carries this subscription's ALL-TIME total (tokens + cost, from
+// `App.state.subscriptionTotals[sub.id]` — a range-free total distinct from the
+// History chart's range-scoped breakdown, per the spec's Design C), falling back to
+// the plain description when totals aren't available yet (e.g. right after startup).
+function subscriptionChipHTML() {
+  const sub = App.state && App.state.subscription;
+  if (!sub || !sub.label) return "";
+  const totals = App.state && App.state.subscriptionTotals && App.state.subscriptionTotals[sub.id];
+  let title = "Active subscription — the newest live session's account";
+  if (totals) {
+    title += ` · all-time: ${fmtTokens(sumTokens(totals.tokens))} tokens`;
+    if (typeof totals.cost === "number" && Number.isFinite(totals.cost)) title += `, ${fmtCost(totals.cost)}`;
+  }
+  return (
+    `<div class="sub-chip-row">` +
+    `<span class="chip" title="${esc(title)}">${esc(sub.label)}</span>` +
+    `</div>`
+  );
+}
+
 function renderLiveRibbon() {
   // The Live page is the main screen, so its ribbon is a "today at a glance" summary:
   // every tile is TODAY's total across all of today's sessions, read from the today
@@ -1045,7 +1071,7 @@ function renderLiveRibbon() {
   tiles.push(tile("Agents", agents));
   tiles.push(tile("Active time", fmtDuration(activeMs)));
   // The usage block is a full-width row that flows below the tiles inside the ribbon grid.
-  $("liveRibbon").innerHTML = tiles.join("") + usageBlockHTML(estNow());
+  $("liveRibbon").innerHTML = tiles.join("") + subscriptionChipHTML() + usageBlockHTML(estNow());
   bindUsage();
   advanceUsageBars(estNow()); // fill the delta chips (empty in the shell) + paint now
 }
@@ -1760,6 +1786,7 @@ const HIST_CARDS = [
   { id: "hc-calendar", title: "Calendar heatmap", sub: "Active time per day" },
   { id: "hc-agents-type", title: "Subagents by type" },
   { id: "hc-tool-usage", title: "Tool usage" },
+  { id: "hc-sub-usage", title: "Tokens & cost per subscription" },
 ];
 
 // Parse a "YYYY-MM-DD" rollup date as a LOCAL calendar date (not UTC) so the
@@ -1915,6 +1942,25 @@ function drawHistory(h) {
       .sort((a, b) => b.value - a.value);
     barChart($("hc-tool-usage"), data, fo(intFmt, { horizontal: true, height: 480, empty: "No tool usage yet." }));
   }
+
+  // Tokens & cost per subscription (horizontal bars, sorted by tokens; each bar's
+  // trailing text also shows that subscription's cost). Cost-dependent like "Cost per
+  // day, by type" — hidden behind the empty state when cost display is off, even though
+  // tokens alone would still be knowable, per the canonical Tokens·Cost pairing.
+  // `App.histData.bySubscription` is a TOP-LEVEL, range-aggregated map keyed by
+  // subscription id — { [id]: { label, tokens, cost } } — built server-side by
+  // buildHistory's mergeBySubscription + priceSubscriptionMap; it is NOT a per-day field
+  // (perDay entries carry no bySubscription breakdown).
+  if (!costOn) {
+    barChart($("hc-sub-usage"), [], fo(fmtTokens, { horizontal: true, empty: COST_OFF }));
+  } else {
+    const bySub = App.histData.bySubscription || {};
+    const data = Object.keys(bySub)
+      .map((id) => ({ label: bySub[id].label || id, value: sumTokens(bySub[id].tokens), value2: num(bySub[id].cost) }))
+      .filter((x) => x.value > 0)
+      .sort((a, b) => b.value - a.value);
+    barChart($("hc-sub-usage"), data, fo(fmtTokens, { horizontal: true, fmt2: fmtCost, color: "var(--series-4)", empty: "No subscription history yet." }));
+  }
 }
 
 function loadHistory() {
@@ -2014,6 +2060,11 @@ function settingsHTML(cfg) {
         "Auto-pause at 5h usage %",
         "Auto-pause when the 5h usage window crosses this % (needs the statusline installed); 0 = off",
         `<input class="input" id="set-autoPauseFiveHourPct" type="number" min="0" max="100" step="1" value="${num(cfg.autoPauseFiveHourPct)}"><span class="chip">%</span>`
+      ) +
+      fieldRow(
+        "Subscription label pattern",
+        "A regex extracting the meaningful part of a verbose subscription name (capture group 1, else the whole match). Default pulls the parenthesized part: \"FOSS Analytical (Lyra)\" → \"Lyra\". Clear to show the raw name unchanged. Applied read-time only — never edits stored data.",
+        `<input class="input input--wide" id="set-subscriptionLabelPattern" type="text" placeholder="\\(([^)]+)\\)" value="${esc(cfg.subscriptionLabelPattern != null ? cfg.subscriptionLabelPattern : "")}">`
       )
   );
 
@@ -2113,6 +2164,7 @@ function readSettingsForm() {
     usagePace: $("set-usagePace").value,
     pauseGateEnabled: cb("set-pauseGateEnabled"),
     autoPauseFiveHourPct: nv("set-autoPauseFiveHourPct", 0),
+    subscriptionLabelPattern: $("set-subscriptionLabelPattern").value,
     events: {
       sessionFinished: cb("set-ev-sessionFinished"),
       needsInput: cb("set-ev-needsInput"),

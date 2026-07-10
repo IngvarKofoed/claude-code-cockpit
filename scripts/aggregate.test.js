@@ -6,6 +6,8 @@ const {
   createState,
   applyEvent,
   snapshot,
+  subBaseName,
+  currentSubscription,
   createRollup,
   accumulateTurn,
   accumulateTurnByModel,
@@ -945,4 +947,128 @@ test('owner_pid is captured from ANY event, not only SessionStart', () => {
   // Session first seen via a non-SessionStart event (e.g. after a snapshot loss).
   applyEvent(state, ev('PreToolUse', { owner_pid: 4242, tool_name: 'Bash' }));
   assert.strictEqual(state.sessions.s1.ownerPid, 4242);
+});
+
+// --- subscription capture + helpers ------------------------------------------
+
+const TEAM = { id: 'org-1', orgType: 'team', orgName: 'FOSS Analytical (Lyra)' };
+const PERSONAL = { id: 'acct-9', orgType: 'personal', displayName: 'Ada Lovelace', email: 'ada@x.io' };
+
+test('SessionStart captures event.sub; newSession defaults subscription to null', () => {
+  const before = createState();
+  applyEvent(before, ev('PreToolUse', { session_id: 'nosub', tool_name: 'Bash' }));
+  assert.strictEqual(before.sessions.nosub.subscription, null); // never carried a sub
+
+  const state = run([ev('SessionStart', { sub: TEAM })]);
+  assert.deepStrictEqual(state.sessions.s1.subscription, TEAM);
+});
+
+test('subscription persists across later events that do not carry it', () => {
+  const state = run([
+    ev('SessionStart', { sub: TEAM }),
+    ev('UserPromptSubmit', { prompt_id: 'p1' }), // no sub on this event
+    ev('Stop'),
+  ]);
+  assert.deepStrictEqual(state.sessions.s1.subscription, TEAM);
+});
+
+test('applyEvent ignores a non-object sub (stays null)', () => {
+  const state = run([ev('SessionStart', { sub: 'garbage' })]);
+  assert.strictEqual(state.sessions.s1.subscription, null);
+});
+
+test('subBaseName: team org -> orgName; personal -> displayName/email/Personal; garbage -> Personal', () => {
+  assert.strictEqual(subBaseName(TEAM), 'FOSS Analytical (Lyra)'); // team type uses orgName
+  assert.strictEqual(subBaseName(PERSONAL), 'Ada Lovelace'); // personal uses displayName first
+  assert.strictEqual(subBaseName({ id: 'p', orgType: 'personal', email: 'only@x.io' }), 'only@x.io'); // no displayName
+  assert.strictEqual(subBaseName({ id: 'p', orgType: 'personal' }), 'Personal'); // neither name nor email
+  // A team type with NO orgName falls back to the personal chain, not a blank.
+  assert.strictEqual(subBaseName({ id: 'o', orgType: 'team', displayName: 'Fallback' }), 'Fallback');
+  // orgType matched case-insensitively.
+  assert.strictEqual(subBaseName({ id: 'o', orgType: 'Enterprise', orgName: 'Acme Corp' }), 'Acme Corp');
+  // Unknown/absent orgType reads as personal (safe default).
+  assert.strictEqual(subBaseName({ id: 'x', orgName: 'Ignored', displayName: 'Real' }), 'Real');
+  assert.strictEqual(subBaseName(null), 'Personal');
+  assert.strictEqual(subBaseName(undefined), 'Personal');
+});
+
+test('currentSubscription: newest LIVE session with a known sub wins', () => {
+  const state = createState();
+  applyEvent(state, ev('SessionStart', { session_id: 'old', sub: PERSONAL, ts: '2026-07-02T09:00:00.000Z' }));
+  applyEvent(state, ev('SessionStart', { session_id: 'new', sub: TEAM, ts: '2026-07-02T11:00:00.000Z' }));
+  assert.deepStrictEqual(currentSubscription(state), TEAM); // greater startedAt
+});
+
+test('currentSubscription: an ended session is not considered, even if newest', () => {
+  const state = createState();
+  applyEvent(state, ev('SessionStart', { session_id: 'live', sub: PERSONAL, ts: '2026-07-02T09:00:00.000Z' }));
+  applyEvent(state, ev('SessionStart', { session_id: 'gone', sub: TEAM, ts: '2026-07-02T11:00:00.000Z' }));
+  applyEvent(state, ev('SessionEnd', { session_id: 'gone', ts: '2026-07-02T12:00:00.000Z' }));
+  assert.deepStrictEqual(currentSubscription(state), PERSONAL); // only the live one counts
+});
+
+test('currentSubscription: a session with no/unknown sub is skipped; none -> null', () => {
+  const state = createState();
+  applyEvent(state, ev('SessionStart', { session_id: 'a', ts: '2026-07-02T09:00:00.000Z' })); // no sub
+  applyEvent(state, ev('SessionStart', { session_id: 'b', sub: { orgType: 'team', orgName: 'X' }, ts: '2026-07-02T10:00:00.000Z' })); // no id -> unknown
+  assert.strictEqual(currentSubscription(state), null);
+
+  applyEvent(state, ev('SessionStart', { session_id: 'c', sub: PERSONAL, ts: '2026-07-02T08:00:00.000Z' }));
+  assert.deepStrictEqual(currentSubscription(state), PERSONAL); // the only known-sub live session
+  assert.strictEqual(currentSubscription({}), null);
+  assert.strictEqual(currentSubscription(null), null);
+});
+
+// --- bySubscription accumulation ---------------------------------------------
+
+test('accumulateTurnByModel: folds tokens into repo.bySubscription[subId] = { name, byModel }', () => {
+  let r = createRollup('2026-07-02');
+  r = accumulateTurnByModel(r, {
+    repoRoot: '/r', repoName: 'r', subId: 'org-1', subName: 'FOSS Analytical (Lyra)',
+    byModel: { 'claude-opus-4-8': T({ input: 100, output: 50 }) }, ts: '2026-07-02T10:00:00.000Z',
+  });
+  r = accumulateTurnByModel(r, {
+    repoRoot: '/r', repoName: 'r', subId: 'org-1', subName: 'FOSS Analytical (Lyra)',
+    byModel: { 'claude-opus-4-8': T({ input: 10 }), 'claude-haiku-4-5': T({ output: 5 }) }, ts: '2026-07-02T10:01:00.000Z',
+  });
+  const sub = r.repos['/r'].bySubscription['org-1'];
+  assert.strictEqual(sub.name, 'FOSS Analytical (Lyra)'); // RAW base name stored, not a patterned label
+  assert.strictEqual(sub.byModel['claude-opus-4-8'].input, 110); // summed across turns
+  assert.strictEqual(sub.byModel['claude-opus-4-8'].output, 50);
+  assert.strictEqual(sub.byModel['claude-haiku-4-5'].output, 5); // per-model split preserved
+});
+
+test('bySubscription: two subscriptions on one repo stay separate', () => {
+  let r = createRollup('2026-07-02');
+  r = accumulateTurnByModel(r, { repoRoot: '/r', repoName: 'r', subId: 'org-1', subName: 'FOSS', byModel: { m: T({ input: 100 }) }, ts: '2026-07-02T10:00:00.000Z' });
+  r = accumulateTurnByModel(r, { repoRoot: '/r', repoName: 'r', subId: 'acct-9', subName: 'Ada', byModel: { m: T({ input: 7 }) }, ts: '2026-07-02T10:01:00.000Z' });
+  const bySub = r.repos['/r'].bySubscription;
+  assert.strictEqual(bySub['org-1'].byModel.m.input, 100);
+  assert.strictEqual(bySub['acct-9'].byModel.m.input, 7);
+  // The repo total still aggregates across subscriptions (byModel is unpartitioned).
+  assert.strictEqual(r.repos['/r'].byModel.m.input, 107);
+});
+
+test('bySubscription: a turn with no subId buckets under "unknown"', () => {
+  const r = accumulateTurnByModel(createRollup('2026-07-02'), {
+    repoRoot: '/r', repoName: 'r', byModel: { m: T({ input: 3 }) }, ts: '2026-07-02T10:00:00.000Z',
+  });
+  const sub = r.repos['/r'].bySubscription.unknown;
+  assert.ok(sub); // present under the sentinel key
+  assert.strictEqual(sub.name, 'unknown'); // no subName -> falls back to the key
+  assert.strictEqual(sub.byModel.m.input, 3);
+});
+
+test('accumulateTokensByModel (backfill) also folds bySubscription (from the usage record)', () => {
+  const r = accumulateTokensByModel(createRollup('2026-07-02'), {
+    repoRoot: '/r', repoName: 'r', subId: 'org-1', subName: 'FOSS', byModel: { m: T({ input: 42 }) }, ts: '2026-07-02T09:00:00.000Z',
+  });
+  const repo = r.repos['/r'];
+  assert.strictEqual(repo.prompts, 0); // backfill counts no turn
+  assert.strictEqual(repo.bySubscription['org-1'].byModel.m.input, 42); // but does attribute the subscription
+});
+
+test('ensureRepo initializes bySubscription to an empty object', () => {
+  const r = accumulateSession(createRollup('2026-07-02'), { repoRoot: '/r', repoName: 'r', sessionId: 's1', ts: '2026-07-02T10:00:00.000Z' });
+  assert.deepStrictEqual(r.repos['/r'].bySubscription, {});
 });

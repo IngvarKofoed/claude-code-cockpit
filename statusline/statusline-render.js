@@ -12,8 +12,11 @@
 // page's session-5h and weekly usage bars. Forwarding never delays the printed
 // line (print first) and never crashes the bar (all errors swallowed).
 //
-// PRIVACY: only `rate_limits` is forwarded — never the cwd/cost/model/session_id
-// the payload also carries. Nothing is stored locally by this script.
+// PRIVACY: only `rate_limits` and `session_id` are forwarded — session_id lets the
+// daemon attribute the push to a session (drop a stale non-current-subscription push);
+// it is local metadata the user opted into by installing the statusline, and is already
+// the cockpit's primary key everywhere. The cwd/cost/model the payload also carries are
+// still stripped. Nothing is stored locally by this script.
 //
 // Invoked directly as the statusLine command (`node <root>/statusline-render.js`);
 // requires resolve against __dirname, so the working directory is irrelevant.
@@ -182,8 +185,8 @@ function renderLine(data) {
   return seg.join(C.dim + " · " + C.reset);
 }
 
-// Best-effort push of ONLY `rate_limits` to the daemon (see emit.js's ping for
-// the same port/token/timeout/exit discipline). Fired after the line is printed;
+// Best-effort push of `rate_limits` + `session_id` to the daemon (see emit.js's ping
+// for the same port/token/timeout/exit discipline). Fired after the line is printed;
 // swallows every error and always calls done() so the process exits promptly.
 function postUsage(data, done) {
   let called = false;
@@ -205,7 +208,10 @@ function postUsage(data, done) {
     } catch (_e) {
       token = "";
     }
-    const body = JSON.stringify({ rate_limits: rateLimits }); // strip everything else
+    // Forward rate_limits + session_id (the daemon attributes the push to a session);
+    // cwd/cost/model and everything else are stripped. An absent session_id is simply
+    // omitted by JSON.stringify — the daemon fails open (accepts the push) in that case.
+    const body = JSON.stringify({ rate_limits: rateLimits, session_id: data.session_id });
     const headers = {
       "content-type": "application/json",
       "content-length": Buffer.byteLength(body),

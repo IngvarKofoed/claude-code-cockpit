@@ -234,6 +234,14 @@ body {
 }
 .tile--alert .tile__value { color: var(--st-waiting); }
 
+/* Active-subscription chip: a full-width row so it sits on its own line above the
+   usage bars without warping the tile grid columns. Uses the plain, muted .chip look
+   (context, not an alert) — no dedicated colour treatment. */
+.sub-chip-row {
+  grid-column: 1 / -1;
+  margin-top: -2px;
+}
+
 /* ---------- Live usage bars (session 5h + weekly, from the statusline) ---------- */
 
 /* Full-width row below the tiles; the two windows sit side by side, stacking when narrow. */

@@ -85,6 +85,38 @@ test('validateConfig: invalid usagePace rejected, falls back to default', () => 
   assert.strictEqual(res.config.usagePace, 'both');
 });
 
+test('validateConfig: subscriptionLabelPattern defaults to the parenthesized-group regex', () => {
+  assert.strictEqual(DEFAULT_CONFIG.subscriptionLabelPattern, '\\(([^)]+)\\)');
+  // The default compiles and extracts the parenthesized part.
+  const re = new RegExp(DEFAULT_CONFIG.subscriptionLabelPattern);
+  assert.strictEqual(re.exec('FOSS Analytical (Lyra)')[1], 'Lyra');
+});
+
+test('validateConfig: accepts a valid regex pattern and "" (extraction off)', () => {
+  const ok = validateConfig({ subscriptionLabelPattern: '\\[(.+?)\\]' });
+  assert.strictEqual(ok.valid, true);
+  assert.strictEqual(ok.config.subscriptionLabelPattern, '\\[(.+?)\\]');
+
+  const off = validateConfig({ subscriptionLabelPattern: '' });
+  assert.strictEqual(off.valid, true);
+  assert.strictEqual(off.config.subscriptionLabelPattern, '');
+});
+
+test('validateConfig: rejects a pattern that does not compile as a RegExp', () => {
+  const res = validateConfig({ subscriptionLabelPattern: '(' }); // unbalanced paren
+  assert.strictEqual(res.valid, false);
+  assert.ok(res.errors.some((e) => e.includes('subscriptionLabelPattern')));
+  // Rejected -> config keeps the default (the on-disk value would be left untouched by writeConfig).
+  assert.strictEqual(res.config.subscriptionLabelPattern, DEFAULT_CONFIG.subscriptionLabelPattern);
+});
+
+test('validateConfig: rejects a non-string subscriptionLabelPattern', () => {
+  const res = validateConfig({ subscriptionLabelPattern: 42 });
+  assert.strictEqual(res.valid, false);
+  assert.ok(res.errors.some((e) => e.includes('subscriptionLabelPattern')));
+  assert.strictEqual(res.config.subscriptionLabelPattern, DEFAULT_CONFIG.subscriptionLabelPattern);
+});
+
 test('validateConfig: non-object input -> invalid, defaults returned', () => {
   const res = validateConfig(null);
   assert.strictEqual(res.valid, false);

@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
-const { normalizeUsage, normalizeUsageWindow, sameUsageWindows } = require('./usage');
+const { normalizeUsage, normalizeUsageWindow, sameUsageWindows, applyPattern, subLabel } = require('./usage');
 
 test('normalizeUsageWindow converts resets_at seconds -> ms and keeps usedPct', () => {
   assert.deepStrictEqual(normalizeUsageWindow({ used_percentage: 23.5, resets_at: 1738425600 }), {
@@ -41,12 +41,26 @@ test('normalizeUsage: full body normalizes both windows', () => {
   assert.deepStrictEqual(out, {
     fiveHour: { usedPct: 62, resetsAt: 1000000 },
     sevenDay: { usedPct: 45, resetsAt: 2000000 },
+    sessionId: null, // no session_id in the body
   });
 });
 
 test('normalizeUsage: windows are independent (one absent -> null, other kept)', () => {
   const out = normalizeUsage({ rate_limits: { five_hour: { used_percentage: 10, resets_at: 5 } } });
-  assert.deepStrictEqual(out, { fiveHour: { usedPct: 10, resetsAt: 5000 }, sevenDay: null });
+  assert.deepStrictEqual(out, { fiveHour: { usedPct: 10, resetsAt: 5000 }, sevenDay: null, sessionId: null });
+});
+
+test('normalizeUsage: passes through a non-empty session_id string', () => {
+  const out = normalizeUsage({ session_id: 'abc-123', rate_limits: { five_hour: { used_percentage: 10, resets_at: 5 } } });
+  assert.strictEqual(out.sessionId, 'abc-123');
+});
+
+test('normalizeUsage: malformed/absent session_id -> sessionId null (drop fails open)', () => {
+  const rl = { five_hour: { used_percentage: 10, resets_at: 5 } };
+  assert.strictEqual(normalizeUsage({ rate_limits: rl }).sessionId, null); // absent
+  assert.strictEqual(normalizeUsage({ session_id: '', rate_limits: rl }).sessionId, null); // empty string
+  assert.strictEqual(normalizeUsage({ session_id: 42, rate_limits: rl }).sessionId, null); // not a string
+  assert.strictEqual(normalizeUsage({ session_id: null, rate_limits: rl }).sessionId, null);
 });
 
 test('normalizeUsage: malformed body -> null (DROP, no partial update)', () => {
@@ -67,4 +81,69 @@ test('sameUsageWindows: null windows compare equal; a null snapshot is never equ
   assert.strictEqual(sameUsageWindows({ fiveHour: null, sevenDay: null }, { fiveHour: null, sevenDay: null }), true);
   assert.strictEqual(sameUsageWindows({ fiveHour: { usedPct: 1, resetsAt: 1 }, sevenDay: null }, { fiveHour: null, sevenDay: null }), false);
   assert.strictEqual(sameUsageWindows(null, { fiveHour: null, sevenDay: null }), false);
+});
+
+// sameUsageWindows ignores the new sessionId field (only the numbers matter for broadcast).
+test('sameUsageWindows: ignores sessionId (only rate-limit numbers gate a broadcast)', () => {
+  const a = { fiveHour: { usedPct: 10, resetsAt: 1 }, sevenDay: null, sessionId: 's1' };
+  const b = { fiveHour: { usedPct: 10, resetsAt: 1 }, sevenDay: null, sessionId: 's2' };
+  assert.strictEqual(sameUsageWindows(a, b), true);
+});
+
+// ---- applyPattern ------------------------------------------------------
+
+test('applyPattern: extracts capture group 1 (the parenthesized part)', () => {
+  assert.strictEqual(applyPattern('FOSS Analytical (Lyra)', '\\(([^)]+)\\)'), 'Lyra');
+});
+
+test('applyPattern: falls back to the whole match when the pattern has no group', () => {
+  assert.strictEqual(applyPattern('abc-123-xyz', '\\d+'), '123');
+});
+
+test('applyPattern: no match -> raw name unchanged', () => {
+  assert.strictEqual(applyPattern('Plain Org Name', '\\(([^)]+)\\)'), 'Plain Org Name');
+});
+
+test('applyPattern: empty/non-string pattern -> raw name unchanged (identity/off)', () => {
+  assert.strictEqual(applyPattern('FOSS (Lyra)', ''), 'FOSS (Lyra)');
+  assert.strictEqual(applyPattern('FOSS (Lyra)', null), 'FOSS (Lyra)');
+  assert.strictEqual(applyPattern('FOSS (Lyra)', undefined), 'FOSS (Lyra)');
+});
+
+test('applyPattern: invalid regex -> raw name unchanged (can never break the label)', () => {
+  assert.strictEqual(applyPattern('FOSS (Lyra)', '('), 'FOSS (Lyra)'); // unbalanced paren won't compile
+  assert.strictEqual(applyPattern('FOSS (Lyra)', '[a-'), 'FOSS (Lyra)');
+});
+
+test('applyPattern: an empty extraction falls back to the raw name (never blank)', () => {
+  // group 1 exists but matches empty; return the raw name rather than ''.
+  assert.strictEqual(applyPattern('hello', '(x*)'), 'hello');
+});
+
+test('applyPattern: non-string name is returned as-is', () => {
+  assert.strictEqual(applyPattern(null, '\\d+'), null);
+  assert.strictEqual(applyPattern(42, '\\d+'), 42);
+});
+
+// ---- subLabel ----------------------------------------------------------
+
+test('subLabel: applies the config pattern to the subscription base name', () => {
+  const teamSub = { id: 'o1', orgType: 'team', orgName: 'FOSS Analytical (Lyra)' };
+  assert.strictEqual(subLabel(teamSub, { subscriptionLabelPattern: '\\(([^)]+)\\)' }), 'Lyra');
+});
+
+test('subLabel: a personal sub with no parens falls back to the raw name', () => {
+  const personal = { id: 'p1', orgType: 'personal', displayName: 'Ada Lovelace' };
+  assert.strictEqual(subLabel(personal, { subscriptionLabelPattern: '\\(([^)]+)\\)' }), 'Ada Lovelace');
+});
+
+test('subLabel: missing/blank pattern is identity (returns the raw base name)', () => {
+  const teamSub = { id: 'o1', orgType: 'team', orgName: 'FOSS (Lyra)' };
+  assert.strictEqual(subLabel(teamSub, { subscriptionLabelPattern: '' }), 'FOSS (Lyra)');
+  assert.strictEqual(subLabel(teamSub, {}), 'FOSS (Lyra)'); // no field
+  assert.strictEqual(subLabel(teamSub, null), 'FOSS (Lyra)'); // no cfg
+});
+
+test('subLabel: a null subscription labels as "Personal"', () => {
+  assert.strictEqual(subLabel(null, { subscriptionLabelPattern: '\\(([^)]+)\\)' }), 'Personal');
 });

@@ -628,3 +628,36 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     by mtime/size) and reuses that parse for the visible page, so the O(total) sweep is amortized
     and off the SSE path; `total`/pagination reflect only kept rows. Repos are NOT filtered — a
     repo whose only sessions were empty still shows a 0/0 row; the ask was about sessions.
+
+66. Subscription-aware usage accounting (v0.23.0): every session's `sub` (organizationUuid + label)
+    is captured once at SessionStart by `emit.js` and embedded in the durable event — replay-safe
+    when subscriptions change across restarts. Rate-limit bar now drops pushes from sessions on an
+    OLD subscription (fail-open if either sub unknown), eliminating cross-sub bar clobber. Usage
+    records + per-repo rollups gain `subscription` as a first-class dimension; daily rollups derive
+    per-subscription breakdowns on demand from the logs. Dashboard shows all-time `subscriptionTotals`
+    (mirrors `repoTotals`), a Live active-subscription chip, and a per-subscription History chart.
+    New `subscriptionLabelPattern` config (regex, default `\(([^)]+)\)` extracts parenthesized name)
+    relabels subscriptions at payload-build time, never touching stored data — so label changes
+    re-label history retroactively. Known limit: mid-session subscription switch mis-attributes
+    until the session ends (self-heals); backfill leaves subscription null (can't recover from
+    transcript). Fail-open: pre-feature/API-key sessions bucket as "unknown" in stats, never wrong.
+
+67. Fixed the entry-66 History "Tokens & cost per subscription" chart, which always rendered
+    empty: it summed a per-day `d.bySubscription` field that `buildHistory` never emits — the
+    breakdown is TOP-LEVEL and range-aggregated (`App.histData.bySubscription`), not per-day.
+    The Live active-subscription chip's tooltip now actually shows the all-time
+    `subscriptionTotals` figure (tokens + cost) it was already fetching but not displaying —
+    was a generic static string, wasting the server-side aggregation entry 66 shipped.
+
+68. Usage records now persist `subscriptionName` (the raw base name) alongside the subscription
+    id, so a recomputed PAST day keeps a real per-subscription label instead of the raw org UUID.
+    Before, only the id was stored; a subscription used only on a rolled-over day (never live-
+    ingested with its name within the aggregated range) showed its UUID in History/all-time views
+    — `mergeSubName` recovered a name only if some other day in the range had it. Closes that seam;
+    old records lacking the field still fall back to the id (then mergeSubName), so no regression.
+
+69. `PUT /api/config` now also pushes a fresh STATE frame (`markDirty`), not just the config frame.
+    Several state fields are server-computed from config — subscription labels (via
+    `subscriptionLabelPattern`) and every cost figure — so without it an already-open dashboard kept
+    showing stale labels/costs until the next event or a reload. Found in browser verification:
+    editing the label pattern didn't relabel the Live chip live; now it does.
