@@ -25,6 +25,7 @@
   --st-idle: #6b7688;
   --st-error: #e2564f;
   --st-ended: #566173;
+  --st-paused: #8b7bff; /* global pause-gate freeze — indigo/violet, distinct from every other status hue */
 
   /* Chart tokens (validated dark categorical/sequential set) */
   --series-1: #3987e5;
@@ -104,8 +105,16 @@ body {
 .nav__tab:hover { background: var(--surface-2); color: var(--ink); }
 .nav__tab.is-active { background: var(--accent-soft); color: var(--ink); }
 
-.conn {
+/* Right end of the topbar: the global Pause/Resume button + the conn indicator, kept together
+   as one group so they stay adjacent whether or not the button is shown: [nav] …… [Pause] [● live].
+   The group carries the auto-margin; its children don't (two auto-margins would split the gap). */
+.topbar__right {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.conn {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -154,6 +163,16 @@ body {
   border-radius: 6px;
   color: #fff;
 }
+/* Global pause-gate freeze — a distinct indigo/violet tint (--st-paused) so it never reads
+   as an error, unlike the red connection-lost banner above (same .banner/.is-shown mechanism,
+   a separate element since the two states are independent). */
+.banner--paused {
+  background: rgba(139, 123, 255, 0.14);
+  border-bottom: 1px solid rgba(139, 123, 255, 0.4);
+  color: #cfc7ff;
+}
+.banner__duration { font-variant-numeric: tabular-nums; }
+.banner__note { opacity: 0.85; }
 
 /* ---------- Views ---------- */
 
@@ -349,6 +368,8 @@ body {
 
 /* ---------- Live cards ---------- */
 
+/* Holds the Pause/Resume button (the Live view's header was deliberately dropped — see the
+   card-decluttering pass — so this stays a single-purpose row, not a full header). */
 .cards {
   display: grid;
   /* 420px fits THREE cards across the 1400px-max content column while still holding
@@ -381,6 +402,7 @@ body {
 .card[data-status="waiting"] .card__rail { background: var(--st-waiting); }
 .card[data-status="error"] .card__rail { background: var(--st-error); }
 .card[data-status="ended"] .card__rail { background: var(--st-ended); }
+.card[data-status="paused"] .card__rail { background: var(--st-paused); }
 
 .card--waiting {
   border-color: rgba(245, 177, 32, 0.55);
@@ -465,6 +487,7 @@ body {
 .card[data-status="running"] .badge { color: var(--st-running); background: rgba(51, 193, 122, 0.12); }
 .card[data-status="waiting"] .badge { color: var(--st-waiting); background: rgba(245, 177, 32, 0.14); }
 .card[data-status="error"] .badge { color: var(--st-error); background: rgba(226, 86, 79, 0.14); }
+.card[data-status="paused"] .badge { color: var(--st-paused); background: rgba(139, 123, 255, 0.14); }
 
 .card__where {
   display: flex;
@@ -759,6 +782,7 @@ body {
 .sbadge[data-status="waiting"] { color: var(--st-waiting); background: rgba(245, 177, 32, 0.14); }
 .sbadge[data-status="error"] { color: var(--st-error); background: rgba(226, 86, 79, 0.14); }
 .sbadge[data-status="idle"] { color: var(--st-idle); }
+.sbadge[data-status="paused"] { color: var(--st-paused); background: rgba(139, 123, 255, 0.14); }
 
 /* ---------- Pagination ---------- */
 
@@ -770,9 +794,7 @@ body {
   margin-top: 16px;
 }
 .pager:empty { margin-top: 0; }
-.pager .btn { margin-top: 0; }
-.pager .btn:disabled { opacity: 0.4; cursor: default; }
-.pager .btn:disabled:hover { background: var(--surface-2); }
+.pager .btn { margin-top: 0; } /* :disabled styling now comes from the general .btn:disabled rule above */
 .pager__label {
   color: var(--ink-2);
   font-size: 12.5px;
@@ -1001,6 +1023,8 @@ body {
 }
 .btn:hover { background: var(--surface-3); }
 .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.btn:disabled { opacity: 0.4; cursor: default; }
+.btn:disabled:hover { background: var(--surface-2); }
 .btn--inline { margin-top: 0; }
 /* Destructive action (delete / cleanup confirm). */
 .btn--danger {
@@ -1009,6 +1033,14 @@ body {
   color: #f4b7b4;
 }
 .btn--danger:hover { background: rgba(226, 86, 79, 0.26); color: #fff; }
+/* Pause gate button (topbar), while a global pause is active — mirrors --danger's
+   tint-border treatment but in the paused indigo/violet. */
+.btn--paused {
+  border-color: rgba(139, 123, 255, 0.5);
+  background: rgba(139, 123, 255, 0.16);
+  color: #cfc7ff;
+}
+.btn--paused:hover { background: rgba(139, 123, 255, 0.26); color: #fff; }
 
 /* ---------- Per-repo row action (⋯ menu) ---------- */
 
@@ -1126,7 +1158,6 @@ body {
 
 @media (max-width: 620px) {
   .topbar { flex-wrap: wrap; gap: 12px; }
-  .conn { margin-left: 0; }
   .main { padding: 16px; }
 }
 

@@ -24,6 +24,10 @@ const DEFAULT_CONFIG = {
   usagePace: 'both', // 'both' | 'tick' | 'delta' | 'off' — Live usage-bar pace cue
   events: { sessionFinished: true, needsInput: true, longRunning: false, turnFailed: true },
   longRunningThresholdMs: 300000,
+  // Pause gate: opt-in master switch (default off) + optional usage auto-pilot.
+  // autoPauseFiveHourPct is the 5h rate-limit threshold that auto-pauses (0 = off).
+  pauseGateEnabled: false,
+  autoPauseFiveHourPct: 0,
   cost: {
     enabled: true,
     currency: 'USD',
@@ -178,7 +182,7 @@ function validateConfig(input) {
     else cfg.port = p;
   }
 
-  for (const key of ['osNotifications', 'sound', 'browserSounds']) {
+  for (const key of ['osNotifications', 'sound', 'browserSounds', 'pauseGateEnabled']) {
     if (key in input) {
       const b = toBool(input[key]);
       if (b === null) errors.push(`${key} must be a boolean`);
@@ -223,6 +227,13 @@ function validateConfig(input) {
       if (n === null) errors.push(`${key} must be a number`);
       else cfg[key] = clampMin(n, 0);
     }
+  }
+
+  // Usage auto-pilot threshold: a percentage clamped to [0,100] (0 = off).
+  if ('autoPauseFiveHourPct' in input) {
+    const n = toNum(input.autoPauseFiveHourPct);
+    if (n === null) errors.push('autoPauseFiveHourPct must be a number');
+    else cfg.autoPauseFiveHourPct = Math.min(100, clampMin(n, 0));
   }
 
   if ('cost' in input) {

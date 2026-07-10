@@ -3,7 +3,9 @@
 // Reads the Claude Code statusline JSON payload on stdin (see
 // https://code.claude.com/docs/en/statusline "Available data") and prints ONE
 // colored line:
-//   cwd · ctx-bar · 5h-bar · reset · tokens · cost · branch · model
+//   [⏸ PAUSED] · cwd · ctx-bar · 5h-bar · reset · tokens · cost · branch · model
+// The leading paused segment only appears when the pause-gate control file
+// (scripts/pause.js) is set AND the feature is opted in (pauseGateEnabled).
 //
 // Then, best-effort and AFTER the line is printed, it POSTs ONLY the payload's
 // `rate_limits` to the daemon's `/internal/usage`, which lights up the Live
@@ -26,6 +28,7 @@ const http = require("http");
 // still renders — only the best-effort POST (paths) and the branch segment (repo) drop.
 let paths = null;
 let repoLib = null;
+let pauseLib = null;
 try {
   paths = require("../scripts/paths.js");
 } catch (_e) {
@@ -35,6 +38,11 @@ try {
   repoLib = require("../scripts/repo.js");
 } catch (_e) {
   repoLib = null;
+}
+try {
+  pauseLib = require("../scripts/pause.js");
+} catch (_e) {
+  pauseLib = null;
 }
 
 // Best-effort forwarder budget; the printed line has already flushed by then.
@@ -117,7 +125,25 @@ function branchOf(payload, dir) {
 function renderLine(data) {
   const seg = [];
 
-  // Order: cwd · ctx · usage(5h) · tokens · cost · branch · model.
+  // Order: [paused] · cwd · ctx · usage(5h) · tokens · cost · branch · model.
+
+  // paused = the pause-gate control file (scripts/pause.js), prepended ahead of
+  // everything else. Shown only when the control file holds a paused sentinel
+  // AND the feature is opted in — mirrors gateDecision's own fail-open rule so
+  // a stray/leftover control file never shows PAUSED for a user who hasn't
+  // opted in. pauseLib may be null (see the defensive require above); either
+  // way a failure here must never break the rest of the line.
+  if (pauseLib) {
+    try {
+      // Use the canonical gateDecision rule (control file + opt-in flag) so the
+      // statusline's PAUSED indicator can never diverge from what the gate enforces.
+      if (pauseLib.gateDecision(pauseLib.readPauseState(), pauseLib.pauseGateEnabled()) === "wait") {
+        seg.push(C.bold + C.red + "⏸ PAUSED" + C.reset);
+      }
+    } catch (_e) {
+      /* no paused segment */
+    }
+  }
 
   // cwd = the directory where Claude was STARTED — prefer workspace.project_dir (the original
   // project dir) over current_dir, then cwd; basename only. (They coincide unless the session

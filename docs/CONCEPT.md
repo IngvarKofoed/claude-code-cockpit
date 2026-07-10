@@ -37,13 +37,14 @@ Plus the notifier's ambient layer: an OS notification and/or a sound when a sess
 
 ## Core capabilities (in scope)
 
-1. **Live session overview.** Per active session: repository (git root name + full path), branch, status (`running` / `waiting-for-input` / `idle` / `error`), the elapsed time of the current prompt (ticking live), and session age.
+1. **Live session overview.** Per active session: repository (git root name + full path), branch, status (`running` / `waiting-for-input` / `idle` / `paused` / `error`), the elapsed time of the current prompt (ticking live), and session age.
 2. **Live activity detail.** What Claude is doing *now* — the current tool (running `Bash`, editing a file, waiting on a permission prompt) derived from tool-use hooks — not just a running/idle flag.
 3. **Per-repository accounting.** Total active time, prompt count, session count, token totals (input / output / cache), and an **estimated dollar cost**, with a time-range filter. *Active time* is engaged wall-clock — time a session spent working a turn or running a background workflow — and deliberately **excludes** time spent waiting on you (a permission prompt) or sitting idle, so it reflects real work rather than elapsed clock.
 4. **History & trends.** Retained aggregates rendered as charts: tokens and time per day, activity by hour of day, and top repositories by time or tokens.
 5. **Session directory.** A newest-first, paginated list of *every* Claude Code session still on disk — read straight from the transcript files, so it covers pre-cockpit and already-ended sessions the accounting store no longer holds. Each row shows the session's AI-generated title, its repository, when it was last active, and its token/cost totals, with live sessions badged active. Because it reads Claude Code's transcripts (not the cockpit's store), it follows Claude Code's retention — a repo cleared from the accounting views still lists its sessions here. The verbatim last prompt is never shown; only the derived title.
 6. **Notifications & sounds.** OS notifications (opt-in, configurable per event) plus in-dashboard sounds, for: session finished, needs input, prompt running too long, and turn failed.
-7. **Zero-friction, cross-platform, private.** No native build step, works on macOS / Windows / Linux, and all data stays on your machine.
+7. **Pause gate.** An optional control-file-based "all-sessions freeze" — one toggle button or slash command instantly blocks every Claude Code session's tool execution via a separate `PreToolUse` gate hook, and resumes all at once when flipped back. The gate is opt-in (`pauseGateEnabled` config), fail-open (missing / garbage control file runs tools), and includes an optional auto-pilot: pause when 5-hour usage crosses a threshold, resume when the window resets. Pause/resume are recorded in the event log and shown on the dashboard and statusline. *Privacy note: pause events carry no message content, only metadata.*
+8. **Zero-friction, cross-platform, private.** No native build step, works on macOS / Windows / Linux, and all data stays on your machine.
 
 ## Principles
 

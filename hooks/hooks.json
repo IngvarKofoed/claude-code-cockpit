@@ -12,7 +12,10 @@
       { "hooks": [ { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/emit.js\"" } ] }
     ],
     "PreToolUse": [
-      { "matcher": "*", "hooks": [ { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/emit.js\"" } ] }
+      { "matcher": "*", "hooks": [
+        { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/emit.js\"" },
+        { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/gate.js\"", "timeout": 86400 }
+      ] }
     ],
     "PostToolUse": [
       { "matcher": "*", "hooks": [ { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/emit.js\"" } ] }

@@ -317,6 +317,10 @@ function detectSoundCues(sessions) {
 
 function checkLongRunning(now) {
   if (!App.cfg || !App.cfg.browserSounds || !evOn("longRunning")) return;
+  // While globally paused, a mid-prompt session's timer is frozen and it is deliberately
+  // frozen by the gate — don't fire a "long-running" chime for a session the user paused
+  // (its raw status is still "running" and currentPromptStartedAt keeps aging).
+  if (App.state && App.state.paused && App.state.paused.active) return;
   const th = num(App.cfg.longRunningThresholdMs);
   if (!(th > 0)) return;
   const sessions = (App.state && App.state.sessions) || [];
@@ -357,6 +361,7 @@ function tick() {
     t.el.textContent = t.kind === "age" ? fmtAge(ms) : fmtDuration(ms);
   }
   tickUsage(now); // advance the usage bars' reset countdown + pace cue on the same loop
+  tickPauseBanner(now); // advance the paused-duration banner on the same loop
   checkLongRunning(now);
 }
 
@@ -376,22 +381,41 @@ const STATUS_LABEL = {
   idle: "Idle",
   error: "Error",
   ended: "Ended",
+  paused: "Paused",
 };
 
-// The card's effective status. A session with background work still in flight (bgTasks —
-// Claude Code's authoritative background_tasks count) reads as "running": it IS working after
-// its turn's Stop, so the badge, colour, big timer and pulse should all say so. A permission
-// prompt or error takes precedence (they need attention / are terminal). Derived from the
-// reliable count, never the ±unreliable subagent counter — so the timer can't disagree with
-// the colour, and the "done" pulse fires only on the real engaged→idle transition.
+// The card's effective status — the RELIABLE work signal, and deliberately pause-UNAWARE.
+// A session with background work still in flight (bgTasks — Claude Code's authoritative
+// background_tasks count) reads as "running": it IS working after its turn's Stop, so the
+// badge, colour, big timer and pulse should all say so. A permission prompt or error takes
+// precedence (they need attention / are terminal). Derived from the reliable count, never the
+// ±unreliable subagent counter — so the timer can't disagree with the colour, and the "done"
+// pulse fires only on the real engaged→idle transition. This is what sound cues, long-running,
+// and sort key off; the GLOBAL pause is a DISPLAY-only overlay applied separately (displayStatus)
+// so pausing/resuming can't manufacture phantom status transitions here.
 function effectiveStatus(s) {
   const raw = s.status || "idle";
   if (raw === "waiting" || raw === "error") return raw;
   return raw === "running" || num(s.bgTasks) > 0 ? "running" : "idle";
 }
 
+// Rendering-only status: overlays the GLOBAL pause (docs/specs/2026-07-09-pause-gate.md —
+// App.state.paused.active) on top of effectiveStatus. A pause freezes running/idle sessions
+// (they show "Paused"), but a session WAITING on a permission prompt or one that ended on an
+// ERROR keeps that status — those need attention / are terminal and must not be masked by the
+// global freeze (the PAUSED banner already conveys the cockpit-wide state). Used ONLY for the
+// card/row display; cues, long-running, and sort use effectiveStatus so the overlay never
+// creates a phantom transition.
+function displayStatus(s) {
+  const eff = effectiveStatus(s);
+  if ((eff === "running" || eff === "idle") && App.state && App.state.paused && App.state.paused.active) {
+    return "paused";
+  }
+  return eff;
+}
+
 function activityText(s) {
-  switch (effectiveStatus(s)) {
+  switch (displayStatus(s)) {
     case "running":
       return s.currentActivity ? "Running " + s.currentActivity : "Working…";
     case "waiting":
@@ -400,6 +424,8 @@ function activityText(s) {
       return "Turn failed" + (s.errorReason ? " · " + s.errorReason : "");
     case "ended":
       return "Session ended";
+    case "paused":
+      return "Paused — frozen by the pause gate";
     default:
       return s.currentActivity || "Idle";
   }
@@ -410,7 +436,7 @@ function chip(text, mono) {
 }
 
 function cardHTML(s) {
-  const status = effectiveStatus(s);
+  const status = displayStatus(s); // display overlay: a global pause shows "Paused" + freezes the timer
   const waiting = status === "waiting";
   const promptStart = s.currentPromptStartedAt;
   const promptStartMs = promptStart ? Date.parse(promptStart) : 0;
@@ -536,6 +562,91 @@ function cardHTML(s) {
 
 function tile(label, value, alert) {
   return `<div class="tile ${alert ? "tile--alert" : ""}"><div class="tile__label">${esc(label)}</div><div class="tile__value">${esc(String(value))}</div></div>`;
+}
+
+// ---- Global pause (pause gate) ----------------------------------------------
+// A daemon-wide freeze (docs/specs/2026-07-09-pause-gate.md) blocks every session's next
+// tool call until the control file flips back. There is no per-session paused state —
+// App.state.paused is ONE global record the daemon folds from the event log and pushes on
+// /api/state + SSE. Drives three things: effectiveStatus() above (every card/row reads
+// "paused"), a dedicated global banner shown on every view (kept separate from the
+// connection-lost #banner — the two can be true independently and would otherwise fight over
+// one element's text), and a Pause/Resume button near the Live ribbon.
+
+// The CURRENT pause span's elapsed time (now − since) — what "⏸ Paused · Xm" means: how long
+// THIS freeze has been on, ticking up from 0 and resetting on each new pause. Deliberately does
+// NOT add p.pausedMs: that is the daemon's cumulative total of ALL prior closed spans (across
+// restarts and days), so folding it in made a fresh 1-minute pause read as many minutes. Total-
+// paused accounting is a separate concern, not this live banner's number.
+function pauseDurationMs(p, now) {
+  const since = Date.parse(p.since);
+  return Number.isFinite(since) ? Math.max(0, now - since) : 0;
+}
+
+// Show/hide the banner and (re)write its mostly-static note on a state change; the ticking
+// duration itself is advanced every second by tickPauseBanner via the shared tick() loop, so
+// this doesn't need to run more than once per snapshot/SSE frame.
+function updatePauseBanner() {
+  const el = $("pauseBanner");
+  if (!el) return;
+  const p = App.state && App.state.paused;
+  const active = !!(p && p.active);
+  el.classList.toggle("is-shown", active);
+  if (!active) return;
+  $("pauseBannerNote").textContent = p.reason === "usage" ? " · auto (5h usage ≥ limit)" : "";
+  $("pauseBannerDuration").textContent = " · " + fmtDuration(pauseDurationMs(p, estNow()));
+}
+
+// Advance the banner's live duration each second; a no-op while it's hidden.
+function tickPauseBanner(now) {
+  const p = App.state && App.state.paused;
+  if (!p || !p.active) return;
+  const el = $("pauseBannerDuration");
+  if (el) el.textContent = " · " + fmtDuration(pauseDurationMs(p, now));
+}
+
+// Global Pause/Resume switch in the topbar — one control for every session, not per-session.
+// Like the ⋯ repo-delete menu, it POSTs then refreshState() rather than trusting an optimistic
+// local flip, so it always reflects the daemon's reconciled state. HIDDEN entirely when the
+// feature is off in Settings: the topbar is persistent across every view, so a permanently
+// disabled control there would be clutter on each page — the feature is opt-in and discoverable
+// in Settings, so it only appears once armed.
+function updatePauseButton() {
+  const btn = $("pauseBtn");
+  if (!btn) return;
+  const enabled = !!(App.cfg && App.cfg.pauseGateEnabled);
+  btn.hidden = !enabled;
+  if (!enabled) return;
+  const active = !!(App.state && App.state.paused && App.state.paused.active);
+  btn.textContent = active ? "Resume" : "Pause";
+  btn.title = active
+    ? "Resume every session's next tool call"
+    : "Pause every session's next tool call";
+  btn.classList.toggle("btn--paused", active);
+}
+
+async function onPauseClick() {
+  const btn = $("pauseBtn");
+  if (!btn || btn.disabled) return;
+  const active = !!(App.state && App.state.paused && App.state.paused.active);
+  try {
+    await api("/api/pause", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paused: !active }),
+    });
+    await refreshState();
+    toast(active ? "Resumed" : "Paused — every session's next tool call will block");
+  } catch (_e) {
+    toast(active ? "Could not resume" : "Could not pause", true);
+  }
+}
+
+// Refresh both pause-driven UI pieces together — called wherever App.state.paused or
+// App.cfg.pauseGateEnabled might have just changed (a fresh snapshot, an SSE config frame).
+function syncPauseUI() {
+  updatePauseBanner();
+  updatePauseButton();
 }
 
 // ---- Live usage bars (session 5h + weekly, from the statusline) -------------
@@ -1016,7 +1127,7 @@ function liveTickAnchor(s) {
 // undefined for a plain past session). Every string that reaches innerHTML is esc()'d — the
 // title is AI-generated text and could otherwise inject markup.
 function sessionRowHTML(r, liveS, showCost) {
-  const st = liveS ? effectiveStatus(liveS) : null;
+  const st = liveS ? displayStatus(liveS) : null;
   const statusCell = st
     ? `<td class="col-status"><span class="sbadge" data-status="${esc(st)}">${esc(STATUS_LABEL[st] || st)}</span></td>`
     : `<td class="col-status"></td>`;
@@ -1185,7 +1296,7 @@ function sessionsOverlaySig() {
   return (App.sessionsRows || [])
     .map((r) => {
       const s = live[r.sessionId];
-      const st = s ? effectiveStatus(s) : "";
+      const st = s ? displayStatus(s) : "";
       const anchor = s && st === "running" ? liveTickAnchor(s) : 0;
       return r.sessionId + ":" + st + ":" + anchor;
     })
@@ -1883,6 +1994,18 @@ function settingsHTML(cfg) {
            <option value="tool" ${cfg.activityDetail === "tool" ? "selected" : ""}>Tool name only</option>
            <option value="args" ${cfg.activityDetail === "args" ? "selected" : ""}>Tool name + arguments</option>
          </select>`
+      ) +
+      // Pause gate: the master switch (below) plus its optional usage-based auto-pilot —
+      // mirrors the Notifications section's master-toggle-then-detail pattern above.
+      fieldRow(
+        "Pause gate",
+        "Let /cockpit:pause and this dashboard's Pause button freeze every session's next tool call",
+        sw("set-pauseGateEnabled", cfg.pauseGateEnabled)
+      ) +
+      fieldRow(
+        "Auto-pause at 5h usage %",
+        "Auto-pause when the 5h usage window crosses this % (needs the statusline installed); 0 = off",
+        `<input class="input" id="set-autoPauseFiveHourPct" type="number" min="0" max="100" step="1" value="${num(cfg.autoPauseFiveHourPct)}"><span class="chip">%</span>`
       )
   );
 
@@ -1980,6 +2103,8 @@ function readSettingsForm() {
     browserSounds: cb("set-browserSounds"),
     activityDetail: $("set-activityDetail").value,
     usagePace: $("set-usagePace").value,
+    pauseGateEnabled: cb("set-pauseGateEnabled"),
+    autoPauseFiveHourPct: nv("set-autoPauseFiveHourPct", 0),
     events: {
       sessionFinished: cb("set-ev-sessionFinished"),
       needsInput: cb("set-ev-needsInput"),
@@ -2079,6 +2204,7 @@ function applyState(state) {
   App.state = state;
   if (state.config) App.cfg = state.config;
   if (typeof state.now === "number") App.clockOffset = state.now - Date.now();
+  syncPauseUI(); // before renderLive/renderSessions — displayStatus() reads App.state.paused
   detectSoundCues(state.sessions || []);
   renderLive();
   throttledReposRefresh();
@@ -2092,6 +2218,7 @@ function applyState(state) {
 // A config arrived out-of-band (SSE) or a save changed cost display; refresh the
 // visible view. Settings is only re-rendered when the user isn't mid-edit.
 function onConfigChanged() {
+  updatePauseButton(); // pauseGateEnabled may have just flipped (enable/disable+hint)
   renderLive();
   refreshReposView(); // rare, so refresh immediately (cost column may have changed)
   // Refetch (not just re-render): cost is computed server-side per request, so a pricing
@@ -2224,6 +2351,8 @@ function init() {
     if (b.id === "sessPrev") loadSessions(App.sessionsPage - 1);
     else if (b.id === "sessNext") loadSessions(App.sessionsPage + 1);
   });
+
+  $("pauseBtn").addEventListener("click", onPauseClick);
 
   $("repoRange").addEventListener("click", (e) => {
     const b = e.target.closest(".range__btn");

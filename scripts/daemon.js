@@ -28,6 +28,7 @@ const pricing = require('./pricing');
 const notify = require('./notify');
 const repoLib = require('./repo');
 const usageLib = require('./usage');
+const pause = require('./pause');
 
 const VERSION = require('../package.json').version;
 const PLUGIN_PATH = process.env.CLAUDE_PLUGIN_ROOT || path.join(__dirname, '..');
@@ -42,6 +43,7 @@ const HEARTBEAT_MS = 15000;
 const SNAPSHOT_MS = 5000;
 const IDLE_CHECK_MS = 60000;
 const SSE_COALESCE_MS = 250; // ≤ ~4 state pushes / second
+const PAUSE_POLL_MS = 2000; // control-file backstop: surface a direct edit / missed nudge in the UI within ~2s
 const REAP_IDLE_FALLBACK_MS = 6 * 3600 * 1000; // reap PID-less sessions after 6h idle
 const REAP_GRACE_MS = 90 * 1000; // min quiet time before reaping a PID-dead session
 
@@ -76,6 +78,20 @@ const sessionActiveDayCache = new Map(); // dateStr (PAST day only) -> Map<sid, 
 let sessionActiveTotalsCache = null; // { at, map: Map<sid, {activeMs,chats,tools,agents}> } short-TTL sum across days (includes the live current day)
 let repoTotalsCache = null; // memoized all-time per-repo totals for /api/state; invalidated on any token/rollup/cost-config change (see repoTotalsAllTime)
 let rateLimitUsage = null; // latest GLOBAL rate-limit snapshot from the statusline forwarder (POST /internal/usage); null until one arrives. Named distinctly from the many function-local `usage` vars in this file so a dropped `let` can't silently clobber it. Served on buildStatePayload().usage.
+
+// Global pause-gate tracker (session-less: the control file is the sole ENFORCEMENT ruler;
+// this only MIRRORS it for the dashboard/statusline). `pauseAcc` is the shared span
+// accumulator (pause.newPauseAcc — closed-span pausedMs + one open span), folded ONLY via
+// pause.foldPauseEvent so the boot rebuild, the live reconciler, and pause.foldPauseState
+// share one implementation. It is PERSISTED in the snapshot (so an open pause span survives a
+// restart / day rollover — its start isn't reset), then reconciled against the control file.
+// `lastPauseSentinel` is the daemon's last-known EFFECTIVE state (RUNNING whenever the feature
+// is disabled, regardless of the file) — the reconcile baseline.
+let pauseAcc = pause.newPauseAcc();
+let lastPauseSentinel = pause.RUNNING;
+let pauseRestoredFromSnapshot = false; // true once loadSnapshot restores pauseAcc (boot prefers it over the log fold)
+let lastFiveHourPct = null; // last 5h usedPct the usage auto-pilot saw (its rising-edge memory)
+let pausePollTimer = null; // the ~2s control-file backstop poll interval (cleared on shutdown)
 
 let replaying = false; // true while replaying the log on boot: suppress side effects
 
@@ -201,6 +217,10 @@ let cleaned = false;
 function cleanup() {
   if (cleaned) return;
   cleaned = true;
+  if (pausePollTimer) {
+    clearInterval(pausePollTimer);
+    pausePollTimer = null;
+  }
   for (const p of [paths.lockPath(), paths.pidPath(), paths.portPath()]) {
     try {
       fs.unlinkSync(p);
@@ -287,6 +307,18 @@ function loadSnapshot() {
   // Restore the last-known usage snapshot so a restart keeps the bars until the
   // next statusline tick. Tolerate an absent key (older snapshot) -> stays null.
   if (snap.usage && typeof snap.usage === 'object') rateLimitUsage = snap.usage;
+  // Restore the pause span accumulator + baseline (an open span keeps its real start across
+  // the restart / day rollover). Tolerate an absent key (older snapshot) -> defaults, and
+  // main() then falls back to folding today's log. main() reconcile()s against the file after.
+  if (snap.pauseAcc && typeof snap.pauseAcc === 'object') {
+    pauseAcc = {
+      pausedMs: num(snap.pauseAcc.pausedMs),
+      openTs: snap.pauseAcc.openTs != null ? snap.pauseAcc.openTs : null,
+      openReason: snap.pauseAcc.openReason != null ? snap.pauseAcc.openReason : null,
+    };
+    pauseRestoredFromSnapshot = true;
+  }
+  if (typeof snap.pauseSentinel === 'string') lastPauseSentinel = snap.pauseSentinel;
 }
 
 // Apply one persisted usage record to a rollup. A `backfill` record (historical
@@ -846,6 +878,97 @@ function tailOnce() {
   drainLog(currentDate);
 }
 
+// ---- pause gate -------------------------------------------------------------
+
+// The EFFECTIVE control sentinel: the file's sentinel only when the feature is enabled;
+// RUNNING otherwise. Accounting (paused time) and the UI must track ENFORCED pauses only —
+// the gate fails open when disabled, so a file armed while disabled freezes nothing and must
+// not read as paused (finding: UI showed a freeze the gate wasn't enforcing).
+function effectivePauseSentinel() {
+  const s = pause.readPauseState();
+  return cfg.pauseGateEnabled === true && pause.isPaused(s) ? s : pause.RUNNING;
+}
+
+// The SINGLE place a pause transition is recorded — so there are never duplicate
+// Paused/Resumed events. Reads the EFFECTIVE sentinel; if its paused/running state differs
+// from the last-known baseline (`lastPauseSentinel`), it appends ONE {ts,event,reason} line
+// to today's event log (durable history + the cold-start fallback fold), folds it DIRECTLY
+// into pauseAcc via pause.foldPauseEvent, updates the baseline, persists the snapshot (so the
+// open span survives a crash before the next periodic save), and broadcasts. Folding directly
+// — rather than via tailOnce reading back the appended line — means a transient tail/read
+// error can't strand the tracker with the baseline already advanced (the earlier bug); on an
+// append failure we return BEFORE touching the baseline so a later reconcile retries. A pause
+// whose only change is its reason (manual <-> usage, still paused) is relabeled in place with
+// no event and no span change. The daemon is a low-frequency SECOND writer of the otherwise
+// hook-written event log — single atomic appends on transitions only. Triggered by
+// POST /api/pause, the auto-pilot, the /internal/event nudge, the ~2s backstop poll, config
+// changes, and boot. A no-change reconcile does nothing (no tail spam).
+function reconcile() {
+  const sentinel = effectivePauseSentinel();
+  const nowPaused = pause.isPaused(sentinel);
+  const wasPaused = pause.isPaused(lastPauseSentinel);
+
+  if (nowPaused === wasPaused) {
+    // No paused/running transition, but the reason may have changed while staying paused
+    // ('paused' <-> 'paused-usage'). Relabel the open span in place — no event, no span math.
+    if (nowPaused && sentinel !== lastPauseSentinel) {
+      pauseAcc.openReason = pause.sentinelReason(sentinel);
+      lastPauseSentinel = sentinel;
+      markDirty();
+    } else if (sentinel !== lastPauseSentinel) {
+      lastPauseSentinel = sentinel; // running-variant change ('' vs 'running'): baseline only
+    }
+    return;
+  }
+
+  const rec = {
+    ts: new Date().toISOString(),
+    event: nowPaused ? 'Paused' : 'Resumed',
+    reason: pause.sentinelReason(sentinel) || 'manual',
+  };
+  try {
+    fs.mkdirSync(paths.eventsDir(), { recursive: true });
+    fs.appendFileSync(paths.eventLogPath(currentDate), JSON.stringify(rec) + '\n');
+  } catch (e) {
+    log('pause event append failed ' + e);
+    return; // leave the baseline unchanged so a later reconcile retries the append
+  }
+  pause.foldPauseEvent(pauseAcc, rec); // authoritative live tracker update (not via tailOnce)
+  lastPauseSentinel = sentinel;
+  saveSnapshot(); // persist the (possibly open) span now so a crash can't reset its start
+  markDirty();
+}
+
+// Usage auto-pilot: given the current 5h usedPct, auto-pause when it crosses the configured
+// threshold and auto-resume when the window resets — reusing the entry-42 rate-limit numbers.
+// Requires pauseGateEnabled + autoPauseFiveHourPct>0 + a numeric usedPct. Goes through the
+// SAME writePauseState + reconcile path as a manual toggle, so auto and manual pauses share
+// one event/accounting/broadcast path and differ only by `reason`. The rising-edge / reset /
+// never-clobber-a-manual-pause rule lives in pure pause.autoPauseDecision. prevPct is
+// remembered across calls (updated every call, action or not).
+function evalAutoPause(curPct) {
+  if (!(cfg.pauseGateEnabled && num(cfg.autoPauseFiveHourPct) > 0)) return;
+  if (!(typeof curPct === 'number' && Number.isFinite(curPct))) return;
+  const decision = pause.autoPauseDecision({
+    prevPct: lastFiveHourPct,
+    curPct,
+    threshold: cfg.autoPauseFiveHourPct,
+    sentinel: pause.readPauseState(),
+  });
+  lastFiveHourPct = curPct;
+  try {
+    if (decision === 'pause') {
+      pause.writePauseState('paused-usage');
+      reconcile();
+    } else if (decision === 'resume') {
+      pause.writePauseState(pause.RUNNING);
+      reconcile();
+    }
+  } catch (e) {
+    log('auto-pause decision (' + decision + ') failed ' + e);
+  }
+}
+
 // ---- event handling ---------------------------------------------------------
 
 function handleEvent(ev) {
@@ -870,6 +993,12 @@ function handleEvent(ev) {
   }
 
   if (replaying) return; // boot replay: rebuild live state only, no side effects
+
+  // Global pause transitions (session-less Paused/Resumed) are NOT folded here: reconcile()
+  // is the single writer AND the single folder of the pause tracker (it appends the line and
+  // folds it directly into pauseAcc), so the tail re-reading the appended line must be a
+  // no-op — aggregate.applyEvent and every per-session branch already ignore session-less
+  // events, so nothing more is needed.
 
   // Fold the engaged-clock span this event just settled into today's per-repo active
   // total. The boot rebuild (deriveRollupFromUsage → accumulateActiveFromEvents)
@@ -1282,6 +1411,20 @@ function buildStatePayload() {
     repoTotals: repoTotalsAllTime(),
     config: cfg,
     usage: rateLimitUsage, // latest global rate-limit snapshot (or null) for the Live usage bars
+    // Global pause-gate state (O(1) tracker read — safe on the SSE hot path). The client
+    // renders a per-session "paused" display from paused.active; pausedMs is closed spans only
+    // (the client adds the live open slice: now − since). `active` is gated on pauseGateEnabled
+    // so the UI never shows a freeze the gate isn't actually enforcing (reconcile already tracks
+    // effective pauses, but this also covers the ~2s window right after the feature is disabled).
+    paused: (() => {
+      const ps = pause.pauseStateOf(pauseAcc);
+      return {
+        active: ps.paused && cfg.pauseGateEnabled === true,
+        since: ps.pausedSince,
+        pausedMs: ps.pausedMs,
+        reason: ps.reason,
+      };
+    })(),
     daemon: { version: VERSION, pluginPath: PLUGIN_PATH, port: PORT },
   };
 }
@@ -1651,6 +1794,7 @@ function handlePutConfig(req, res) {
     cfg = result.config; // hot-reload in-memory config
     repoTotalsCache = null; // rates / currency / cost.enabled may have changed
     broadcastConfig(); // every open dashboard reflects the change
+    reconcile(); // toggling pauseGateEnabled changes the EFFECTIVE pause state — apply it now
     json(res, { ok: true, config: cfg });
   });
 }
@@ -1661,6 +1805,9 @@ function handleInternalEvent(req, res) {
     json(res, { ok: true });
     try {
       tailOnce();
+      // A slash-command pause/resume writes the control file directly then nudges here;
+      // reconcile so that transition is logged + reflected instantly (no-op otherwise).
+      reconcile();
     } catch (e) {
       log('nudge tail failed ' + e);
     }
@@ -1688,6 +1835,11 @@ function handleInternalUsage(req, res) {
     // broadcast carries fresh liveness for the "updated Xm ago" staleness display.
     const changed = !rateLimitUsage || !usageLib.sameUsageWindows(rateLimitUsage, windows);
     rateLimitUsage = { ...windows, updatedAt: Date.now() };
+    // Usage auto-pilot: evaluate the 5h window against the auto-pause threshold. Runs on
+    // every push (not only `changed`) so the rising-edge memory (prevPct) tracks the latest
+    // value; it self-gates on pauseGateEnabled + autoPauseFiveHourPct>0 and does nothing when
+    // no 5h window is present (no statusline / API-key session).
+    evalAutoPause(windows.fiveHour ? windows.fiveHour.usedPct : null);
     if (changed) markDirty();
   });
 }
@@ -2015,6 +2167,33 @@ function handleReposDelete(req, res) {
   });
 }
 
+// POST /api/pause — body { paused: bool }. The MANUAL pause/resume path (the dashboard
+// Pause/Resume button; slash commands write the file directly and nudge instead). Writes
+// the control file — the sole ruler — then reconciles so the transition is logged and
+// broadcast instantly. The gate hook enforces the file regardless of the daemon; this only
+// records + surfaces the state. reconcile() treats the file as paused only when the feature
+// is enabled, so arming it while disabled records/shows nothing (matching the gate, which
+// fails open when disabled) — the dashboard hides the button in that case anyway.
+function handlePause(req, res) {
+  readBody(req, (raw) => {
+    let body;
+    try {
+      body = JSON.parse(raw || '');
+    } catch (_e) {
+      return json(res, { ok: false, error: 'invalid JSON body' }, 400);
+    }
+    const paused = !!(body && body.paused === true);
+    try {
+      pause.writePauseState(paused ? 'paused' : pause.RUNNING);
+      reconcile();
+      json(res, { ok: true, paused });
+    } catch (e) {
+      log('pause toggle failed ' + ((e && e.stack) || e));
+      json(res, { ok: false, error: String((e && e.message) || e) }, 500);
+    }
+  });
+}
+
 function handleRequest(req, res) {
   try {
     const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
@@ -2063,6 +2242,7 @@ function handleRequest(req, res) {
     if (req.method === 'PUT' && pathname === '/api/config') return handlePutConfig(req, res);
     if (req.method === 'POST' && pathname === '/api/data/cleanup') return handleDataCleanup(req, res);
     if (req.method === 'POST' && pathname === '/api/repos/delete') return handleReposDelete(req, res);
+    if (req.method === 'POST' && pathname === '/api/pause') return handlePause(req, res);
     if (req.method === 'POST' && pathname === '/internal/event') return handleInternalEvent(req, res);
     if (req.method === 'POST' && pathname === '/internal/usage') return handleInternalUsage(req, res);
     if (req.method === 'POST' && pathname === '/internal/backfill') return handleBackfill(req, res);
@@ -2142,6 +2322,11 @@ function saveSnapshot() {
     extra: Object.fromEntries(extra),
     seenIds: Object.fromEntries([...seenIds].map(([sid, set]) => [sid, [...set]])),
     usage: rateLimitUsage,
+    // Persist the pause span accumulator + baseline so an OPEN pause span survives a restart
+    // (and a day rollover) without its start being reset — unlike active-time spans, a pause's
+    // duration must not reset at midnight. Restored preferentially on boot (see main()).
+    pauseAcc,
+    pauseSentinel: lastPauseSentinel,
   };
   try {
     const file = paths.snapshotPath();
@@ -2260,6 +2445,16 @@ function startLoops() {
   setInterval(heartbeat, HEARTBEAT_MS);
   setInterval(saveSnapshot, SNAPSHOT_MS);
   setInterval(checkIdleShutdown, IDLE_CHECK_MS);
+  // Control-file backstop: a direct file edit or a missed slash-command nudge surfaces in
+  // the UI within ~2s (enforcement is already correct without it — the gate reads the file
+  // directly). Held so cleanup() can clear it on shutdown; reconcile() self-guards its I/O.
+  pausePollTimer = setInterval(() => {
+    try {
+      reconcile();
+    } catch (e) {
+      log('reconcile poll failed ' + e);
+    }
+  }, PAUSE_POLL_MS);
 }
 
 // ---- boot -------------------------------------------------------------------
@@ -2297,6 +2492,34 @@ function main() {
   // still open across this restart. catchUpIngest seeds each session's counted-id
   // set from the durable usage logs first, so this is idempotent (message-id keyed).
   catchUpIngest();
+
+  // Rebuild the pause tracker, then reconcile against the control file. Prefer the snapshot-
+  // restored pauseAcc/baseline (loadSnapshot) — it preserves an OPEN pause span's real start
+  // across a restart or day rollover, which a today-only log fold cannot (a span that began
+  // yesterday isn't in today's log, so the fold would drop it and reconcile would re-open it
+  // with ts=now, resetting the displayed duration). On a COLD start (no pause data in the
+  // snapshot) fall back to folding today's log. The baseline comes from the restored/folded
+  // state — NOT readPauseState() — so reconcile can still detect a pause armed while the daemon
+  // was DOWN (a direct file edit); after this reconcile, lastPauseSentinel == the effective
+  // control-file state (its post-boot invariant).
+  if (!pauseRestoredFromSnapshot) {
+    const folded = pause.foldPauseState(readJsonl(paths.eventLogPath(currentDate)));
+    pauseAcc = {
+      pausedMs: folded.pausedMs,
+      openTs: folded.pausedSince,
+      openReason: folded.reason,
+    };
+    lastPauseSentinel = folded.paused
+      ? (folded.reason === 'usage' ? 'paused-usage' : 'paused')
+      : pause.RUNNING;
+  }
+  reconcile();
+
+  // Auto-pilot: evaluate once against a restored usage snapshot so a 5h threshold already
+  // crossed before the restart still pauses (and seeds the rising-edge prevPct memory).
+  if (rateLimitUsage && rateLimitUsage.fiveHour && typeof rateLimitUsage.fiveHour.usedPct === 'number') {
+    evalAutoPause(rateLimitUsage.fiveHour.usedPct);
+  }
 
   startServer(() => {
     log(`daemon up on http://127.0.0.1:${PORT} v${VERSION}${ephemeral ? ' (ephemeral)' : ''}`);

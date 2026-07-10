@@ -582,3 +582,30 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
       stale index.html comment referencing the removed families/pivot.
     Skipped (deliberate, not a bug): buildHistory still emits unread per-day `byModel`/`byRepo` — entry 61
     keeps every breakdown re-addable, and it's off the SSE hot path.
+
+63. Pause gate landed (v0.21.0): a separate blocking `PreToolUse` hook (`gate.js`) reads a control file
+    (`stateDir/cockpit.pause`) and freezes every session's tool execution when it holds a paused sentinel;
+    opt-in (`pauseGateEnabled` config), fail-open (missing/garbage file runs tools), fail-safe-deny at ~24h.
+    Pause/Resumed events recorded in the log; daemon folds them into global `pausedMs` + live `paused` status
+    (derived, not per-session). Optional auto-pause when 5h usage crosses a threshold, auto-resume on window
+    reset, both reusing entry-42 rate-limit data. Control file is sole ruler — no chat-prompt resumption.
+    Dashboard Pause/Resume button + `/cockpit:pause|resume` commands + `POST /api/pause` + PAUSED banner +
+    statusline segment. Limitation: paused mid-tool wait counts as active time (clock adjustment deferred).
+
+64. Pause-gate review hardening (v0.21.0, pre-commit fixes to #63). Now true, and not to re-break:
+    `paused` is a DISPLAY-only overlay (`displayStatus`), deliberately kept OUT of `effectiveStatus` — so a
+    global pause no longer masks a session's error/waiting badge, misfires the resume sound cues, or trips
+    the long-running chime (all keyed off `effectiveStatus`; error/waiting also outrank the overlay).
+    `paused.active` is gated on `pauseGateEnabled` so the UI never shows a freeze the gate isn't enforcing.
+    Manual (`paused`) vs auto (`paused-usage`) sentinels stay distinct: a window reset auto-resumes only its
+    own auto-pause, never a hand-set one. The pause span accumulator is snapshot-persisted, so an open pause
+    survives a restart / midnight without resetting its duration (a today-only log fold couldn't). `reconcile`
+    folds the tracker directly via the shared pure `pause.foldPauseEvent` (also used by `foldPauseState`),
+    not via a tail re-read a transient throw could strand. Slash commands + statusline route through the
+    canonical `pause.gateDecision`; the daemon-nudge moved to a cross-platform `scripts/pause-cli.js` (node
+    http, no `curl` — Windows-safe).
+    Post-feedback UI tweaks: the Pause/Resume button moved from the Live ribbon to the persistent TOPBAR
+    (it's a global, all-session control — reachable from any view), and is HIDDEN until the feature is
+    enabled (no dead control on every page). The PAUSED banner shows the CURRENT pause's elapsed time
+    (`now − since`), NOT the cumulative `pausedMs` of all prior spans — folding that in made a fresh
+    1-minute pause read as many minutes. `pausedMs` is still tracked on `/api/state` but no longer surfaced.

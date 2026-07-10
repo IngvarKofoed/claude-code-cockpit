@@ -20,14 +20,28 @@
         <button class="nav__tab" type="button" data-view="history">History</button>
         <button class="nav__tab" type="button" data-view="settings">Settings</button>
       </nav>
-      <div class="conn" id="conn" data-state="idle">
-        <span class="conn__dot"></span>
-        <span id="connText">connecting…</span>
+      <!-- Right cluster: the global Pause/Resume button + connection indicator. The gate freezes
+           EVERY session, so the control lives in the persistent topbar (reachable from any view),
+           not on one tab. The button is hidden until the feature is enabled in Settings (see
+           app.js updatePauseButton). -->
+      <div class="topbar__right">
+        <button class="btn btn--inline" id="pauseBtn" type="button" hidden>Pause</button>
+        <div class="conn" id="conn" data-state="idle">
+          <span class="conn__dot"></span>
+          <span id="connText">connecting…</span>
+        </div>
       </div>
     </header>
 
     <div class="banner" id="banner">
       <span>Connection lost — run <code>/cockpit:open</code> to restart the dashboard.</span>
+    </div>
+
+    <!-- Global pause-gate freeze (docs/specs/2026-07-09-pause-gate.md). Separate element
+         from #banner above — the two are independent states and would otherwise fight over
+         one banner's text. Shown/hidden and filled in by app.js's syncPauseUI()/tick(). -->
+    <div class="banner banner--paused" id="pauseBanner">
+      <span>⏸ Paused</span><span class="banner__duration" id="pauseBannerDuration"></span><span class="banner__note" id="pauseBannerNote"></span>
     </div>
 
     <main class="main">

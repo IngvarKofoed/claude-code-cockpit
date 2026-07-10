@@ -78,6 +78,10 @@ function tokenPath() {
   return path.join(stateDir(), 'cockpit.token');
 }
 
+function pausePath() {
+  return path.join(stateDir(), 'cockpit.pause');
+}
+
 function logPath() {
   return path.join(stateDir(), 'daemon.log');
 }
@@ -114,6 +118,7 @@ module.exports = {
   pidPath,
   lockPath,
   tokenPath,
+  pausePath,
   logPath,
   ensureDirs,
   dateStr,
