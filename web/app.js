@@ -1051,7 +1051,15 @@ function renderLiveRibbon() {
 }
 
 function renderLive() {
-  const sessions = (App.state && App.state.sessions) || [];
+  // Hide an IDLE session that spent 0 tokens (and so 0 cost) — an opened-but-never-worked
+  // session sitting idle. A RUNNING/WAITING/ERROR session is NEVER hidden: pollTokens sets a
+  // running first-turn session's tokens to a KNOWN {0,0,0,0} before its first assistant usage
+  // flushes, so a bare "known-zero" test would drop actively-running cards (and could show the
+  // empty state while a session runs). Gating on effectiveStatus==="idle" keeps active cards
+  // visible. tokens===null (transcript not read yet / unavailable) is unknown, not zero -> kept.
+  const sessions = ((App.state && App.state.sessions) || []).filter(
+    (s) => !(effectiveStatus(s) === "idle" && s.tokens != null && sumTokens(s.tokens) === 0)
+  );
   renderLiveRibbon();
   const cards = $("cards");
   if (!sessions.length) {

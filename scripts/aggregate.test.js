@@ -11,6 +11,7 @@ const {
   accumulateTurnByModel,
   accumulateTokensByModel,
   accumulateSession,
+  countedSessions,
   accumulateActiveFromEvents,
   accumulateSessionStatsFromEvents,
 } = require('./aggregate');
@@ -636,6 +637,42 @@ test('accumulateTurn then accumulateSession share one repo entry', () => {
   const repo = r.repos['/r'];
   assert.strictEqual(repo.prompts, 1);
   assert.deepStrictEqual(repo.sessions, ['s1']);
+});
+
+test('countedSessions: only sessions observed via events AND having spent tokens', () => {
+  let r = createRollup('2026-07-02');
+  // Three sessions observed via events (repo.sessions).
+  for (const sid of ['s-worked', 's-empty', 's-tokens-later']) {
+    r = accumulateSession(r, { repoRoot: '/r', repoName: 'r', sessionId: sid, ts: '2026-07-02T10:00:00.000Z' });
+  }
+  // s-worked spent tokens on a turn; s-empty never did; s-tokens-later spent tokens too.
+  r = accumulateTurnByModel(r, { repoRoot: '/r', repoName: 'r', sessionId: 's-worked', byModel: { m: T({ output: 5 }) }, ts: '2026-07-02T10:01:00.000Z' });
+  r = accumulateTurnByModel(r, { repoRoot: '/r', repoName: 'r', sessionId: 's-tokens-later', byModel: { m: T({ input: 3 }) }, ts: '2026-07-02T10:02:00.000Z' });
+  const repo = r.repos['/r'];
+  assert.deepStrictEqual(repo.sessions, ['s-worked', 's-empty', 's-tokens-later']); // all observed
+  // s-empty is dropped (0 tokens); order follows repo.sessions.
+  assert.deepStrictEqual(countedSessions(repo), ['s-worked', 's-tokens-later']);
+});
+
+test('countedSessions: a backfill-only session (tokens but no event) is NOT counted', () => {
+  let r = createRollup('2026-07-02');
+  // Backfill records carry tokens + a session id but no event ever registered the session.
+  r = accumulateTokensByModel(r, { repoRoot: '/r', repoName: 'r', sessionId: 's-backfill', byModel: { m: T({ input: 999 }) }, ts: '2026-07-02T10:00:00.000Z' });
+  const repo = r.repos['/r'];
+  assert.deepStrictEqual(repo.tokenSessions, ['s-backfill']); // it did spend tokens
+  assert.deepStrictEqual(repo.sessions, []); // but no event registered it
+  assert.deepStrictEqual(countedSessions(repo), []); // so it doesn't count (unchanged backfill rule)
+});
+
+test('countedSessions: a 0-token turn does not mark the session, empty repo -> []', () => {
+  let r = createRollup('2026-07-02');
+  r = accumulateSession(r, { repoRoot: '/r', repoName: 'r', sessionId: 's1', ts: '2026-07-02T10:00:00.000Z' });
+  r = accumulateTurnByModel(r, { repoRoot: '/r', repoName: 'r', sessionId: 's1', byModel: { m: T() }, ts: '2026-07-02T10:01:00.000Z' }); // all-zero
+  const repo = r.repos['/r'];
+  assert.strictEqual(repo.prompts, 1); // the turn still counts as a chat
+  assert.deepStrictEqual(repo.tokenSessions, []); // but it spent nothing
+  assert.deepStrictEqual(countedSessions(repo), []);
+  assert.deepStrictEqual(countedSessions(undefined), []); // defensive
 });
 
 test('accumulateTurnByModel: one turn, tokens split per model, counted once', () => {

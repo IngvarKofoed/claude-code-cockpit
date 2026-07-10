@@ -74,6 +74,8 @@ const primedSeen = new Set(); // session_ids whose seenIds have been seeded from
 const rollupCache = new Map(); // dateStr -> memoized derived past-day rollup (fast History reads)
 let sessionsSnapshot = null; // { at, files:[{path,proj,sid,mtimeMs,size}], total } short-TTL stat/sort snapshot for /api/sessions
 const sessionsParseCache = new Map(); // transcriptPath -> { mtimeMs, size, meta } — reuse the parse iff both match a fresh stat
+let sessionsEmptyCache = new Map(); // transcriptPath -> { mtimeMs, size, empty } — did the session spend 0 tokens; keyed by stat so only changed files re-parse
+let sessionsFilteredCache = null; // { snapAt, files, total } — sessionsFileList minus 0-token sessions, keyed to the stat snapshot's `at`
 const sessionActiveDayCache = new Map(); // dateStr (PAST day only) -> Map<sid, {activeMs,chats,tools,agents}>, memoized event-log-derived per-session stats
 let sessionActiveTotalsCache = null; // { at, map: Map<sid, {activeMs,chats,tools,agents}> } short-TTL sum across days (includes the live current day)
 let repoTotalsCache = null; // memoized all-time per-repo totals for /api/state; invalidated on any token/rollup/cost-config change (see repoTotalsAllTime)
@@ -328,7 +330,7 @@ function applyUsageRecord(rollup, u) {
   const byModel = u.byModel && typeof u.byModel === 'object'
     ? u.byModel
     : { [u.model || 'unknown']: { input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite } };
-  const arg = { repoRoot: u.repo_root, repoName: u.repo_name, byModel, ts: u.ts };
+  const arg = { repoRoot: u.repo_root, repoName: u.repo_name, sessionId: u.session_id, byModel, ts: u.ts };
   if (u.backfill) aggregate.accumulateTokensByModel(rollup, arg);
   else aggregate.accumulateTurnByModel(rollup, arg); // durationMs is ignored; active time is event-derived
 }
@@ -785,12 +787,54 @@ async function sessionActiveTotals() {
   return total;
 }
 
-// Paginated, newest-first list of every retained transcript. `total` is the file
-// count (== rendered rows across all pages); an out-of-range page yields an empty
-// slice with the correct total. Async so the per-page transcript reads never block the
-// event loop — each awaited read yields, letting SSE frames and other requests interleave.
-async function buildSessions(page, pageSize) {
+// A session's transcript tokens are EMPTY when they're known (not null) and sum to zero —
+// an opened-but-never-worked session. tokens:null means the transcript was unreadable, which
+// is UNKNOWN not zero, so it is NOT empty and stays listed as "—" (the no-wrong-zero rule).
+function isEmptyTokens(t) {
+  return t != null && num(t.input) + num(t.output) + num(t.cacheRead) + num(t.cacheWrite) === 0;
+}
+
+// sessionsFileList minus the sessions that spent 0 tokens. Classifying emptiness needs each
+// transcript's tokens, so this PARSES every file once per file-version; the emptiness bit is
+// cached (keyed by mtime/size) so steady state re-parses only changed/new transcripts, and the
+// whole filtered list is cached to the stat snapshot's `at` so rapid Prev/Next reuses one pass.
+// Async so a cold classification sweep yields between files (like buildSessions) rather than
+// blocking the event loop on a whole-store parse.
+// Two sessions are always KEPT even when their transcript reads 0 tokens: an UNREADABLE one
+// (tokens:null is unknown, not zero) and a CURRENTLY-LIVE one — a running first-turn session's
+// transcript has a user message but no assistant usage yet, so isEmptyTokens is true, and
+// without the live-keep it would vanish from the directory (and be undercounted) mid-turn.
+async function sessionsFilteredList() {
   const snap = sessionsFileList();
+  if (sessionsFilteredCache && sessionsFilteredCache.snapAt === snap.at) return sessionsFilteredCache;
+  const nextEmpty = new Map(); // rebuilt fresh each pass so vanished transcripts are pruned
+  const files = [];
+  for (const f of snap.files) {
+    let rec = sessionsEmptyCache.get(f.path);
+    if (!rec || rec.mtimeMs !== f.mtimeMs || rec.size !== f.size) {
+      const meta = await sessionMeta(f.path, f.proj);
+      // Populate the page parse cache from this same read so buildSessions' sessionRow reuses it
+      // instead of parsing the visible page a second time (the cold double-parse). For a store
+      // over the FIFO cap, page-0 files parsed first here are evicted by the sweep's tail, so the
+      // page re-parses then — no worse than before, and the common (sub-cap) case parses once.
+      setSessionsParseCache(f.path, { mtimeMs: f.mtimeMs, size: f.size, meta });
+      rec = { mtimeMs: f.mtimeMs, size: f.size, empty: isEmptyTokens(meta.tokens) };
+    }
+    nextEmpty.set(f.path, rec);
+    if (!rec.empty || state.sessions[f.sid] != null) files.push(f);
+  }
+  sessionsEmptyCache = nextEmpty;
+  sessionsFilteredCache = { snapAt: snap.at, files, total: files.length };
+  return sessionsFilteredCache;
+}
+
+// Paginated, newest-first list of every retained transcript THAT SPENT TOKENS (0-token
+// sessions are filtered out — see sessionsFilteredList). `total` is the filtered count
+// (== rendered rows across all pages); an out-of-range page yields an empty slice with the
+// correct total. Async so the per-page transcript reads never block the event loop — each
+// awaited read yields, letting SSE frames and other requests interleave.
+async function buildSessions(page, pageSize) {
+  const snap = await sessionsFilteredList();
   const activeIdx = await sessionActiveTotals();
   const start = page * pageSize;
   const slice = snap.files.slice(start, start + pageSize);
@@ -1231,9 +1275,9 @@ function recordTurn(sid, stopEvent, usage, fresh, seen, allBackfill = false) {
     );
     if (day === currentDate) {
       if (isTurn) {
-        aggregate.accumulateTurnByModel(todayRollup, { repoRoot, repoName, byModel: g.byModel, ts });
+        aggregate.accumulateTurnByModel(todayRollup, { repoRoot, repoName, sessionId: sid, byModel: g.byModel, ts });
       } else {
-        aggregate.accumulateTokensByModel(todayRollup, { repoRoot, repoName, byModel: g.byModel, ts });
+        aggregate.accumulateTokensByModel(todayRollup, { repoRoot, repoName, sessionId: sid, byModel: g.byModel, ts });
       }
     }
   }
@@ -1359,7 +1403,7 @@ function reposSummary() {
       repoName: r.repoName,
       activeMs: r.activeMs,
       prompts: r.prompts,
-      sessions: r.sessions.length,
+      sessions: aggregate.countedSessions(r).length, // only sessions that spent tokens
       tokens: r.tokens,
       subagents: r.subagents,
       byTool: r.byTool,
@@ -1494,9 +1538,10 @@ function aggregateReposAcrossDates(dates, { trackSessions = true } = {}) {
       a.prompts += num(rr.prompts);
       a.activeMs += num(rr.activeMs);
       a.subagents += num(rr.subagents);
-      // Distinct sessions across the range: union the per-day id lists so a session
-      // spanning several days is counted once. lastActive is the max timestamp seen.
-      if (trackSessions) for (const sid of rr.sessions || []) a.sessionIds.add(sid);
+      // Distinct sessions across the range: union the per-day COUNTED id lists (sessions
+      // that spent tokens) so a session spanning several days is counted once and a
+      // 0-token session never inflates the total. lastActive is the max timestamp seen.
+      if (trackSessions) for (const sid of aggregate.countedSessions(rr)) a.sessionIds.add(sid);
       if (rr.lastActive && (a.lastActive == null || Date.parse(rr.lastActive) > Date.parse(a.lastActive))) a.lastActive = rr.lastActive;
       addTokens(a.tokens, rr.tokens);
       for (const m of Object.keys(rr.byModel || {})) {
@@ -1565,7 +1610,7 @@ function buildHistory(rangeRaw) {
         addTokens(tokens, rr.tokens);
         activeMs += num(rr.activeMs);
         prompts += num(rr.prompts);
-        sessions += Array.isArray(rr.sessions) ? rr.sessions.length : 0;
+        sessions += aggregate.countedSessions(rr).length; // only sessions that spent tokens
         subagents += num(rr.subagents);
 
         const repoTools = sumCounts(rr.byTool);

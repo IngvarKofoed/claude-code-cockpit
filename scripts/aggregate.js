@@ -369,7 +369,9 @@ function ensureRepo(rollup, repoRoot, repoName) {
       repoName: repoName != null ? repoName : null,
       activeMs: 0,
       prompts: 0,
-      sessions: [], // distinct session ids
+      sessions: [], // distinct session ids that emitted any event for this repo (event-derived)
+      tokenSessions: [], // subset of session ids that actually spent tokens (usage-log-derived);
+      // the counted session count is sessions ∩ tokenSessions — see countedSessions()
       tokens: emptyTokens(),
       byModel: {},
       byTool: {}, // toolName -> count, tallied from PreToolUse (event-derived, unconditional)
@@ -425,6 +427,28 @@ function addByModel(repo, byModel) {
   }
 }
 
+// Sum every token field across a per-model map (used only to decide whether a record
+// spent anything — the exact total is folded elsewhere).
+function sumByModel(byModel) {
+  let s = 0;
+  const bm = byModel && typeof byModel === 'object' ? byModel : {};
+  for (const model of Object.keys(bm)) {
+    const t = bm[model] || {};
+    s += num(t.input) + num(t.output) + num(t.cacheRead) + num(t.cacheWrite);
+  }
+  return s;
+}
+
+// Record a session against a repo's tokenSessions set IFF this record spent tokens.
+// This is the usage-log side of the "session actually did billable work" test; the
+// event log supplies repo.sessions (was-observed). A session is COUNTED only when it
+// is in both — see countedSessions — so a 0-token session (opened, never worked) drops
+// out of the per-repo / History / ribbon session counts.
+function markTokenSession(repo, sessionId, byModel) {
+  if (sessionId == null || sumByModel(byModel) <= 0) return;
+  if (!repo.tokenSessions.includes(sessionId)) repo.tokenSessions.push(sessionId);
+}
+
 // Like accumulateTurn but attributes a turn's tokens PER MODEL — one turn can span
 // models (e.g. a compaction/summary message in a cheaper model, or a mid-session
 // model switch). Counts the turn once (prompts += 1) while filing each model's
@@ -435,6 +459,7 @@ function accumulateTurnByModel(rollup, turn) {
   const repo = ensureRepo(rollup, turn.repoRoot, turn.repoName);
   repo.prompts += 1; // active time comes from the event stream, not turn duration
   addByModel(repo, turn.byModel);
+  markTokenSession(repo, turn.sessionId, turn.byModel);
   bumpLastActive(repo, turn.ts);
   return rollup;
 }
@@ -447,6 +472,7 @@ function accumulateTokensByModel(rollup, turn) {
   if (!rollup || !turn || turn.repoRoot == null) return rollup;
   const repo = ensureRepo(rollup, turn.repoRoot, turn.repoName);
   addByModel(repo, turn.byModel);
+  markTokenSession(repo, turn.sessionId, turn.byModel);
   bumpLastActive(repo, turn.ts);
   return rollup;
 }
@@ -458,6 +484,20 @@ function accumulateSession(rollup, s) {
   if (s.sessionId != null && !repo.sessions.includes(s.sessionId)) repo.sessions.push(s.sessionId);
   bumpLastActive(repo, s.ts);
   return rollup;
+}
+
+// The session ids that COUNT for a repo: observed via the event log (repo.sessions)
+// AND having spent tokens (repo.tokenSessions). Excludes a 0-token session (opened but
+// never worked) from every session count, and — because it requires an event too — a
+// backfill-only session (usage but no events) still contributes tokens/cost but no
+// session count, unchanged from before. Returns a fresh array (safe to iterate/union).
+function countedSessions(repo) {
+  if (!repo) return [];
+  const observed = Array.isArray(repo.sessions) ? repo.sessions : [];
+  const withTokens = Array.isArray(repo.tokenSessions) ? repo.tokenSessions : [];
+  if (!withTokens.length || !observed.length) return [];
+  const tok = new Set(withTokens);
+  return observed.filter((sid) => tok.has(sid));
 }
 
 // Derive per-repo (and per-hour) active time from a day's event stream and fold it
@@ -557,6 +597,7 @@ module.exports = {
   accumulateTurnByModel,
   accumulateTokensByModel,
   accumulateSession,
+  countedSessions,
   accumulateActiveFromEvents,
   accumulateSessionStatsFromEvents,
 };
