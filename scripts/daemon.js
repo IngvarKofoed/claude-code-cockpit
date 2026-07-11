@@ -994,12 +994,12 @@ function reconcile() {
 }
 
 // Usage auto-pilot: given the current 5h usedPct, auto-pause when it crosses the configured
-// threshold and auto-resume when the window resets — reusing the entry-42 rate-limit numbers.
-// Requires pauseGateEnabled + autoPauseFiveHourPct>0 + a numeric usedPct. Goes through the
-// SAME writePauseState + reconcile path as a manual toggle, so auto and manual pauses share
-// one event/accounting/broadcast path and differ only by `reason`. The rising-edge / reset /
-// never-clobber-a-manual-pause rule lives in pure pause.autoPauseDecision. prevPct is
-// remembered across calls (updated every call, action or not).
+// threshold and auto-resume once usage falls a deadband BELOW it — reusing the entry-42
+// rate-limit numbers. Requires pauseGateEnabled + autoPauseFiveHourPct>0 + a numeric usedPct.
+// Goes through the SAME writePauseState + reconcile path as a manual toggle, so auto and manual
+// pauses share one event/accounting/broadcast path and differ only by `reason`. The rising-edge
+// (pause) / hysteresis (resume) / never-clobber-a-manual-pause rule lives in pure
+// pause.autoPauseDecision. prevPct is remembered across calls (updated every call, action or not).
 function evalAutoPause(curPct) {
   if (!(cfg.pauseGateEnabled && num(cfg.autoPauseFiveHourPct) > 0)) return;
   if (!(typeof curPct === 'number' && Number.isFinite(curPct))) return;

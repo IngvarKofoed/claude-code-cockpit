@@ -1,6 +1,6 @@
 {
   "name": "cockpit",
-  "version": "0.24.0",
+  "version": "0.25.0",
   "description": "Live, cross-platform mission control for every running Claude Code session — status, elapsed timers, and per-repository token/time/cost accounting, with optional OS notifications and sounds.",
   "author": {
     "name": "Martin Ingvar Kofoed Jensen"

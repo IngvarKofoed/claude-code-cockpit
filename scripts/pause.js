@@ -141,12 +141,31 @@ function foldPauseState(events) {
   return pauseStateOf(acc);
 }
 
-// PURE: the usage auto-pilot's rising-edge / window-reset rule.
+// The hysteresis deadband (percentage points) between the auto-pause threshold and the
+// auto-RESUME line: the auto-pilot pauses AT the threshold but only resumes once usage has
+// fallen this far BELOW it. Sharing one line for pause and resume made a rolling 5h % — which
+// wobbles a point or two across the boundary as old requests age out and new ones enter —
+// flap the gate pause/resume every few seconds. The escape valve for a wrong/stale high push
+// (e.g. a lagging cross-subscription reading) is preserved but bounded by the resume line: a
+// corrected reading BELOW it — a real window reset (→~0%) or a switch to a materially
+// lower-usage subscription — resumes; a corrected reading that lands back INSIDE the band
+// [threshold−deadband, threshold) holds paused. That hold is the deliberate cost of not
+// flapping: you stay frozen only while the CURRENT reading is genuinely near the limit, not
+// because of a past spike alone (manual Resume always overrides). Fixed (not yet a config
+// field) to keep the config surface small.
+const AUTO_RESUME_DEADBAND_PCT = 10;
+
+// PURE: the usage auto-pilot's rising-edge (pause) / hysteresis (resume) rule.
 //  - threshold not a finite number > 0 → 'none' (auto-pilot off).
-//  - prevPct null/NaN is treated as 0.
-//  - RISING EDGE: prev below and cur at/above the threshold, and the file is
-//    NOT a paused sentinel (running/'') → 'pause' (never clobber a manual pause).
-//  - RESET: file is exactly 'paused-usage' and cur is back below threshold → 'resume'.
+//  - prevPct / curPct null/NaN are treated as 0.
+//  - RISING EDGE: prev below and cur at/above the threshold, and the file is NOT a paused
+//    sentinel (running/'') → 'pause' (never clobber a manual pause).
+//  - RESUME (hysteresis): file is exactly 'paused-usage' and cur has fallen below the resume
+//    line — threshold minus the deadband — → 'resume'. Deliberately NOT the instant cur dips
+//    back under the threshold: that shared-line rule flapped on a rolling-window wobble. The
+//    deadband is capped at half the threshold so a low threshold keeps a resume line above 0
+//    (it never strands paused-forever), and a real reset or lower-usage subscription still
+//    clears it.
 //  - otherwise → 'none'.
 function autoPauseDecision({ prevPct, curPct, threshold, sentinel } = {}) {
   if (!(typeof threshold === 'number' && Number.isFinite(threshold) && threshold > 0)) {
@@ -155,9 +174,10 @@ function autoPauseDecision({ prevPct, curPct, threshold, sentinel } = {}) {
   const prev = typeof prevPct === 'number' && Number.isFinite(prevPct) ? prevPct : 0;
   const cur = typeof curPct === 'number' && Number.isFinite(curPct) ? curPct : 0;
   const s = String(sentinel == null ? '' : sentinel).trim();
+  const resumeAt = threshold - Math.min(AUTO_RESUME_DEADBAND_PCT, threshold / 2);
 
   if (prev < threshold && cur >= threshold && !PAUSE_SENTINELS.has(s)) return 'pause';
-  if (s === 'paused-usage' && cur < threshold) return 'resume';
+  if (s === 'paused-usage' && cur < resumeAt) return 'resume';
   return 'none';
 }
 
@@ -175,4 +195,5 @@ module.exports = {
   pauseStateOf,
   foldPauseState,
   autoPauseDecision,
+  AUTO_RESUME_DEADBAND_PCT,
 };

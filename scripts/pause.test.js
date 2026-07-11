@@ -201,10 +201,45 @@ test('autoPauseDecision: never fires a pause over an existing manual "paused" se
   );
 });
 
-test('autoPauseDecision: window reset (paused-usage, dropping back below threshold) -> resume', () => {
+test('autoPauseDecision: paused-usage stays paused on a small dip below the threshold (no flap)', () => {
+  // Hysteresis: a rolling 5h % wobbles across the pause line as requests age in/out. A dip
+  // that stays within the deadband (above threshold − 10) must NOT resume, or the gate flaps
+  // pause/resume every few seconds. threshold 95 -> resume line 85.
   assert.strictEqual(
-    autoPauseDecision({ prevPct: 97, curPct: 80, threshold: 95, sentinel: 'paused-usage' }),
+    autoPauseDecision({ prevPct: 96, curPct: 90, threshold: 95, sentinel: 'paused-usage' }),
+    'none',
+  );
+  // Right at the resume line is still not below it.
+  assert.strictEqual(
+    autoPauseDecision({ prevPct: 96, curPct: 85, threshold: 95, sentinel: 'paused-usage' }),
+    'none',
+  );
+});
+
+test('autoPauseDecision: paused-usage resumes once usage falls a full deadband below the threshold', () => {
+  // A real window reset (→~0%) or a switch to a lower-usage subscription blows past the resume
+  // line (threshold − 10) — that clear drop, not a sub-band wobble, resumes. This is the
+  // escape valve that clears a wrong/stale high push: the next correct low reading resumes.
+  assert.strictEqual(
+    autoPauseDecision({ prevPct: 97, curPct: 84, threshold: 95, sentinel: 'paused-usage' }),
     'resume',
+  );
+  assert.strictEqual(
+    autoPauseDecision({ prevPct: 97, curPct: 5, threshold: 95, sentinel: 'paused-usage' }),
+    'resume',
+  );
+});
+
+test('autoPauseDecision: the resume deadband shrinks for a low threshold so it never strands', () => {
+  // threshold 8 -> deadband min(10, 4) = 4 -> resume line 4. Usage must fall below 4 to
+  // resume, but the line is never 0, so a drop toward reset still resumes (no stuck-forever).
+  assert.strictEqual(
+    autoPauseDecision({ prevPct: 9, curPct: 5, threshold: 8, sentinel: 'paused-usage' }),
+    'none', // 5 is still at/above the resume line 4
+  );
+  assert.strictEqual(
+    autoPauseDecision({ prevPct: 9, curPct: 2, threshold: 8, sentinel: 'paused-usage' }),
+    'resume', // 2 < 4
   );
 });
 
