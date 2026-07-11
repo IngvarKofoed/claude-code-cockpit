@@ -58,6 +58,10 @@ function newSession(event) {
     // don't move it. The card freezes its big timer at waitingSince − promptStart, so a
     // blocked card shows how long the prompt ran before it asked you, without ticking.
     waitingSince: null,
+    // ISO ts the session parked at the pause gate (gate.js emitted a `Gated` marker), or
+    // null when not parked. Set ONCE per park; cleared globally by the daemon on `Resumed`
+    // and here on SessionEnd. Anchors the "safe to close" at-rest signal (see atRest).
+    gatedSince: null,
     promptCount: 0,
     toolCount: 0, // total tool invocations (incl. subagents), bumped on PreToolUse
     // Cumulative "engaged" wall-clock: time the session spent running a turn OR
@@ -163,6 +167,19 @@ function currentSubscription(state) {
 // longer strand the session "engaged" forever (the count self-heals on the next carrying event).
 function isEngaged(session) {
   return session.status === 'running' || num(session.bgTasks) > 0;
+}
+
+// "At rest" = this session has come to rest under a pause, so it is safe to close: it is NOT
+// waiting on the user AND (it parked at the gate — gatedSince set, even a `running` session
+// whose next tool is frozen pre-execution — OR it simply isn't working). A `waiting` session
+// (a permission prompt) genuinely needs the user: closing the laptop abandons that prompt, so
+// waiting is NEVER at rest and holds the "safe to close" signal, even in the rare case it also
+// carries a gate marker. `error` IS at rest — the turn is over, nothing is executing or pending,
+// same as idle. NOT at rest iff waiting, OR running/engaged (still finishing a pre-pause tool)
+// with gatedSince null. No timestamp math: the `Gated` marker's presence IS the parked signal.
+// Pure; the daemon rolls this up into paused.allAtRest and the safe-to-close cue.
+function atRest(session) {
+  return session.status !== 'waiting' && (session.gatedSince != null || !isEngaged(session));
 }
 
 // Fold one event into state, mutating and returning the same object. Unknown
@@ -302,8 +319,18 @@ function applyEvent(state, event) {
       session.subagents.active = Math.max(0, session.subagents.active - 1);
       break;
 
+    case 'Gated':
+      // gate.js emitted this once when it froze a tool call pre-execution. Set the
+      // parked anchor ONCE (a second Gated during the same pause must not overwrite it),
+      // and do NOT touch status/currentActivity/currentPrompt/subagents or the engaged
+      // clock — a Gated on a running session keeps it running/engaged (active-time-during-
+      // pause is a documented non-goal). The global clear rides on `Resumed` (daemon-side).
+      if (session.gatedSince == null && typeof event.ts === 'string') session.gatedSince = event.ts;
+      break;
+
     case 'SessionEnd':
       session.status = 'ended';
+      session.gatedSince = null; // session gone; drop any parked anchor
       if (event.reason != null) session.endedReason = event.reason;
       break;
 
@@ -372,6 +399,10 @@ function toCard(s) {
   delete card.engagedSince;
   delete card.activeDelta;
   delete card.disengagedNow; // daemon-only transition flag; bgTasks stays for the client's effectiveStatus
+  // Precompute the at-rest signal once server-side; gatedSince already flows via the {...s}
+  // spread (unlike the internal anchors above — the client renders the honest paused badge
+  // from card.atRest and freezes the timer at card.gatedSince).
+  card.atRest = atRest(s);
   return card;
 }
 
@@ -677,6 +708,7 @@ function accumulateSessionStatsFromEvents(events) {
 module.exports = {
   createState,
   applyEvent,
+  atRest,
   snapshot,
   subBaseName,
   currentSubscription,

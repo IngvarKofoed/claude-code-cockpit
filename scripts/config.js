@@ -28,7 +28,7 @@ const DEFAULT_CONFIG = {
   // a name without parens simply doesn't match and falls back unchanged. '' = off
   // (identity). Applied at payload-build time only — never migrates stored data.
   subscriptionLabelPattern: '\\(([^)]+)\\)',
-  events: { sessionFinished: true, needsInput: true, longRunning: false, turnFailed: true },
+  events: { sessionFinished: true, needsInput: true, longRunning: false, turnFailed: true, safeToClose: true },
   longRunningThresholdMs: 300000,
   // Pause gate: opt-in master switch (default off) + optional usage auto-pilot.
   // autoPauseFiveHourPct is the 5h rate-limit threshold that auto-pauses (0 = off).

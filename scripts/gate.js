@@ -21,7 +21,17 @@
 // a non-zero exit could disturb a session.
 
 const fs = require('fs');
+const paths = require('./paths');
 const pause = require('./pause');
+
+// `http` and `path` are required LAZILY inside the marker helpers below — only reached on the
+// rare paused-and-emitting branch. This hook runs fresh on EVERY tool call under
+// pauseGateEnabled and exits immediately in the common not-paused case, so it shouldn't pay to
+// load them on that hot path.
+
+// Best-effort daemon ping budget for the Gated marker (mirrors emit.js). The
+// durable append already happened by then; the gate never awaits this.
+const PING_TIMEOUT_MS = 150;
 
 // Re-check the control file this often while paused. A pending timer keeps Node
 // alive between checks (no busy-wait, no while-loop).
@@ -65,6 +75,84 @@ function readStdin() {
   }
 }
 
+// Parse the stdin payload for session_id ONLY (the gate is otherwise
+// payload-agnostic). Wrapped so a garbage/empty payload never affects the gate.
+function parseSessionId(raw) {
+  try {
+    const obj = JSON.parse(raw);
+    return obj && typeof obj === 'object' ? obj : {};
+  } catch (_e) {
+    return {};
+  }
+}
+
+// Append one object as a single JSON line to today's event log (copied from
+// emit.js — a single small-line append is atomic on local filesystems).
+function appendEvent(record) {
+  const path = require('path'); // lazy — only the paused-and-emitting branch reaches here
+  const filePath = paths.eventLogPath(paths.dateStr());
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.appendFileSync(filePath, JSON.stringify(record) + '\n');
+}
+
+// Best-effort daemon nudge — carries no authoritative data; the daemon always
+// re-reads the log. Fire-and-forget: the gate never awaits or blocks on it.
+function pingDaemon() {
+  try {
+    const http = require('http'); // lazy — only the paused-and-emitting branch reaches here
+    const readTrim = (p) => {
+      try {
+        return fs.readFileSync(p, 'utf8').trim();
+      } catch (_e) {
+        return '';
+      }
+    };
+    const port = parseInt(readTrim(paths.portPath()), 10);
+    if (!port) return;
+    const token = readTrim(paths.tokenPath());
+    const body = '{}';
+    const headers = {
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(body),
+    };
+    if (token) headers.authorization = `Bearer ${token}`;
+    const req = http.request(
+      { host: '127.0.0.1', port, path: '/internal/event', method: 'POST', timeout: PING_TIMEOUT_MS, headers },
+      (res) => {
+        res.resume(); // drain so the socket can close
+      }
+    );
+    req.on('timeout', () => req.destroy());
+    req.on('error', () => {});
+    req.write(body);
+    req.end();
+  } catch (_e) {
+    // best-effort — a ping failure is invisible to the gate.
+  }
+}
+
+// Emit ONE Gated marker as the gate enters the poll loop. Fully wrapped: any
+// failure is logged and swallowed and can NEVER change the gate decision or the
+// exit-0 guarantee. Skips the marker (but the gate still blocks) if session_id
+// is missing. PRIVACY: never copies tool_input / message / user_input.
+function emitGatedMarker(payload) {
+  try {
+    const sessionId = payload && payload.session_id;
+    if (typeof sessionId !== 'string' || !sessionId) return;
+    const record = {
+      ts: new Date().toISOString(),
+      event: 'Gated',
+      session_id: sessionId,
+      owner_pid: process.ppid,
+    };
+    if (typeof payload.tool_name === 'string') record.tool_name = payload.tool_name;
+    appendEvent(record);
+    pingDaemon();
+  } catch (err) {
+    logErr(err);
+  }
+}
+
 // Emit the fail-safe deny, then exit 0.
 function deny() {
   try {
@@ -76,7 +164,7 @@ function deny() {
 }
 
 function main() {
-  readStdin();
+  const payload = parseSessionId(readStdin());
 
   // Step 1: read the control file first. Common case (not paused) exits
   // immediately WITHOUT reading config.
@@ -91,6 +179,11 @@ function main() {
   // Step 3: paused AND enabled — poll the control file until it flips to running
   // (or the ceiling fires). Watches ONLY the control file: disabling the feature
   // mid-pause does not release an already-blocked call (the file is the ruler).
+  // The gate has decided to WAIT (paused AND enabled) and is about to enter the
+  // poll loop — emit the one Gated park marker now. Wrapped internally; it can
+  // never affect the decision, the poll timing, or the exit-0 guarantee.
+  emitGatedMarker(payload);
+
   const startedAt = Date.now();
   const tick = () => {
     try {

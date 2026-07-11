@@ -34,6 +34,10 @@ const EVENT_SPECS = {
       return reason ? `The turn failed (${reason}).` : 'The turn failed.';
     },
   },
+  safeToClose: {
+    label: 'safe to close',
+    message: () => 'All sessions are at rest — safe to close the laptop.',
+  },
 };
 
 // Decide whether/what to notify. Returns null when notifications are disabled
@@ -46,7 +50,9 @@ function buildNotification(eventName, session, config) {
   const spec = EVENT_SPECS[eventName];
   if (!spec) return null;
 
-  const repoName = (session && session.repoName) || 'unknown repo';
+  // Session-less GLOBAL events (e.g. safeToClose) have no session at all; fall
+  // back to a sensible product name rather than "unknown repo" for those.
+  const repoName = (session && session.repoName) || (session ? 'unknown repo' : 'Cockpit');
   return {
     event: eventName,
     title: `${repoName} — ${spec.label}`,

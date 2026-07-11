@@ -5,6 +5,7 @@ const assert = require('node:assert');
 const {
   createState,
   applyEvent,
+  atRest,
   snapshot,
   subBaseName,
   currentSubscription,
@@ -1083,4 +1084,123 @@ test('accumulateTokensByModel (backfill) also folds bySubscription (from the usa
 test('ensureRepo initializes bySubscription to an empty object', () => {
   const r = accumulateSession(createRollup('2026-07-02'), { repoRoot: '/r', repoName: 'r', sessionId: 's1', ts: '2026-07-02T10:00:00.000Z' });
   assert.deepStrictEqual(r.repos['/r'].bySubscription, {});
+});
+
+// --- pause gate: Gated marker + atRest (safe to close) -----------------------
+
+test('newSession starts with gatedSince null', () => {
+  const s = run([ev('SessionStart')]).sessions.s1;
+  assert.strictEqual(s.gatedSince, null);
+});
+
+test('Gated sets gatedSince to its ts and does not alter status/activity/prompt', () => {
+  // The session is mid-turn running a Bash when the gate parks its NEXT tool call.
+  // Gated must set the anchor but touch nothing else — the session stays running.
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:01.000Z', prompt_id: 'p1' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:02.000Z', tool_name: 'Bash' }),
+    ev('Gated', { ts: '2026-07-02T10:00:05.000Z', tool_name: 'Edit' }),
+  ]);
+  const s = state.sessions.s1;
+  assert.strictEqual(s.gatedSince, '2026-07-02T10:00:05.000Z');
+  assert.strictEqual(s.status, 'running'); // unchanged
+  assert.strictEqual(s.currentActivity, 'Bash'); // unchanged
+  assert.deepStrictEqual(s.currentPrompt, { promptId: 'p1', startedAt: '2026-07-02T10:00:01.000Z' });
+});
+
+test('a second Gated does not overwrite the first gatedSince (set-once)', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('Gated', { ts: '2026-07-02T10:00:05.000Z' }),
+    ev('Gated', { ts: '2026-07-02T10:00:09.000Z' }),
+  ]);
+  assert.strictEqual(state.sessions.s1.gatedSince, '2026-07-02T10:00:05.000Z');
+});
+
+test('SessionEnd clears gatedSince to null', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('Gated', { ts: '2026-07-02T10:00:05.000Z' }),
+    ev('SessionEnd', { ts: '2026-07-02T10:00:06.000Z', reason: 'exit' }),
+  ]);
+  assert.strictEqual(state.sessions.s1.gatedSince, null);
+});
+
+test('atRest: true for idle and error, but NOT a session waiting on the user', () => {
+  const idle = run([ev('SessionStart')]).sessions.s1;
+  assert.strictEqual(atRest(idle), true);
+
+  // A session blocked on a permission prompt genuinely needs the user — closing the laptop
+  // abandons that prompt — so it is NOT at rest and holds the "safe to close" signal.
+  const waiting = run([ev('SessionStart'), ev('Notification', { notification_type: 'permission_prompt' })]).sessions.s1;
+  assert.strictEqual(waiting.status, 'waiting');
+  assert.strictEqual(atRest(waiting), false);
+
+  // An error ends the turn — nothing is executing or pending — so it IS at rest, like idle.
+  const errored = run([ev('SessionStart'), ev('UserPromptSubmit', { prompt_id: 'p1' }), ev('StopFailure', { stop_reason: 'api_error' })]).sessions.s1;
+  assert.strictEqual(errored.status, 'error');
+  assert.strictEqual(atRest(errored), true);
+});
+
+test('atRest: waiting overrides a gate marker — a waiting session is never at rest even if gated', () => {
+  const s = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { prompt_id: 'p1' }),
+    ev('Gated', { ts: '2026-07-02T10:00:05.000Z' }),
+    ev('Notification', { notification_type: 'permission_prompt' }),
+  ]).sessions.s1;
+  assert.strictEqual(s.status, 'waiting');
+  assert.strictEqual(s.gatedSince, '2026-07-02T10:00:05.000Z');
+  assert.strictEqual(atRest(s), false); // needs the user, despite the gate marker
+});
+
+test('atRest: false for a running session with gatedSince null (still finishing a pre-pause tool)', () => {
+  const running = run([ev('SessionStart'), ev('UserPromptSubmit', { prompt_id: 'p1' })]).sessions.s1;
+  assert.strictEqual(running.status, 'running');
+  assert.strictEqual(running.gatedSince, null);
+  assert.strictEqual(atRest(running), false);
+});
+
+test('atRest: true for a running session once it is gated (parked at the gate)', () => {
+  const s = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { prompt_id: 'p1' }),
+    ev('Gated', { ts: '2026-07-02T10:00:05.000Z' }),
+  ]).sessions.s1;
+  assert.strictEqual(s.status, 'running');
+  assert.strictEqual(atRest(s), true); // gatedSince set -> parked -> safe
+});
+
+test('atRest: false for an engaged (bgTasks>0) session with gatedSince null; true once gated', () => {
+  // A background workflow is in flight after its launching turn's Stop (bgTasks=1) -> engaged.
+  const engaged = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { prompt_id: 'p1' }),
+    ev('Stop', { ts: '2026-07-02T10:00:03.000Z', bg_tasks: 1 }),
+  ]).sessions.s1;
+  assert.strictEqual(engaged.bgTasks, 1);
+  assert.strictEqual(engaged.gatedSince, null);
+  assert.strictEqual(atRest(engaged), false); // engaged, not parked
+
+  // Once its tool parks at the gate, the frozen workflow reads at rest (it can't progress).
+  const gated = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { prompt_id: 'p1' }),
+    ev('Stop', { ts: '2026-07-02T10:00:03.000Z', bg_tasks: 1 }),
+    ev('Gated', { ts: '2026-07-02T10:00:05.000Z' }),
+  ]).sessions.s1;
+  assert.strictEqual(gated.bgTasks, 1);
+  assert.strictEqual(atRest(gated), true);
+});
+
+test('toCard exposes atRest and keeps gatedSince', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { prompt_id: 'p1' }),
+    ev('Gated', { ts: '2026-07-02T10:00:05.000Z' }),
+  ]);
+  const card = snapshot(state, 0).sessions.find((x) => x.sessionId === 's1');
+  assert.strictEqual(card.atRest, true);
+  assert.strictEqual(card.gatedSince, '2026-07-02T10:00:05.000Z');
 });

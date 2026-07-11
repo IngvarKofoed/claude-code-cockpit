@@ -96,6 +96,22 @@ let pauseRestoredFromSnapshot = false; // true once loadSnapshot restores pauseA
 let lastFiveHourPct = null; // last 5h usedPct the usage auto-pilot saw (its rising-edge memory)
 let pausePollTimer = null; // the ~2s control-file backstop poll interval (cleared on shutdown)
 
+// "Safe to close" latch + summary (the pause-gate at-rest signal). pauseSafeNotified is a
+// per-pause latch: true = the OS notification will NOT fire; it is armed to false ONLY on a
+// live Paused transition (reconcile), so the walk-away ping lands at most once per pause span.
+// Initialized true so a daemon booting straight into an already-safe pause never spuriously
+// notifies (boot suppression re-asserts this before the server listens). pauseSafeSummary is
+// the READ-ONLY payload projection — computed/edge-checked in the write paths (handleEvent,
+// reconcile), only READ by buildStatePayload so a GET /api/state can never fire a notification.
+let pauseSafeNotified = true;
+let pauseSafeSummary = { allAtRest: false, atRestCount: 0, total: 0 };
+// True during boot until the server listens. The boot reconcile() (and the auto-pilot's boot
+// eval) can detect an already-standing pause as a fresh transition and ARM the latch, then call
+// refreshPauseSafe() in the SAME call — which would fire the walk-away ping before the post-boot
+// neutralization runs. This flag hard-suppresses the fire during boot; only a pause that begins
+// after the server is up can notify.
+let pauseSafeBooting = true;
+
 let replaying = false; // true while replaying the log on boot: suppress side effects
 
 const sseClients = new Set();
@@ -989,7 +1005,20 @@ function reconcile() {
   }
   pause.foldPauseEvent(pauseAcc, rec); // authoritative live tracker update (not via tailOnce)
   lastPauseSentinel = sentinel;
+
+  // Drive the "safe to close" latch on the live pause transition. Entering paused ARMS it
+  // (false → the next all-at-rest edge fires the walk-away ping); entering running (Resumed)
+  // re-latches it (true, no fire) and clears every session's gatedSince immediately, so the
+  // badge/summary release without waiting for the Resumed record to loop back through the tail.
+  if (nowPaused) {
+    pauseSafeNotified = false;
+  } else {
+    pauseSafeNotified = true;
+    for (const sid of Object.keys(state.sessions)) state.sessions[sid].gatedSince = null;
+  }
+
   saveSnapshot(); // persist the (possibly open) span now so a crash can't reset its start
+  refreshPauseSafe(); // recompute the summary + fire on a same-instant all-at-rest edge
   markDirty();
 }
 
@@ -1023,12 +1052,76 @@ function evalAutoPause(curPct) {
   }
 }
 
+// Mirror the Live grid's "opened but never worked" filter (entry 65): a session that is idle
+// (not running/waiting/error, no background work in flight) with a KNOWN-zero token total.
+// tokens == null means UNKNOWN (unreadable / not-yet-ingested), NOT empty — so it is kept.
+// Used so the pause "N of M at rest" count stays in step with the cards the user actually sees.
+function isIdleEmptySession(s) {
+  if (s.status === 'running' || s.status === 'waiting' || s.status === 'error') return false;
+  if (num(s.bgTasks) > 0) return false;
+  const t = s.tokens;
+  if (t == null) return false; // unknown tokens -> keep, never filter on a wrong zero
+  return num(t.input) + num(t.output) + num(t.cacheRead) + num(t.cacheWrite) === 0;
+}
+
+// Recompute the "safe to close" summary and fire the one-per-pause walk-away notification on
+// the rising edge to all-at-rest. Called at the END of the two write paths (handleEvent — after
+// its replay guard — and reconcile), NEVER during boot replay or from buildStatePayload, so a
+// stray GET /api/state can't trip the notification. `atRest` is computed once here, server-side;
+// the payload only READS pauseSafeSummary.
+function refreshPauseSafe() {
+  // Cheap gate first: with no pause enforced (the overwhelmingly common case) the summary is
+  // never shown and the notification can't fire, so skip the O(sessions) scan on the event hot
+  // path entirely.
+  const active = pause.pauseStateOf(pauseAcc).paused && cfg.pauseGateEnabled === true;
+  if (!active) {
+    pauseSafeSummary = { allAtRest: false, atRestCount: 0, total: 0 };
+    return;
+  }
+  let total = 0;
+  let atRestCount = 0;
+  for (const sid of Object.keys(state.sessions)) {
+    const s = state.sessions[sid];
+    if (!s || s.status === 'ended') continue;
+    // Skip opened-but-never-worked sessions so "N of M" matches the visible cards. They are
+    // trivially at rest, so dropping them from BOTH total and atRestCount leaves allAtRest
+    // unchanged — it only stops M from counting sessions the user can't see.
+    if (isIdleEmptySession(s)) continue;
+    total++;
+    if (aggregate.atRest(s)) atRestCount++;
+  }
+  const allAtRest = total > 0 && atRestCount === total;
+  pauseSafeSummary = { allAtRest, atRestCount, total };
+
+  // Rising-edge, latched: fire once per pause span when the LAST visible session parks. The latch
+  // (pauseSafeNotified) is armed to false on a live Paused transition and re-set to true here
+  // on fire — so ordinary at-rest churn mid-pause can't re-ping. M === 0 (no visible sessions) is
+  // not a meaningful "safe to close" and is excluded by total > 0. Session-less global event (no
+  // session arg), gated by osNotifications + events.safeToClose inside notify.buildNotification.
+  if (allAtRest && !pauseSafeNotified && !pauseSafeBooting) {
+    const n = notify.buildNotification('safeToClose', null, cfg);
+    if (n) notify.notify(n);
+    pauseSafeNotified = true;
+  }
+}
+
 // ---- event handling ---------------------------------------------------------
 
 function handleEvent(ev) {
   const sid = ev.session_id;
 
   aggregate.applyEvent(state, ev);
+
+  // Replay-safe global clear of the at-rest anchor: the durable log holds `Gated`
+  // (park) but no `Ungated` — release rides on the session-less `Resumed` record.
+  // Clearing here (NOT only on a live reconcile() transition) is load-bearing: a
+  // cold boot replays today's log and re-sets gatedSince from each `Gated`; the
+  // matching `Resumed` record must null it again, else a parked-then-resumed
+  // session would survive boot as falsely "safe to close". Runs during boot replay
+  // AND the live tail — it precedes the `if (replaying) return;` guard.
+  if (ev.event === 'Resumed') {
+    for (const s of Object.keys(state.sessions)) state.sessions[s].gatedSince = null;
+  }
 
   if (sid != null && ev.transcript_path) {
     const x = extra.get(sid) || {};
@@ -1135,6 +1228,11 @@ function handleEvent(ev) {
   if (session && session.disengagedNow && session.status === 'idle') {
     maybeNotify('sessionFinished', session);
   }
+
+  // Recompute at-rest + fire the walk-away notification on the rising edge. Only reached on the
+  // LIVE path (the `if (replaying) return;` above skips it during boot replay), so a
+  // parked-then-resumed session replayed at boot never spuriously notifies.
+  refreshPauseSafe();
 
   lastBusyAt = Date.now();
   markDirty();
@@ -1507,6 +1605,11 @@ function buildStatePayload() {
         since: ps.pausedSince,
         pausedMs: ps.pausedMs,
         reason: ps.reason,
+        // "Safe to close" summary — READ from pauseSafeSummary only (computed + edge-checked in
+        // the write paths, never here), so a GET /api/state can't fire the notification.
+        allAtRest: pauseSafeSummary.allAtRest,
+        atRestCount: pauseSafeSummary.atRestCount,
+        total: pauseSafeSummary.total,
       };
     })(),
     daemon: { version: VERSION, pluginPath: PLUGIN_PATH, port: PORT },
@@ -2592,7 +2695,14 @@ function reapStale() {
       changed = true;
     }
   }
-  if (changed) markDirty();
+  if (changed) {
+    // Reaping the last non-at-rest session is a safe-to-close edge: recompute the summary
+    // (so the broadcast state drops the phantom from 'N of M') and fire the walk-away ping if
+    // the survivors are now all at rest under an active pause. refreshPauseSafe no-ops when no
+    // pause is active.
+    refreshPauseSafe();
+    markDirty();
+  }
 }
 
 function heartbeat() {
@@ -2702,6 +2812,18 @@ function main() {
   if (rateLimitUsage && rateLimitUsage.fiveHour && typeof rateLimitUsage.fiveHour.usedPct === 'number') {
     evalAutoPause(rateLimitUsage.fiveHour.usedPct);
   }
+
+  // Boot suppression, edge-correct: a daemon that boots straight into an ALREADY-at-rest pause
+  // must not re-ping a "safe to close" a pre-restart daemon already announced — but a standing
+  // pause that is NOT yet at rest must stay ARMED, so a mid-pause restart doesn't silently drop
+  // the walk-away ping for the rest of that (possibly hours-long) span. So compute the summary
+  // now (pauseSafeBooting still true → this refresh cannot fire) and latch on the CURRENT
+  // at-rest state: already-safe → notified (suppress); not-yet-safe → armed (will fire when it
+  // parks). refreshPauseSafe no-ops when unpaused, leaving the summary zeroed (armed, harmless —
+  // the next real Paused transition re-arms anyway).
+  refreshPauseSafe();
+  pauseSafeNotified = pauseSafeSummary.allAtRest;
+  pauseSafeBooting = false; // boot done: a pause beginning after this may fire the walk-away ping
 
   startServer(() => {
     log(`daemon up on http://127.0.0.1:${PORT} v${VERSION}${ephemeral ? ' (ephemeral)' : ''}`);

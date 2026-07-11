@@ -400,24 +400,33 @@ function effectiveStatus(s) {
 }
 
 // Rendering-only status: overlays the GLOBAL pause (docs/specs/2026-07-09-pause-gate.md —
-// App.state.paused.active) on top of effectiveStatus. A pause freezes running/idle sessions
-// (they show "Paused"), but a session WAITING on a permission prompt or one that ended on an
-// ERROR keeps that status — those need attention / are terminal and must not be masked by the
-// global freeze (the PAUSED banner already conveys the cockpit-wide state). Used ONLY for the
-// card/row display; cues, long-running, and sort use effectiveStatus so the overlay never
-// creates a phantom transition.
+// App.state.paused.active) on top of effectiveStatus. A pause only freezes a running/idle
+// session once it has actually come to rest at the gate (s.atRest, from the server — see
+// docs/specs/2026-07-11-pause-safe-to-close.md); a session still finishing a tool call that
+// passed the gate before the pause was clicked keeps its real "running" badge and ticking
+// timer (activityText adds a "pausing…" hint) instead of a misleading instant "Paused". A
+// session WAITING on a permission prompt or one that ended on an ERROR keeps that status —
+// those need attention / are terminal and must not be masked by the global freeze (the PAUSED
+// banner already conveys the cockpit-wide state). Used ONLY for the card/row display; cues,
+// long-running, and sort use effectiveStatus so the overlay never creates a phantom transition.
 function displayStatus(s) {
   const eff = effectiveStatus(s);
-  if ((eff === "running" || eff === "idle") && App.state && App.state.paused && App.state.paused.active) {
+  if ((eff === "running" || eff === "idle") && App.state && App.state.paused && App.state.paused.active && s.atRest) {
     return "paused";
   }
   return eff;
 }
 
 function activityText(s) {
-  switch (displayStatus(s)) {
-    case "running":
-      return s.currentActivity ? "Running " + s.currentActivity : "Working…";
+  const status = displayStatus(s);
+  switch (status) {
+    case "running": {
+      const base = s.currentActivity ? "Running " + s.currentActivity : "Working…";
+      // Still finishing a tool that passed the gate before the pause was clicked — not yet
+      // parked (s.atRest false). A subtle hint distinguishes "pausing" from ordinary running.
+      const pausing = App.state && App.state.paused && App.state.paused.active && !s.atRest;
+      return pausing ? base + " · pausing…" : base;
+    }
     case "waiting":
       return "Waiting for your input";
     case "error":
@@ -425,7 +434,7 @@ function activityText(s) {
     case "ended":
       return "Session ended";
     case "paused":
-      return "Paused — frozen by the pause gate";
+      return "Paused — parked";
     default:
       return s.currentActivity || "Idle";
   }
@@ -583,6 +592,16 @@ function pauseDurationMs(p, now) {
   return Number.isFinite(since) ? Math.max(0, now - since) : 0;
 }
 
+// The "safe to close" note: once every live session has parked, a green "all at rest" line;
+// otherwise, while there are live sessions, an "N of M at rest" progress line; with no live
+// sessions (M === 0), no count at all — an empty M/M would be a meaningless "0 of 0".
+function pauseAtRestNote(p) {
+  const total = num(p.total);
+  if (p.allAtRest) return " · ✓ all sessions at rest — safe to close";
+  if (total > 0) return " · " + num(p.atRestCount) + " of " + total + " at rest";
+  return "";
+}
+
 // Show/hide the banner and (re)write its mostly-static note on a state change; the ticking
 // duration itself is advanced every second by tickPauseBanner via the shared tick() loop, so
 // this doesn't need to run more than once per snapshot/SSE frame.
@@ -593,11 +612,15 @@ function updatePauseBanner() {
   const active = !!(p && p.active);
   el.classList.toggle("is-shown", active);
   if (!active) return;
-  $("pauseBannerNote").textContent = p.reason === "usage" ? " · auto (5h usage ≥ limit)" : "";
+  el.classList.toggle("banner--safe", !!p.allAtRest);
+  const reasonNote = p.reason === "usage" ? " · auto (5h usage ≥ limit)" : "";
+  $("pauseBannerNote").textContent = reasonNote + pauseAtRestNote(p);
   $("pauseBannerDuration").textContent = " · " + fmtDuration(pauseDurationMs(p, estNow()));
 }
 
-// Advance the banner's live duration each second; a no-op while it's hidden.
+// Advance the banner's live duration each second; a no-op while it's hidden. The at-rest
+// count/safe class are NOT re-derived here — updatePauseBanner (driven by state changes) owns
+// them, and they don't change on a bare per-second tick.
 function tickPauseBanner(now) {
   const p = App.state && App.state.paused;
   if (!p || !p.active) return;
@@ -2073,7 +2096,8 @@ function settingsHTML(cfg) {
       fieldRow("Session finished", "When a turn completes", sw("set-ev-sessionFinished", ev.sessionFinished)) +
       fieldRow("Needs input", "When a session is waiting on you", sw("set-ev-needsInput", ev.needsInput)) +
       fieldRow("Long-running prompt", "When a prompt exceeds the threshold below", sw("set-ev-longRunning", ev.longRunning)) +
-      fieldRow("Turn failed", "When a turn ends on an error", sw("set-ev-turnFailed", ev.turnFailed))
+      fieldRow("Turn failed", "When a turn ends on an error", sw("set-ev-turnFailed", ev.turnFailed)) +
+      fieldRow("Safe to close", "When every session is parked and it is safe to close the laptop", sw("set-ev-safeToClose", ev.safeToClose))
   );
 
   const dashboard = section(
@@ -2227,6 +2251,7 @@ function readSettingsForm() {
       needsInput: cb("set-ev-needsInput"),
       longRunning: cb("set-ev-longRunning"),
       turnFailed: cb("set-ev-turnFailed"),
+      safeToClose: cb("set-ev-safeToClose"),
     },
     longRunningThresholdMs: Math.round(nv("set-longRunningSec", 300) * 1000),
     idleShutdownHours: nv("set-idleShutdownHours", 0),
