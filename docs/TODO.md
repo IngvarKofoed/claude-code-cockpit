@@ -1,7 +1,7 @@
 # TODO
 
-- [ ] Would it be possible to know when each session actually have paused?
 
+- [x] Would it be possible to know when each session actually have paused?
 - [x] When I switch subscriptions, and workflows get paused, then when some of the agents stops, the run from the old subscription and updates the statusbar with now old data. Could this be fixed somehow?
 - [x] The 10? or 30? minuts last update thing, that dims the two usage bars. Could we not dim them and just show some text that its based on old information. Then keep the time updating, which will make the yellow persantage go down over time until reset?
 - [x] Add same usage cue made for 5H to weekly, including setting
