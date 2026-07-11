@@ -715,3 +715,8 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     Known blind spots (documented, not to re-fix): a run_in_background Bash / concurrent background
     subagent can read safe EARLY (parked short-circuits bgTasks); and a session the daemon still believes
     is `running` (a dropped Stop with a live owner) holds the ping OFF until the reaper finalizes it.
+
+76. The all-at-rest cue now names the other safe action beyond closing the laptop (v0.26.1): the banner reads
+    "safe to close or switch subscription" and the OS notification "safe to close the laptop or switch
+    subscription". Since a common reason to pause is high 5h usage, being at rest is also the safe moment
+    to switch to another subscription, not only to walk away. Copy-only.

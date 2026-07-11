@@ -36,7 +36,7 @@ const EVENT_SPECS = {
   },
   safeToClose: {
     label: 'safe to close',
-    message: () => 'All sessions are at rest — safe to close the laptop.',
+    message: () => 'All sessions are at rest — safe to close the laptop or switch subscription.',
   },
 };
 

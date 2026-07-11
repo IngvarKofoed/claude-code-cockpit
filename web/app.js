@@ -597,7 +597,7 @@ function pauseDurationMs(p, now) {
 // sessions (M === 0), no count at all — an empty M/M would be a meaningless "0 of 0".
 function pauseAtRestNote(p) {
   const total = num(p.total);
-  if (p.allAtRest) return " · ✓ all sessions at rest — safe to close";
+  if (p.allAtRest) return " · ✓ all sessions at rest — safe to close or switch subscription";
   if (total > 0) return " · " + num(p.atRestCount) + " of " + total + " at rest";
   return "";
 }
