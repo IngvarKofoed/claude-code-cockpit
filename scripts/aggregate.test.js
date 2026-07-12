@@ -257,6 +257,42 @@ test('activeMs EXCLUDES permission-waiting time within a turn', () => {
   assert.strictEqual(state.sessions.s1.activeMs, 5000);
 });
 
+test('a user-blocking tool (AskUserQuestion) enters waiting immediately on PreToolUse', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:04.000Z', tool_name: 'AskUserQuestion' }),
+  ]);
+  const s = state.sessions.s1;
+  assert.strictEqual(s.status, 'waiting');
+  // Frozen at the ask itself, NOT the follow-up permission Notification (which may not fire).
+  assert.strictEqual(s.waitingSince, '2026-07-02T10:00:04.000Z');
+});
+
+test('a non-blocking tool (ExitPlanMode) stays running on PreToolUse (handled by its own permission Notification, not here)', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:04.000Z', tool_name: 'ExitPlanMode' }),
+  ]);
+  assert.strictEqual(state.sessions.s1.status, 'running');
+});
+
+test('activeMs EXCLUDES a user-blocking tool deliberation even without a permission Notification', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:04.000Z', tool_name: 'AskUserQuestion' }), // +4s composing, then waiting on you
+    // No permission_prompt Notification here on purpose: the exclusion must hold on the tool name alone.
+    ev('PostToolUse', { ts: '2026-07-02T10:03:04.000Z', tool_name: 'AskUserQuestion' }), // 3min deliberation -> excluded; back to running
+    ev('Stop', { ts: '2026-07-02T10:03:06.000Z' }), // +2s running
+  ]);
+  const s = state.sessions.s1;
+  // Running spans: 0->4 (compose the question), (4->184 waiting on you: excluded), 184->186 => 4+2 = 6s.
+  assert.strictEqual(s.activeMs, 6000);
+  assert.strictEqual(s.status, 'idle');
+});
+
 test('activeMs COUNTS a background workflow running after the turn Stop (bgTasks-driven)', () => {
   const state = run([
     ev('SessionStart'),

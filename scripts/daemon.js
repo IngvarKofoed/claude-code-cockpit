@@ -1109,6 +1109,9 @@ function refreshPauseSafe() {
 
 function handleEvent(ev) {
   const sid = ev.session_id;
+  // Captured BEFORE applyEvent so the needsInput trigger below can detect the transition INTO
+  // `waiting` (see there). null for a not-yet-registered session.
+  const prevStatus = sid != null && state.sessions[sid] ? state.sessions[sid].status : null;
 
   aggregate.applyEvent(state, ev);
 
@@ -1201,9 +1204,6 @@ function handleEvent(ev) {
     case 'Stop':
       ingestTurn(sid, ev);
       break;
-    case 'Notification':
-      if (ev.notification_type === 'permission_prompt') maybeNotify('needsInput', session);
-      break;
     case 'StopFailure':
       // A failed turn still spent tokens; ingest them like Stop so they aren't
       // lost if the session ends (dropSession) before any later Stop sweeps them.
@@ -1227,6 +1227,17 @@ function handleEvent(ev) {
   // empties background_tasks and settles the session to idle).
   if (session && session.disengagedNow && session.status === 'idle') {
     maybeNotify('sessionFinished', session);
+  }
+
+  // needsInput fires once on the transition INTO `waiting` — whether a permission prompt
+  // (Notification) or a user-blocking tool (AskUserQuestion PreToolUse, which aggregate flips to
+  // `waiting`). Keying off the transition, not the Notification event, makes it (a) robust when
+  // Claude Code doesn't fire the follow-up permission Notification after a blocking tool, and
+  // (b) exactly-once: that follow-up arrives while already `waiting` (prevStatus === 'waiting'),
+  // so it's a no-op, not a second ping. Mirrors the in-browser cue (app.js), which also keys off
+  // the waiting transition, so the OS and browser channels agree.
+  if (session && session.status === 'waiting' && prevStatus !== 'waiting') {
+    maybeNotify('needsInput', session);
   }
 
   // Recompute at-rest + fire the walk-away notification on the rising edge. Only reached on the

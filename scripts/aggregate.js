@@ -169,6 +169,19 @@ function isEngaged(session) {
   return session.status === 'running' || num(session.bgTasks) > 0;
 }
 
+// A tool whose PreToolUse hands control back to the USER and blocks until they respond — currently
+// just AskUserQuestion (a multiple-choice ask). While it's open the main agent is waiting on you,
+// not working, so its PreToolUse enters `waiting`: the same "waiting on the user" category as a
+// permission prompt, excluding the deliberation from active time and freezing the card timer.
+// Claude Code USUALLY fires a permission_prompt Notification right after AskUserQuestion (which
+// would flip us to `waiting` too), but that follow-up is a version-dependent detail — observed to
+// occasionally not fire — so keying off the tool name makes the exclusion robust and immediate.
+// ExitPlanMode is deliberately NOT here: it fires a permission_prompt Notification of its own (so
+// the waiting path already covers it, like any permission prompt), and treating its PreToolUse as
+// blocking would misfire under auto-accept plan mode (no user block) or strand it `waiting` if the
+// approval emits no PostToolUse to restore `running`.
+const USER_BLOCKING_TOOLS = new Set(['AskUserQuestion']);
+
 // "At rest" = this session has come to rest under a pause, so it is safe to close: it is NOT
 // waiting on the user AND (it parked at the gate — gatedSince set, even a `running` session
 // whose next tool is frozen pre-execution — OR it simply isn't working). A `waiting` session
@@ -242,7 +255,11 @@ function applyEvent(state, event) {
     }
 
     case 'PreToolUse':
-      session.status = 'running';
+      // A tool that blocks on the user (see USER_BLOCKING_TOOLS) enters `waiting` — the main
+      // agent handed control back and isn't working, so the engaged clock stops while you decide.
+      // Any other tool means Claude is working: `running`. (A concurrent background task keeps
+      // isEngaged true via bgTasks regardless, so background work isn't wrongly paused here.)
+      session.status = USER_BLOCKING_TOOLS.has(event.tool_name) ? 'waiting' : 'running';
       if (event.tool_name != null) session.currentActivity = event.tool_name;
       // num() coercion is required: loadSnapshot restores sessions straight from
       // JSON without running newSession, so a session live across a daemon upgrade

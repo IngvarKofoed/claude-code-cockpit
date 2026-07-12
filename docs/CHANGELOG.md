@@ -720,3 +720,9 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     "safe to close or switch subscription" and the OS notification "safe to close the laptop or switch
     subscription". Since a common reason to pause is high 5h usage, being at rest is also the safe moment
     to switch to another subscription, not only to walk away. Copy-only.
+
+77. `AskUserQuestion`'s `PreToolUse` now enters `waiting` on the tool name alone (v0.27.0,
+    `aggregate.USER_BLOCKING_TOOLS`), excluding answer time from active time even when Claude Code skips
+    the follow-up `permission_prompt` Notification it usually fires. `needsInput` now keys off the
+    running→`waiting` TRANSITION (not the Notification), so a blocking tool pings you exactly once and
+    matches the browser cue. `ExitPlanMode` stays out — its own Notification already covers it.
