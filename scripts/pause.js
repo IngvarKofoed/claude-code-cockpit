@@ -66,18 +66,40 @@ function writePauseState(sentinel) {
   fs.renameSync(tmp, file);
 }
 
-// Defensive LIGHT read of config.json for the one opt-in flag. Deliberately
-// does NOT call config.readConfig() — that can trigger a one-time migration
-// WRITE, and a hook must have no side effects. No merge, no migration, no
-// default-filling: just parse and read the single field. Returns true only if
-// pauseGateEnabled is boolean true or the string 'true'; false on ANY error.
+// Defensive LIGHT read of config.json for the one gate flag. Deliberately does
+// NOT call config.readConfig() — that can trigger a one-time migration WRITE, and
+// a hook must have no side effects (it only reads DEFAULT_CONFIG). Resolution:
+//   • EXPLICIT setting wins: true/'true' → on, false/'false' → off (a persisted
+//     opt-out is never overridden by the on-by-default).
+//   • Parsed config that OMITS the key (or isn't an object) → shipped default,
+//     so the on-by-default gate is armed and this read agrees with the daemon's
+//     merged config for a fresh / config-less / minimal install.
+//   • NO config file (ENOENT) → shipped default too — the fresh-install case.
+//   • Any OTHER read error, or an UNPARSEABLE file → FAIL OPEN (false). A blocking
+//     hook must never freeze every session on a config it couldn't read/parse;
+//     here the gate's fail-open rule outranks matching the daemon (which would
+//     default such a config to on). Never throws.
+// config.js is required LAZILY (matching gate.js's http/path pattern): the common
+// not-paused hook path never calls this, so it must not pay to load + freeze it.
 function pauseGateEnabled() {
+  const { DEFAULT_CONFIG } = require('./config');
+  const dflt = DEFAULT_CONFIG.pauseGateEnabled === true;
+  let text;
   try {
-    const raw = JSON.parse(fs.readFileSync(paths.configPath(), 'utf8'));
-    return raw.pauseGateEnabled === true || raw.pauseGateEnabled === 'true';
-  } catch (_e) {
-    return false;
+    text = fs.readFileSync(paths.configPath(), 'utf8');
+  } catch (e) {
+    return e && e.code === 'ENOENT' ? dflt : false;
   }
+  let raw;
+  try {
+    raw = JSON.parse(text);
+  } catch (_e) {
+    return false; // file exists but is corrupt/partial → fail open
+  }
+  const v = raw && typeof raw === 'object' ? raw.pauseGateEnabled : undefined;
+  if (v === true || v === 'true') return true;
+  if (v === false || v === 'false') return false;
+  return dflt;
 }
 
 // Epoch ms for an ISO string; unparseable sorts LAST (Infinity) so a bad

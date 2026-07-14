@@ -30,10 +30,15 @@ const DEFAULT_CONFIG = {
   subscriptionLabelPattern: '\\(([^)]+)\\)',
   events: { sessionFinished: true, needsInput: true, longRunning: false, turnFailed: true, safeToClose: true },
   longRunningThresholdMs: 300000,
-  // Pause gate: opt-in master switch (default off) + optional usage auto-pilot.
-  // autoPauseFiveHourPct is the 5h rate-limit threshold that auto-pauses (0 = off).
-  pauseGateEnabled: false,
-  autoPauseFiveHourPct: 0,
+  // Pause gate: master switch (default ON) + usage auto-pilot. autoPauseFiveHourPct
+  // is the 5h rate-limit threshold that auto-pauses (0 = off; default 90). There is
+  // deliberately NO migration (a boolean can't tell a deliberate opt-out from the old
+  // default): a persisted explicit `false` stays off, but the on-by-default reaches any
+  // config that merely OMITS the key — a fresh/config-less install OR an existing
+  // minimal/hand-edited/migrated config.json — since both the daemon's merged config and
+  // the gate hook (see pause.js) fill an absent key from here.
+  pauseGateEnabled: true,
+  autoPauseFiveHourPct: 90,
   cost: {
     enabled: true,
     currency: 'USD',

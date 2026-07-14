@@ -12,12 +12,14 @@ const {
   gateDecision,
   readPauseState,
   writePauseState,
+  pauseGateEnabled,
   newPauseAcc,
   foldPauseEvent,
   pauseStateOf,
   foldPauseState,
   autoPauseDecision,
 } = require('./pause');
+const { DEFAULT_CONFIG } = require('./config');
 
 // ---- isPaused / sentinelReason -----------------------------------------
 
@@ -314,6 +316,62 @@ test('readPauseState/writePauseState: round-trip through a temp state dir', () =
 
     writePauseState('running');
     assert.strictEqual(readPauseState(), 'running');
+  } finally {
+    for (const k of envKeys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// ---- pauseGateEnabled (light raw config read + default-fill) ------------
+// The gate hook reads config.json directly. An EXPLICIT setting wins; an absent
+// key / missing / garbage file falls back to the shipped default (so the
+// on-by-default gate reaches a config-less fresh install). Redirect the config
+// dir env vars to a temp dir, mirroring the round-trip test above.
+
+test('pauseGateEnabled: explicit true/false wins; absent/missing/garbage -> shipped default', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cockpit-gate-'));
+  const envKeys = ['XDG_CONFIG_HOME', 'APPDATA', 'HOME', 'USERPROFILE'];
+  const saved = {};
+  for (const k of envKeys) saved[k] = process.env[k];
+  const cfgDir = path.join(tmp, 'config', 'claude-code-cockpit');
+  const cfgFile = path.join(cfgDir, 'config.json');
+  const write = (obj) => {
+    fs.mkdirSync(cfgDir, { recursive: true });
+    fs.writeFileSync(cfgFile, typeof obj === 'string' ? obj : JSON.stringify(obj));
+  };
+  const dflt = DEFAULT_CONFIG.pauseGateEnabled === true;
+  try {
+    process.env.XDG_CONFIG_HOME = path.join(tmp, 'config');
+    process.env.APPDATA = path.join(tmp, 'config');
+    process.env.HOME = tmp;
+    process.env.USERPROFILE = tmp;
+
+    // No file yet -> shipped default (the fresh/config-less-install case).
+    assert.strictEqual(pauseGateEnabled(), dflt);
+
+    // Explicit values (boolean and string form) always win over the default.
+    write({ pauseGateEnabled: false });
+    assert.strictEqual(pauseGateEnabled(), false);
+    write({ pauseGateEnabled: 'false' });
+    assert.strictEqual(pauseGateEnabled(), false);
+    write({ pauseGateEnabled: true });
+    assert.strictEqual(pauseGateEnabled(), true);
+    write({ pauseGateEnabled: 'true' });
+    assert.strictEqual(pauseGateEnabled(), true);
+
+    // A parsed config that omits the key, or non-object JSON, -> shipped default
+    // (agrees with the daemon's merged config for a minimal install).
+    write({ port: 4319 });
+    assert.strictEqual(pauseGateEnabled(), dflt);
+    write('123');
+    assert.strictEqual(pauseGateEnabled(), dflt);
+    // An UNPARSEABLE file fails OPEN (false), NOT the default — a blocking hook
+    // must never freeze on a config it couldn't parse.
+    write('not json {');
+    assert.strictEqual(pauseGateEnabled(), false);
   } finally {
     for (const k of envKeys) {
       if (saved[k] === undefined) delete process.env[k];
