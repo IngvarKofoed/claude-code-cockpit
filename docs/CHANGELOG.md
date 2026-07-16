@@ -779,6 +779,11 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     Pause button — tallest child — sets the bar height), main top padding 16→12, ribbon margin 14→12,
     card body padding →9px / gap 7px (card grid gap was already 12). Stacking still adds a line by default
     — so the lever to fit two card rows is toggling the folder path off (~21px/card, more than this buys).
+    [Superseded in part: the ribbon margin 14→12 was reverted in 0.32.1 — see entry 85.]
+
+85. Reverted the Live ribbon's bottom margin 12→14px (v0.32.1), undoing the one-value tightening entry 83
+    made in 0.32.0, per user preference. The other 0.32.0 height reclaims (topbar, main padding, card
+    padding) stand — only this single spacing was restored.
 
 84. The Live card's folder-path line now matches the session-name/branch row style (v0.32.0) — same UI
     font (was mono), 12px, `--ink-2` colour, 13px/0.8 icon. Its click-to-copy button keeps its 6px
