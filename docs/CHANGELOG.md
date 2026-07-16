@@ -742,3 +742,10 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     Crucially it keeps the gate's FAIL-OPEN rule for the error path: a corrupt/unparseable or otherwise
     unreadable config resolves to `false` (tools run), NOT the default — a blocking hook must never freeze
     every session on a config it couldn't read, so fail-open outranks matching the daemon there.
+
+79. Dashboard light theme (v0.29.0): Settings > Dashboard "Light theme" toggle (default dark),
+    persisted per-browser in localStorage (`cockpit.theme`, like live-sort, not daemon config or SSE).
+    Synchronous <head> bootstrap prevents dark flash on load. Tokenized dark-assuming colours:
+    borders/hover/tooltip/toast flip white-alpha↔black-alpha; switch-knob/banner+danger text fixed.
+    Charts recolour via CSS var() tokens; heatmap/calendar ramp reads new --heat-* and redraws on toggle.
+    Light categorical palette = dataviz-validated light steps of the same hues.

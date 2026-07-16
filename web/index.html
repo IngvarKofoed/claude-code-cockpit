@@ -9,6 +9,9 @@
   <!-- Daemon injects the per-session bearer token into the placeholder below so the SPA can auth.
        Keep this the ONLY occurrence of the placeholder string in this file. -->
   <script>window.__COCKPIT_TOKEN__="%%TOKEN%%";</script>
+  <!-- Theme bootstrap: apply a saved light-theme preference before first paint (no dark flash).
+       Dark is the default = no attribute. Per-browser pref; mirrors app.js setTheme(). -->
+  <script>try{if(localStorage.getItem("cockpit.theme")==="light")document.documentElement.setAttribute("data-theme","light");}catch(e){}</script>
 </head>
 <body>
   <div class="app">

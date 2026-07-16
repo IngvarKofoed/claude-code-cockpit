@@ -388,18 +388,30 @@ function hexLerp(a, b, t) {
   const c = pa.map((v, i) => Math.round(v + (pb[i] - v) * t));
   return "#" + c.map((v) => v.toString(16).padStart(2, "0")).join("");
 }
-// sequential blue ramp on the dark surface: low -> near-surface, high -> bright.
-function ramp(t) {
-  return t <= 0 ? "#171d27" : hexLerp("#1b3350", "#5598e7", Math.min(1, t));
+// sequential blue ramp: low -> near-surface, high -> bright. Theme-aware — the stops are read
+// from the --heat-* CSS custom properties at render time (dark default vs. light override),
+// falling back to the current dark hex if a token is unresolved. Resolve ONCE per chart render
+// (const stops = heatStops()) and pass it in — never call getComputedStyle per cell.
+function heatStops() {
+  const cs = getComputedStyle(document.documentElement);
+  const g = (name, fb) => {
+    const v = cs.getPropertyValue(name).trim();
+    return /^#[0-9a-fA-F]{6}$/.test(v) ? v : fb;
+  };
+  return { zero: g("--heat-zero", "#171d27"), lo: g("--heat-lo", "#1b3350"), hi: g("--heat-hi", "#5598e7") };
+}
+function ramp(t, stops) {
+  return t <= 0 ? stops.zero : hexLerp(stops.lo, stops.hi, Math.min(1, t));
 }
 
 function heatLegend(host) {
+  const stops = heatStops();
   const legend = document.createElement("div");
   legend.className = "heat-legend";
   legend.append(document.createTextNode("less"));
   [0.05, 0.35, 0.7, 1].forEach((t) => {
     const i = document.createElement("i");
-    i.style.background = ramp(t);
+    i.style.background = ramp(t, stops);
     legend.appendChild(i);
   });
   legend.append(document.createTextNode("more"));
@@ -427,12 +439,13 @@ export function punch(host, matrix7x24, opts) {
   styleTicks(svg);
 
   const max = Math.max(...matrix7x24.flat(), 0) || 1;
+  const stops = heatStops();
   matrix7x24.forEach((row, d) => {
     const y = mt + d * (chh + gap);
     svg.appendChild(text(ml - 7, y + chh / 2 + 4, PUNCH_DAYS[d] || "", "", "end"));
     (row || []).forEach((v, h) => {
       const x = ml + h * (cw + gap);
-      const r = el("rect", { x, y, width: cw, height: chh, rx: 2.5, fill: ramp((v || 0) / max) });
+      const r = el("rect", { x, y, width: cw, height: chh, rx: 2.5, fill: ramp((v || 0) / max, stops) });
       bindTip(r, `${PUNCH_DAYS[d]} ${String(h).padStart(2, "0")}:00`, fmt(v || 0));
       svg.appendChild(r);
     });
@@ -461,6 +474,7 @@ export function calendar(host, dayVals, opts) {
   styleTicks(svg);
 
   const max = Math.max(...dayVals.map((d) => d.value || 0), 0) || 1;
+  const stops = heatStops();
   const dow = ["Mon", "", "Wed", "", "Fri", "", ""]; // dayVals[0] is a Monday (row 0)
   dow.forEach((s, i) => {
     if (s) svg.appendChild(text(ml - 6, mt + i * (cell + gap) + cell / 2 + 4, s, "", "end"));
@@ -469,7 +483,7 @@ export function calendar(host, dayVals, opts) {
   dayVals.forEach((d, i) => {
     const wk = Math.floor(i / 7), dy = i % 7;
     const x = ml + wk * (cell + gap), y = mt + dy * (cell + gap);
-    const fill = d.value ? ramp(0.18 + 0.82 * (d.value / max)) : "var(--surface-2)";
+    const fill = d.value ? ramp(0.18 + 0.82 * (d.value / max), stops) : "var(--surface-2)";
     const r = el("rect", { x, y, width: cell, height: cell, rx: 3, fill });
     bindTip(
       r,

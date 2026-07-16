@@ -18,6 +18,7 @@ const App = {
   histData: null, // last /api/history payload — the pivot re-slices this with no refetch
   histBuilt: false, // History view scaffolding (family cards + pivot toolbar) built once
   liveSort: "status", // "status" (server waiting-first) | "name" (alpha); set from localStorage in init
+  theme: "dark", // "dark" (default) | "light"; per-browser localStorage pref, set in init
   repoRows: [], // normalized rows currently shown in the per-repo table
   repoSort: { key: "activeMs", dir: -1 }, // dir: 1 asc, -1 desc
   sessionsPage: 0, // current 0-based page of the Sessions view
@@ -1163,6 +1164,27 @@ function setLiveSort(value) {
   renderLive();
 }
 
+// Theme is a per-browser preference (localStorage), NOT daemon config — never PUT it (a config
+// save would also pop a spurious "Settings saved" toast). Dark is the default (no data-theme
+// attribute); "light" stamps data-theme="light".
+function applyTheme() {
+  const el = document.documentElement;
+  if (App.theme === "light") el.setAttribute("data-theme", "light");
+  else el.removeAttribute("data-theme");
+}
+function setTheme(value) {
+  App.theme = value === "light" ? "light" : "dark";
+  try {
+    localStorage.setItem("cockpit.theme", App.theme);
+  } catch (_e) {
+    /* persistence best-effort */
+  }
+  applyTheme();
+  // The charts' var()-based colours recolour live, but the heatmap/calendar ramp is computed in
+  // JS from the --heat-* tokens at render time — so redraw History from cached data to recompute it.
+  if (App.histData) drawHistory(App.histData);
+}
+
 // ---- Sessions view ---------------------------------------------------------
 
 // Relative "3h ago" from an epoch-ms timestamp (the transcript file mtime). Reuses
@@ -2103,7 +2125,8 @@ function settingsHTML(cfg) {
   const dashboard = section(
     "Dashboard",
     null,
-    fieldRow("In-browser sounds", "Play Web Audio cues in this tab", sw("set-browserSounds", cfg.browserSounds)) +
+    fieldRow("Light theme", "Use the light color scheme (this browser only)", sw("set-theme", App.theme === "light")) +
+      fieldRow("In-browser sounds", "Play Web Audio cues in this tab", sw("set-browserSounds", cfg.browserSounds)) +
       fieldRow(
         "Live view sort",
         "Order the live session cards (this browser only)",
@@ -2482,6 +2505,14 @@ function init() {
     /* localStorage unavailable — keep the default */
   }
 
+  try {
+    const th = localStorage.getItem("cockpit.theme");
+    App.theme = th === "light" ? "light" : "dark";
+  } catch (_e) {
+    /* localStorage unavailable — keep default dark */
+  }
+  applyTheme(); // reconcile the <html> attribute with App.theme (the head bootstrap may have set it)
+
   $("nav").addEventListener("click", (e) => {
     const t = e.target.closest(".nav__tab");
     if (t) setView(t.dataset.view);
@@ -2529,6 +2560,10 @@ function init() {
     // locally and never PUT it (a config save would also pop a spurious "Settings saved" toast).
     if (e.target.id === "set-liveSort") {
       setLiveSort(e.target.value);
+      return;
+    }
+    if (e.target.id === "set-theme") {
+      setTheme(e.target.checked ? "light" : "dark");
       return;
     }
     // The Data section (store size + cleanup) isn't part of the config, so its inputs

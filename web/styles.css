@@ -43,7 +43,67 @@
   --r: 12px;
   --r-sm: 8px;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 10px 30px -14px rgba(0, 0, 0, 0.7);
+
+  --pop-bg: #05070b;                    /* tooltip/toast popover surface */
+  --row-hover: rgba(255, 255, 255, 0.02); /* table row hover wash */
+  --knob: #c4cbd8;                       /* switch knob (off) */
+  --danger-ink: #f4b7b4;                 /* destructive/error text on a tinted bg */
+  --paused-ink: #cfc7ff;                 /* pause-gate indigo text on a tinted bg */
+  --safe-ink: #b7f0cf;                   /* all-at-rest green text */
+  --heat-zero: #171d27;                  /* heatmap/calendar ramp: zero cell */
+  --heat-lo: #1b3350;                    /* heatmap/calendar ramp: low end */
+  --heat-hi: #5598e7;                    /* heatmap/calendar ramp: high end */
 }
+
+:root[data-theme="light"] {
+  /* Surfaces — light inverts the raised direction: card (surface-1) is the LIGHTEST (white),
+     wells/tracks (surface-3) the greyest, which reads correctly as inset on light. */
+  --plane: #eef1f5;
+  --surface-1: #ffffff;
+  --surface-2: #f1f3f7;
+  --surface-3: #e4e8ee;
+  /* Borders/hover flip to BLACK-alpha — white-alpha is invisible on a light surface. */
+  --border: rgba(11, 17, 30, 0.12);
+  --border-strong: rgba(11, 17, 30, 0.20);
+  --ink: #141922;
+  --ink-2: #545c6b;
+  --ink-muted: #7b8494;
+  --accent: #2364c8;
+  --accent-soft: rgba(35, 100, 200, 0.12);
+  /* Status hues darkened for legible badge text on white (rail/dot use the same token — fine). */
+  --st-running: #178a4e;
+  --st-waiting: #a86f00;
+  --st-idle: #64708a;
+  --st-error: #d03b3b;
+  --st-ended: #7a8598;
+  --st-paused: #5b4cc7;
+  /* Chart categorical — dataviz-validated LIGHT steps of the same six hues. */
+  --series-1: #2a78d6;
+  --series-2: #1baf7a;
+  --series-3: #eda100;
+  --series-4: #e34948;
+  --series-5: #4a3aa7;
+  --series-6: #008300;
+  --grid: #e3e6ea;
+  --axis: #c7ccd3;
+  --shadow: 0 1px 2px rgba(11, 17, 30, 0.06), 0 10px 30px -14px rgba(11, 17, 30, 0.18);
+  --pop-bg: #ffffff;
+  --row-hover: rgba(11, 17, 30, 0.04);
+  --knob: #ffffff;
+  --danger-ink: #b4231f;
+  --paused-ink: #4a3aa7;
+  --safe-ink: #12724a;
+  /* Sequential blue ramp on light: zero near-surface, high a strong blue (dark = more). */
+  --heat-zero: #eef1f5;
+  --heat-lo: #cde2fb;
+  --heat-hi: #2a78d6;
+}
+/* The connection-lost banner's code chip: a dark chip only suited the dark theme. */
+:root[data-theme="light"] .banner code { background: rgba(0, 0, 0, 0.06); color: var(--ink); }
+/* The sticky topbar's translucent surface was a hardcoded dark rgba with no light override,
+   so in light mode the bar stayed dark while its tab/status text flipped to dark-theme ink
+   (dark-on-dark, unreadable). Flip the surface to a light translucent wash to match. */
+:root[data-theme="light"] .topbar { background: rgba(255, 255, 255, 0.82); }
 
 * { box-sizing: border-box; }
 
@@ -152,7 +212,7 @@ body {
   padding: 10px 22px;
   background: rgba(226, 86, 79, 0.14);
   border-bottom: 1px solid rgba(226, 86, 79, 0.4);
-  color: #f4b7b4;
+  color: var(--danger-ink);
   font-size: 13px;
 }
 .banner.is-shown { display: flex; }
@@ -169,7 +229,7 @@ body {
 .banner--paused {
   background: rgba(139, 123, 255, 0.14);
   border-bottom: 1px solid rgba(139, 123, 255, 0.4);
-  color: #cfc7ff;
+  color: var(--paused-ink);
 }
 .banner__duration { font-variant-numeric: tabular-nums; }
 .banner__note { opacity: 0.85; }
@@ -179,7 +239,7 @@ body {
 .banner--paused.banner--safe {
   background: rgba(51, 193, 122, 0.14);
   border-bottom: 1px solid rgba(51, 193, 122, 0.4);
-  color: #b7f0cf;
+  color: var(--safe-ink);
 }
 
 /* ---------- Views ---------- */
@@ -751,7 +811,7 @@ body {
   font-weight: 550;
 }
 .table tbody tr:last-child td { border-bottom: 0; }
-.table tbody tr:hover td { background: rgba(255, 255, 255, 0.02); }
+.table tbody tr:hover td { background: var(--row-hover); }
 .table .muted { color: var(--ink-muted); }
 
 /* ---------- Sessions table ---------- */
@@ -908,7 +968,7 @@ body {
   opacity: 0;
   transform: translate(-50%, -140%);
   transition: opacity 0.08s;
-  background: #05070b;
+  background: var(--pop-bg);
   border: 1px solid var(--border-strong);
   border-radius: 8px;
   padding: 6px 9px;
@@ -985,7 +1045,7 @@ body {
   width: 18px;
   height: 18px;
   border-radius: 50%;
-  background: #c4cbd8;
+  background: var(--knob);
   transition: transform 0.15s, background 0.15s;
 }
 .switch input:checked + .switch__track { background: var(--accent); }
@@ -1049,7 +1109,7 @@ body {
 .btn--danger {
   border-color: rgba(226, 86, 79, 0.5);
   background: rgba(226, 86, 79, 0.16);
-  color: #f4b7b4;
+  color: var(--danger-ink);
 }
 .btn--danger:hover { background: rgba(226, 86, 79, 0.26); color: #fff; }
 /* Pause gate button (topbar), while a global pause is active — mirrors --danger's
@@ -1057,7 +1117,7 @@ body {
 .btn--paused {
   border-color: rgba(139, 123, 255, 0.5);
   background: rgba(139, 123, 255, 0.16);
-  color: #cfc7ff;
+  color: var(--paused-ink);
 }
 .btn--paused:hover { background: rgba(139, 123, 255, 0.26); color: #fff; }
 
@@ -1109,8 +1169,8 @@ body {
 }
 .menu__item:hover { background: var(--surface-3); }
 .menu__item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.menu__item--danger { color: #f0a6a2; }
-.menu__item--danger:hover { background: rgba(226, 86, 79, 0.15); color: #f4b7b4; }
+.menu__item--danger { color: var(--danger-ink); }
+.menu__item--danger:hover { background: rgba(226, 86, 79, 0.15); color: var(--danger-ink); }
 
 /* ---------- Confirm modal ---------- */
 
@@ -1139,8 +1199,8 @@ body {
 .modal__body p { margin: 0 0 10px; }
 .modal__body p:last-child { margin-bottom: 0; }
 .modal__body b { color: var(--ink); font-weight: 600; }
-.modal__warn { color: #f0a6a2; }
-.modal__warn b { color: #f4b7b4; }
+.modal__warn { color: var(--danger-ink); }
+.modal__warn b { color: var(--danger-ink); }
 .modal__actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
 .modal__actions .btn { margin-top: 0; }
 
@@ -1160,7 +1220,7 @@ body {
   bottom: 22px;
   left: 50%;
   transform: translate(-50%, 20px);
-  background: #05070b;
+  background: var(--pop-bg);
   border: 1px solid var(--border-strong);
   color: var(--ink);
   padding: 9px 16px;
