@@ -139,7 +139,7 @@ body {
   display: flex;
   align-items: center;
   gap: 20px;
-  padding: 9px 22px;
+  padding: 5px 22px;
   background: rgba(11, 14, 20, 0.82);
   backdrop-filter: blur(10px);
   border-bottom: 1px solid var(--border);
@@ -157,7 +157,7 @@ body {
   color: var(--ink-2);
   font: inherit;
   font-size: 13px;
-  padding: 7px 13px;
+  padding: 5px 13px;
   border-radius: var(--r-sm);
   cursor: pointer;
   transition: background 0.12s, color 0.12s;
@@ -174,6 +174,10 @@ body {
   align-items: center;
   gap: 14px;
 }
+/* The Pause button reuses the global .btn (7px vertical padding) and is the topbar's tallest
+   element, so it — not the topbar's own padding — sets the bar height. Trim its vertical
+   padding to match the shortened nav tabs and keep the bar compact; font/horizontal unchanged. */
+.topbar .btn { padding: 5px 13px; }
 .conn {
   display: flex;
   align-items: center;
@@ -246,7 +250,7 @@ body {
 
 .main {
   flex: 1;
-  padding: 16px 22px 22px;
+  padding: 12px 22px 22px;
   max-width: 1400px;
   width: 100%;
   margin: 0 auto;
@@ -275,7 +279,7 @@ body {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 10px;
-  margin-bottom: 14px;
+  margin-bottom: 12px;
 }
 .tile {
   background: var(--surface-1);
@@ -524,10 +528,10 @@ body {
 .card__body {
   flex: 1;
   min-width: 0;
-  padding: 12px 16px;
+  padding: 9px 16px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 7px;
 }
 
 .card__head {
@@ -577,14 +581,20 @@ body {
   gap: 5px;
   min-width: 0;
   font-size: 12px;
+  line-height: 16px;
+  min-height: 16px; /* hold the row height when there's no name yet — icon-only, not collapsed */
   color: var(--ink-2);
 }
 #cards .card__title svg { width: 13px; height: 13px; flex: none; opacity: 0.8; }
 #cards .card__title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Branch and folder path are STACKED, each on its own line (was one shared row) — a
+   column flex, left-aligned, with a tight internal gap so the two read as one location
+   group. Either line is omitted upstream when its toggle is off / its value is absent. */
 .card__where {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
   min-width: 0;
 }
 .branch {
@@ -594,30 +604,38 @@ body {
   font-size: 12px;
   color: var(--ink-2);
   flex: none;
-  max-width: 45%;
+  min-width: 0;
+  max-width: 100%; /* was 45% for the shared row; now full-width on its own line, still ellipsizes */
 }
 .branch svg { width: 13px; height: 13px; flex: none; opacity: 0.8; }
 .branch span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* The folder path is a click-to-copy button, but on its own line it should read as the
+   same kind of labelled row as the session name and branch above it — so it inherits their
+   font (not mono), 12px size, --ink-2 colour, and 13px/0.8 icon. The button keeps its 6px
+   horizontal padding for a comfortable hover hit-area, offset by an equal negative margin
+   so the icon lines up flush at the same x as the branch/name icons rather than indenting. */
 .path {
   appearance: none;
   border: 0;
   background: transparent;
-  color: var(--ink-muted);
-  font-family: var(--font-mono);
-  font-size: 11.5px;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 12px;
   padding: 2px 6px;
+  margin-left: -6px;
   border-radius: 6px;
   cursor: pointer;
   min-width: 0;
+  max-width: 100%;
   display: inline-flex;
   align-items: center;
   gap: 5px;
   overflow: hidden;
 }
 .path span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; }
-.path svg { width: 12px; height: 12px; flex: none; opacity: 0.6; }
-.path:hover { background: var(--surface-2); color: var(--ink-2); }
+.path svg { width: 13px; height: 13px; flex: none; opacity: 0.8; }
+.path:hover { background: var(--surface-2); color: var(--ink); }
 
 .card__activity {
   display: flex;

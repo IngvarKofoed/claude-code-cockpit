@@ -765,3 +765,22 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
 81. The Live card session-name line gained a flat tag/label icon (v0.31.0), matching the branch symbol's
     stroke style (13px, 0.8 opacity) — so the name reads as a labelled row like the branch/path lines rather
     than floating text. The title is now icon + ellipsized text span (was a bare ellipsized block).
+
+82. The session-name line is now ALWAYS rendered on a Live card (v0.32.0) — the tag icon shows even when
+    there's no name yet (empty text), reversing entry 80's "omit when no title". A fixed line-height +
+    min-height (16px) holds the row so the icon-only line matches a named line's height rather than
+    collapsing, keeping the card layout stable whether or not a title has arrived.
+
+83. Live cards STACK branch + folder path on separate lines (was one shared row), and each location
+    line — session name, branch, folder path — gets a per-browser show/hide toggle in Settings >
+    Dashboard (v0.32.0; localStorage `cockpit.liveShow`, all on by default; a malformed/partial stored
+    value defaults each key on; `.card__where` wrapper dropped when neither line shows). Height reclaimed
+    for the live grid: topbar ~47→41px (its own padding + nav-tab/button vertical padding, since the
+    Pause button — tallest child — sets the bar height), main top padding 16→12, ribbon margin 14→12,
+    card body padding →9px / gap 7px (card grid gap was already 12). Stacking still adds a line by default
+    — so the lever to fit two card rows is toggling the folder path off (~21px/card, more than this buys).
+
+84. The Live card's folder-path line now matches the session-name/branch row style (v0.32.0) — same UI
+    font (was mono), 12px, `--ink-2` colour, 13px/0.8 icon. Its click-to-copy button keeps its 6px
+    horizontal padding for a comfortable hover hit-area, offset by an equal negative margin so all three
+    location icons align flush at the same left edge rather than the path indenting under its padding.

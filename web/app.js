@@ -19,6 +19,7 @@ const App = {
   histBuilt: false, // History view scaffolding (family cards + pivot toolbar) built once
   liveSort: "status", // "status" (server waiting-first) | "name" (alpha); set from localStorage in init
   theme: "dark", // "dark" (default) | "light"; per-browser localStorage pref, set in init
+  liveShow: { title: true, branch: true, path: true }, // which Live-card location lines to show; per-browser localStorage pref, set in init
   repoRows: [], // normalized rows currently shown in the per-repo table
   repoSort: { key: "activeMs", dir: -1 }, // dir: 1 asc, -1 desc
   sessionsPage: 0, // current 0-based page of the Sessions view
@@ -56,6 +57,25 @@ function esc(s) {
 function num(v) {
   const n = typeof v === "number" ? v : Number(v);
   return Number.isFinite(n) ? n : 0;
+}
+
+// Per-browser preference storage (Live sort, theme, Live-card line visibility). These are
+// localStorage-only, never daemon config; the read/write is best-effort so a browser with
+// storage disabled just falls back to the in-memory default. Both helpers swallow errors so
+// each pref's setter/loader stays a one-liner and can't accidentally skip the try/catch.
+function persistPref(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (_e) {
+    /* persistence best-effort */
+  }
+}
+function loadPref(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch (_e) {
+    return null; // storage unavailable — caller keeps its default
+  }
 }
 
 function sumTokens(t) {
@@ -548,6 +568,25 @@ function cardHTML(s) {
   const f = App.flash[s.sessionId];
   const flash = f && f.until > Date.now() ? " card--flash " + f.cls : "";
 
+  // Which location lines to render is a per-browser preference (App.liveShow), all on by
+  // default. The session name still renders even when it has no title yet (entry 82: the tag
+  // icon + a min-height hold the row) — the toggle removes the line entirely, it doesn't
+  // depend on a name being present. Branch and folder path are now STACKED (each its own line
+  // in the column-flex `.card__where`) rather than sharing one row, and each is omitted when
+  // its toggle is off or its value is absent; the wrapper is dropped when neither shows.
+  const show = App.liveShow;
+  const title = show.title
+    ? `<div class="card__title"${s.title ? ` title="${esc(s.title)}"` : ""}>${TITLE_SVG}<span>${s.title ? esc(s.title) : ""}</span></div>`
+    : "";
+  const whereParts = [];
+  if (show.branch && s.branch)
+    whereParts.push(`<span class="branch">${BRANCH_SVG}<span>${esc(s.branch)}</span></span>`);
+  if (show.path && s.cwd)
+    whereParts.push(
+      `<button class="path" type="button" data-path="${esc(s.cwd)}" title="Copy path">${COPY_SVG}<span>${esc(s.cwd)}</span></button>`
+    );
+  const where = whereParts.length ? `<div class="card__where">${whereParts.join("")}</div>` : "";
+
   return `
   <article class="card ${waiting ? "card--waiting" : ""}${flash}" data-status="${esc(status)}">
     <div class="card__rail"></div>
@@ -556,11 +595,7 @@ function cardHTML(s) {
         <span class="card__repo" title="${esc(s.repoName || "")}">${esc(s.repoName || "(unknown)")}</span>
         <span class="badge">${esc(STATUS_LABEL[status] || status)}</span>
       </div>
-      ${s.title ? `<div class="card__title" title="${esc(s.title)}">${TITLE_SVG}<span>${esc(s.title)}</span></div>` : ""}
-      <div class="card__where">
-        ${s.branch ? `<span class="branch">${BRANCH_SVG}<span>${esc(s.branch)}</span></span>` : ""}
-        ${s.cwd ? `<button class="path" type="button" data-path="${esc(s.cwd)}" title="Copy path">${COPY_SVG}<span>${esc(s.cwd)}</span></button>` : ""}
-      </div>
+      ${title}${where}
       <div class="card__activity"><span class="spark"></span><span>${esc(activityText(s))}</span></div>
       <div class="telemetry">
         <span class="telemetry__value" ${tickMs ? `data-timer="dur" data-start="${tickMs}"` : ""}>${tickMs ? "0s" : hasFrozen ? esc(fmtDuration(waitFrozenMs)) : "—"}</span>
@@ -1162,11 +1197,17 @@ async function copyPath(path) {
 // the server's waiting-first order; "name" sorts alphabetically for stable positions.
 function setLiveSort(value) {
   App.liveSort = value === "name" ? "name" : "status";
-  try {
-    localStorage.setItem("cockpit.liveSort", App.liveSort);
-  } catch (_e) {
-    /* persistence best-effort */
-  }
+  persistPref("cockpit.liveSort", App.liveSort);
+  renderLive();
+}
+
+// Which Live-card location lines are shown (session name / branch / folder path) — a
+// per-browser preference (localStorage), NOT daemon config, so it never PUTs. Set from the
+// Settings > Dashboard switches; re-renders the grid so the change is immediate.
+function setLiveShow(key, on) {
+  if (!(key in App.liveShow)) return;
+  App.liveShow[key] = !!on;
+  persistPref("cockpit.liveShow", JSON.stringify(App.liveShow));
   renderLive();
 }
 
@@ -1180,11 +1221,7 @@ function applyTheme() {
 }
 function setTheme(value) {
   App.theme = value === "light" ? "light" : "dark";
-  try {
-    localStorage.setItem("cockpit.theme", App.theme);
-  } catch (_e) {
-    /* persistence best-effort */
-  }
+  persistPref("cockpit.theme", App.theme);
   applyTheme();
   // The charts' var()-based colours recolour live, but the heatmap/calendar ramp is computed in
   // JS from the --heat-* tokens at render time — so redraw History from cached data to recompute it.
@@ -2133,6 +2170,9 @@ function settingsHTML(cfg) {
     null,
     fieldRow("Light theme", "Use the light color scheme (this browser only)", sw("set-theme", App.theme === "light")) +
       fieldRow("In-browser sounds", "Play Web Audio cues in this tab", sw("set-browserSounds", cfg.browserSounds)) +
+      fieldRow("Show session name", "Session name line on each live card (this browser only)", sw("set-show-title", App.liveShow.title)) +
+      fieldRow("Show branch", "Git branch line on each live card (this browser only)", sw("set-show-branch", App.liveShow.branch)) +
+      fieldRow("Show folder path", "Working-directory path line on each live card (this browser only)", sw("set-show-path", App.liveShow.path)) +
       fieldRow(
         "Live view sort",
         "Order the live session cards (this browser only)",
@@ -2504,20 +2544,25 @@ function connect() {
 function init() {
   // Per-browser Live sort preference (unknown value → "status"); the Settings > Dashboard
   // control reflects and updates it (see setLiveSort).
-  try {
-    const ls = localStorage.getItem("cockpit.liveSort");
-    if (ls === "name" || ls === "status") App.liveSort = ls;
-  } catch (_e) {
-    /* localStorage unavailable — keep the default */
-  }
+  const ls = loadPref("cockpit.liveSort");
+  if (ls === "name" || ls === "status") App.liveSort = ls;
 
-  try {
-    const th = localStorage.getItem("cockpit.theme");
-    App.theme = th === "light" ? "light" : "dark";
-  } catch (_e) {
-    /* localStorage unavailable — keep default dark */
-  }
+  const th = loadPref("cockpit.theme");
+  App.theme = th === "light" ? "light" : "dark";
   applyTheme(); // reconcile the <html> attribute with App.theme (the head bootstrap may have set it)
+
+  // Per-browser Live-card line visibility (session name / branch / folder path). Any key
+  // omitted or non-false stays visible, so a partial/older stored object still defaults on.
+  // The JSON.parse keeps its own guard so a malformed stored value falls back to all-on.
+  try {
+    const raw = loadPref("cockpit.liveShow");
+    if (raw) {
+      const v = JSON.parse(raw) || {};
+      App.liveShow = { title: v.title !== false, branch: v.branch !== false, path: v.path !== false };
+    }
+  } catch (_e) {
+    /* malformed stored value — keep all lines shown */
+  }
 
   $("nav").addEventListener("click", (e) => {
     const t = e.target.closest(".nav__tab");
@@ -2570,6 +2615,11 @@ function init() {
     }
     if (e.target.id === "set-theme") {
       setTheme(e.target.checked ? "light" : "dark");
+      return;
+    }
+    // Live-card line-visibility switches are also per-browser prefs, not daemon config.
+    if (e.target.id && e.target.id.startsWith("set-show-")) {
+      setLiveShow(e.target.id.slice("set-show-".length), e.target.checked);
       return;
     }
     // The Data section (store size + cleanup) isn't part of the config, so its inputs
