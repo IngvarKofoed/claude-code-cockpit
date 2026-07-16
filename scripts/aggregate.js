@@ -89,6 +89,10 @@ function newSession(event) {
     endedReason: null,
     tokens: null, // daemon fills from transcript.js; null = unavailable
     cost: null, // daemon fills from pricing.js
+    // AI-generated session name (transcript `ai-title`), daemon-filled from readUsage
+    // on each token read; null until one exists (or transcript unreadable). Display
+    // only — the DERIVED title, never the verbatim last prompt (the privacy boundary).
+    title: null,
   };
 }
 

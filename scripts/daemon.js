@@ -1437,6 +1437,10 @@ function updateSessionTokens(sid, usage) {
   if (!session) return;
   session.tokens = usage.totals;
   session.cost = cfg.cost.enabled ? pricing.estimateCost(usage.byModel, cfg.cost.rates).total : null;
+  // Backfill the session's AI-generated name from the transcript (same source as the
+  // Sessions view). Only overwrite when present, so a transient read before the
+  // ai-title line flushes can't clear a name we already have.
+  if (usage.title != null && String(usage.title).trim() !== '') session.title = usage.title;
   // Backfill the session's DISPLAYED model from the transcript. The SessionStart
   // hook is the ONLY event that ever carries `model`, and it may omit it (docs:
   // optional), so a resumed session or one first seen after a snapshot loss shows
@@ -2640,9 +2644,23 @@ function saveSnapshot() {
 function pollTokens() {
   for (const sid of Object.keys(state.sessions)) {
     const s = state.sessions[sid];
-    if (s.status !== 'running') continue;
     const x = extra.get(sid);
     if (!x || !x.transcriptPath) continue;
+    const running = s.status === 'running';
+    // Idle-but-live sessions accrue no new tokens, so they're normally skipped. The one
+    // exception: a session still MISSING its name — Claude Code writes the `ai-title` to
+    // the transcript ASYNC, often after the turn's Stop, so without this the Live card
+    // shows no name until the next prompt (while the Sessions view, reading the transcript
+    // directly, already shows it). Gate that extra read on the transcript mtime changing,
+    // so an idle session that never gains a title isn't re-parsed on every poll.
+    if (!running) {
+      if (s.title != null) continue;
+      let mtimeMs;
+      try { mtimeMs = fs.statSync(x.transcriptPath).mtimeMs; } catch (_e) { continue; }
+      if (x.titlePollMtimeMs === mtimeMs) continue;
+      x.titlePollMtimeMs = mtimeMs;
+      extra.set(sid, x);
+    }
     let usage;
     try {
       usage = transcript.readUsage(x.transcriptPath);
@@ -2654,9 +2672,12 @@ function pollTokens() {
     const changed = !before ||
       before.input !== usage.totals.input || before.output !== usage.totals.output ||
       before.cacheRead !== usage.totals.cacheRead || before.cacheWrite !== usage.totals.cacheWrite;
-    if (changed) {
+    // Running: refresh on any token change. Idle title-backfill: refresh regardless (it may
+    // bring a name with no token delta), but only broadcast when tokens or the title moved.
+    if (changed || !running) {
+      const titleBefore = s.title;
       updateSessionTokens(sid, usage); // display refresh only; rollup writes happen at Stop
-      markDirty();
+      if (changed || s.title !== titleBefore) markDirty();
     }
   }
 }

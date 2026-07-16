@@ -375,6 +375,11 @@ const BRANCH_SVG =
 const COPY_SVG =
   '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">' +
   '<rect x="5" y="5" width="8" height="9" rx="1.5"/><path d="M3 11V3a1 1 0 0 1 1-1h6"/></svg>';
+// A flat tag/label glyph for the session name, in the same stroke style as BRANCH_SVG.
+const TITLE_SVG =
+  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">' +
+  '<path d="M7.4 2.2H3.2a1 1 0 0 0-1 1v4.2a1 1 0 0 0 .3.7l6.1 6.1a1 1 0 0 0 1.4 0l4.2-4.2a1 1 0 0 0 0-1.4L8.1 2.5a1 1 0 0 0-.7-.3Z"/>' +
+  '<circle cx="5" cy="5" r="1"/></svg>';
 
 const STATUS_LABEL = {
   running: "Running",
@@ -551,6 +556,7 @@ function cardHTML(s) {
         <span class="card__repo" title="${esc(s.repoName || "")}">${esc(s.repoName || "(unknown)")}</span>
         <span class="badge">${esc(STATUS_LABEL[status] || status)}</span>
       </div>
+      ${s.title ? `<div class="card__title" title="${esc(s.title)}">${TITLE_SVG}<span>${esc(s.title)}</span></div>` : ""}
       <div class="card__where">
         ${s.branch ? `<span class="branch">${BRANCH_SVG}<span>${esc(s.branch)}</span></span>` : ""}
         ${s.cwd ? `<button class="path" type="button" data-path="${esc(s.cwd)}" title="Copy path">${COPY_SVG}<span>${esc(s.cwd)}</span></button>` : ""}
