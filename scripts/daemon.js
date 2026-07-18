@@ -45,6 +45,8 @@ const IDLE_CHECK_MS = 60000;
 const SSE_COALESCE_MS = 250; // ≤ ~4 state pushes / second
 const PAUSE_POLL_MS = 2000; // control-file backstop: surface a direct edit / missed nudge in the UI within ~2s
 const REAP_IDLE_FALLBACK_MS = 6 * 3600 * 1000; // reap PID-less sessions after 6h idle
+const LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate daemon.log once it passes ~5MB (keep one .1 backup, ~10MB cap)
+const LOG_ROTATE_MS = 3600 * 1000; // check the log size hourly (plus once at boot)
 const REAP_GRACE_MS = 90 * 1000; // min quiet time before reaping a PID-dead session
 
 const STATIC = {
@@ -95,6 +97,8 @@ let lastPauseSentinel = pause.RUNNING;
 let pauseRestoredFromSnapshot = false; // true once loadSnapshot restores pauseAcc (boot prefers it over the log fold)
 let lastFiveHourPct = null; // last 5h usedPct the usage auto-pilot saw (its rising-edge memory)
 let pausePollTimer = null; // the ~2s control-file backstop poll interval (cleared on shutdown)
+let diagLastCurSub; // usage diagnostic: last current-subscription id logged (transition detector); undefined until first push
+let diagLastDrop = null; // usage diagnostic: last DROP line logged (dedup consecutive identical drops)
 
 // "Safe to close" latch + summary (the pause-gate at-rest signal). pauseSafeNotified is a
 // per-pause latch: true = the OS notification will NOT fire; it is armed to false ONLY on a
@@ -150,6 +154,32 @@ function log(msg) {
     fs.appendFileSync(paths.logPath(), `${new Date().toISOString()} ${msg}\n`);
   } catch (_e) {
     /* logging must never throw */
+  }
+}
+
+// Bound daemon.log's growth: once it passes LOG_MAX_BYTES, rename it to daemon.log.1
+// (replacing any prior .1) so at most ~2 generations are kept. log() append-writes by path,
+// so its next call recreates a fresh daemon.log — no held stream to reopen, and the daemon is
+// the sole writer (hooks write the event log, not this file), so the rename can't race a writer.
+// Best-effort: a rotation failure must never disturb the daemon. Run once at boot + hourly.
+function rotateLogIfLarge() {
+  try {
+    const p = paths.logPath();
+    let size = 0;
+    try {
+      size = fs.statSync(p).size;
+    } catch (_e) {
+      return; // no log yet -> nothing to rotate
+    }
+    if (size <= LOG_MAX_BYTES) return;
+    fs.renameSync(p, `${p}.1`); // single atomic rename; overwrites the previous backup
+    log(`rotated daemon.log at ${size} bytes (> ${LOG_MAX_BYTES}); previous kept as daemon.log.1`);
+  } catch (e) {
+    try {
+      log('log rotation failed ' + e);
+    } catch (_e2) {
+      /* ignore */
+    }
   }
 }
 
@@ -2126,7 +2156,46 @@ function handleInternalUsage(req, res) {
     const pushSub = pushSession && pushSession.subscription ? pushSession.subscription.id : null;
     const cur = aggregate.currentSubscription(state);
     const curSub = cur ? cur.id : null;
-    if (pushSub != null && curSub != null && pushSub !== curSub) return; // stale non-current push -> drop
+    // DIAGNOSTIC (metadata only — no message content): record current-subscription transitions and
+    // dropped pushes to daemon.log so a recurrence of the idle-session usage-bar hijack (an idle
+    // session on a secondary subscription winning `currentSubscription`, so the active subscription's
+    // real usage pushes are dropped here and the bar freezes at a stale value) is diagnosable from the
+    // log alone. Near-zero volume: the transition line fires only on a real change; the DROP line is
+    // silent unless a push is actually being discarded (a legit post-switch stale push, or the bug).
+    // Each diagnostic is wrapped so it can NEVER alter the push path (the drop `return` below must
+    // fire regardless of any logging error) — observability must not become a behavior change.
+    if (curSub !== diagLastCurSub) {
+      diagLastCurSub = curSub;
+      try {
+        const liveSummary = Object.keys(state.sessions)
+          .filter((id) => {
+            const s = state.sessions[id];
+            return s && s.status !== 'ended' && s.subscription && s.subscription.id != null;
+          })
+          .map((id) => `${id.slice(0, 8)}:${usageLib.subLabel(state.sessions[id].subscription, cfg)}:${state.sessions[id].status}`)
+          .join(' ');
+        log(`usage: current sub -> ${cur ? usageLib.subLabel(cur, cfg) : 'none'} [${curSub ? curSub.slice(0, 8) : '-'}] | live: ${liveSummary || '(none)'}`);
+      } catch (_e) {
+        /* diagnostic only */
+      }
+    }
+    if (pushSub != null && curSub != null && pushSub !== curSub) {
+      try {
+        // Dedup on the (dropped sub -> current sub) PAIR, not the message text: during a sustained
+        // drop — the very situation this traces — the 5h % ticks up and multiple sessions push, so
+        // keying on those would re-log on nearly every render. Keyed on the pair, a drop episode logs
+        // ONE line; it re-logs only when the pair changes (current shifts, or a different sub is dropped).
+        const dropKey = `${pushSub}>${curSub}`;
+        if (dropKey !== diagLastDrop) {
+          diagLastDrop = dropKey;
+          const pct = windows.fiveHour && typeof windows.fiveHour.usedPct === 'number' ? Math.round(windows.fiveHour.usedPct) : '?';
+          log(`usage: DROP push ${usageLib.subLabel(pushSession.subscription, cfg)} [${pushSub.slice(0, 8)}] 5h=${pct}% -- current=${cur ? usageLib.subLabel(cur, cfg) : 'none'} (session ${(windows.sessionId || '').slice(0, 8)})`);
+        }
+      } catch (_e) {
+        /* diagnostic only */
+      }
+      return; // stale non-current push -> drop
+    }
     // The forwarder posts on every statusline render (frequently). Broadcast ONLY when the
     // numbers actually change — else an unchanged push would rebuild the whole Live card grid
     // several times/sec (wiping text selection mid-turn). updatedAt still advances so a later
@@ -2769,6 +2838,8 @@ function startLoops() {
   setInterval(heartbeat, HEARTBEAT_MS);
   setInterval(saveSnapshot, SNAPSHOT_MS);
   setInterval(checkIdleShutdown, IDLE_CHECK_MS);
+  rotateLogIfLarge(); // bound daemon.log at boot, then hourly
+  setInterval(rotateLogIfLarge, LOG_ROTATE_MS);
   // Control-file backstop: a direct file edit or a missed slash-command nudge surfaces in
   // the UI within ~2s (enforcement is already correct without it — the gate reads the file
   // directly). Held so cleanup() can clear it on shutdown; reconcile() self-guards its I/O.
