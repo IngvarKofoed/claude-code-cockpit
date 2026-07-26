@@ -96,6 +96,12 @@ let pauseAcc = pause.newPauseAcc();
 let lastPauseSentinel = pause.RUNNING;
 let pauseRestoredFromSnapshot = false; // true once loadSnapshot restores pauseAcc (boot prefers it over the log fold)
 let lastFiveHourPct = null; // last 5h usedPct the usage auto-pilot saw (its rising-edge memory)
+let lastWeeklyPct = null; // same, for the 7-day window (each window has its own edge memory)
+// Window keys ('fiveHour' / 'weekly') seen at/above their threshold during the CURRENT auto-pause
+// span — the anti-flap deadband applies only to these (see pause.autoPauseDecision `wasOver`).
+// Reset whenever the control file isn't 'paused-usage', so every span starts empty; not persisted,
+// so a restart mid-pause re-seeds from whatever is still over on the next statusline push.
+let autoPauseOverWindows = new Set();
 let pausePollTimer = null; // the ~2s control-file backstop poll interval (cleared on shutdown)
 let diagLastCurSub; // usage diagnostic: last current-subscription id logged (transition detector); undefined until first push
 let diagLastDrop = null; // usage diagnostic: last DROP line logged (dedup consecutive identical drops)
@@ -1052,29 +1058,52 @@ function reconcile() {
   markDirty();
 }
 
-// Usage auto-pilot: given the current 5h usedPct, auto-pause when it crosses the configured
-// threshold and auto-resume once usage falls a deadband BELOW it — reusing the entry-42
-// rate-limit numbers. Requires pauseGateEnabled + autoPauseFiveHourPct>0 + a numeric usedPct.
-// Goes through the SAME writePauseState + reconcile path as a manual toggle, so auto and manual
-// pauses share one event/accounting/broadcast path and differ only by `reason`. The rising-edge
-// (pause) / hysteresis (resume) / never-clobber-a-manual-pause rule lives in pure
-// pause.autoPauseDecision. prevPct is remembered across calls (updated every call, action or not).
-function evalAutoPause(curPct) {
-  if (!(cfg.pauseGateEnabled && num(cfg.autoPauseFiveHourPct) > 0)) return;
-  if (!(typeof curPct === 'number' && Number.isFinite(curPct))) return;
+// Usage auto-pilot: given the current 5h and weekly usedPct, auto-pause when EITHER crosses its
+// configured threshold and auto-resume once every window is back under its threshold and the one
+// that tripped has fallen a deadband below it — reusing the entry-42 rate-limit numbers. Requires
+// pauseGateEnabled plus, per window, a threshold > 0 AND a numeric usedPct; a window missing
+// either is simply not armed for this call, so an absent reading can neither pause nor block a
+// resume. Goes through the SAME writePauseState + reconcile path as a manual toggle, so auto and
+// manual pauses share one event/accounting/broadcast path and differ only by `reason`. The
+// rising-edge (pause) / hysteresis (resume) / never-clobber-a-manual-pause rule lives in pure
+// pause.autoPauseDecision; this function owns only the per-window memories it needs — each
+// window's prevPct (updated on every call that carries a reading, action or not) and the
+// per-span set of windows that went over.
+function evalAutoPause(curFivePct, curWeeklyPct) {
+  if (cfg.pauseGateEnabled !== true) return;
+  const isPct = (v) => typeof v === 'number' && Number.isFinite(v);
+  const windows = [];
+  if (num(cfg.autoPauseFiveHourPct) > 0 && isPct(curFivePct)) {
+    windows.push({ key: 'fiveHour', prevPct: lastFiveHourPct, curPct: curFivePct, threshold: cfg.autoPauseFiveHourPct });
+    lastFiveHourPct = curFivePct;
+  }
+  if (num(cfg.autoPauseWeeklyPct) > 0 && isPct(curWeeklyPct)) {
+    windows.push({ key: 'weekly', prevPct: lastWeeklyPct, curPct: curWeeklyPct, threshold: cfg.autoPauseWeeklyPct });
+    lastWeeklyPct = curWeeklyPct;
+  }
+  // A DISARMED window's memory is deliberately left un-advanced (null): arming a threshold you
+  // are already over should pause on the next push, exactly as enabling the 5h one always has —
+  // the null prev reads as 0, so the first armed reading is a crossing.
+  if (windows.length === 0) return;
+  const sentinel = pause.readPauseState();
+  // Maintain the per-span "went over" set the resume deadband keys off. Cleared outside an
+  // auto-pause (running, or a manual pause) so each span starts clean, then grown BEFORE the
+  // decision so the very reading that trips the pause is already recorded as its cause.
+  if (sentinel !== 'paused-usage') autoPauseOverWindows.clear();
+  for (const w of windows) {
+    if (w.curPct >= w.threshold) autoPauseOverWindows.add(w.key);
+  }
   const decision = pause.autoPauseDecision({
-    prevPct: lastFiveHourPct,
-    curPct,
-    threshold: cfg.autoPauseFiveHourPct,
-    sentinel: pause.readPauseState(),
+    windows: windows.map((w) => ({ ...w, wasOver: autoPauseOverWindows.has(w.key) })),
+    sentinel,
   });
-  lastFiveHourPct = curPct;
   try {
     if (decision === 'pause') {
       pause.writePauseState('paused-usage');
       reconcile();
     } else if (decision === 'resume') {
       pause.writePauseState(pause.RUNNING);
+      autoPauseOverWindows.clear(); // span over; don't carry its causes into the next one
       reconcile();
     }
   } catch (e) {
@@ -2204,11 +2233,14 @@ function handleInternalUsage(req, res) {
     // Tag the accepted snapshot with the subscription it belongs to (the pushing session's if
     // known, else the current one) so the bar can be attributed. sameUsageWindows ignores this.
     rateLimitUsage = { ...windows, subscription: pushSub != null ? pushSub : curSub, updatedAt: Date.now() };
-    // Usage auto-pilot: evaluate the 5h window against the auto-pause threshold. Runs on
-    // every push (not only `changed`) so the rising-edge memory (prevPct) tracks the latest
-    // value; it self-gates on pauseGateEnabled + autoPauseFiveHourPct>0 and does nothing when
-    // no 5h window is present (no statusline / API-key session).
-    evalAutoPause(windows.fiveHour ? windows.fiveHour.usedPct : null);
+    // Usage auto-pilot: evaluate the 5h and weekly windows against their auto-pause thresholds.
+    // Runs on every push (not only `changed`) so each rising-edge memory (prevPct) tracks the
+    // latest value; it self-gates on pauseGateEnabled + a per-window threshold > 0 and does
+    // nothing for a window this push doesn't carry (no statusline / API-key session).
+    evalAutoPause(
+      windows.fiveHour ? windows.fiveHour.usedPct : null,
+      windows.sevenDay ? windows.sevenDay.usedPct : null
+    );
     if (changed) markDirty();
   });
 }
@@ -2910,10 +2942,13 @@ function main() {
   }
   reconcile();
 
-  // Auto-pilot: evaluate once against a restored usage snapshot so a 5h threshold already
-  // crossed before the restart still pauses (and seeds the rising-edge prevPct memory).
-  if (rateLimitUsage && rateLimitUsage.fiveHour && typeof rateLimitUsage.fiveHour.usedPct === 'number') {
-    evalAutoPause(rateLimitUsage.fiveHour.usedPct);
+  // Auto-pilot: evaluate once against a restored usage snapshot so a threshold already crossed
+  // before the restart still pauses (and seeds each window's rising-edge prevPct memory).
+  if (rateLimitUsage && (rateLimitUsage.fiveHour || rateLimitUsage.sevenDay)) {
+    evalAutoPause(
+      rateLimitUsage.fiveHour ? rateLimitUsage.fiveHour.usedPct : null,
+      rateLimitUsage.sevenDay ? rateLimitUsage.sevenDay.usedPct : null
+    );
   }
 
   // Boot suppression, edge-correct: a daemon that boots straight into an ALREADY-at-rest pause

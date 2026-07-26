@@ -177,29 +177,61 @@ function foldPauseState(events) {
 // field) to keep the config surface small.
 const AUTO_RESUME_DEADBAND_PCT = 10;
 
-// PURE: the usage auto-pilot's rising-edge (pause) / hysteresis (resume) rule.
-//  - threshold not a finite number > 0 → 'none' (auto-pilot off).
-//  - prevPct / curPct null/NaN are treated as 0.
-//  - RISING EDGE: prev below and cur at/above the threshold, and the file is NOT a paused
-//    sentinel (running/'') → 'pause' (never clobber a manual pause).
-//  - RESUME (hysteresis): file is exactly 'paused-usage' and cur has fallen below the resume
-//    line — threshold minus the deadband — → 'resume'. Deliberately NOT the instant cur dips
-//    back under the threshold: that shared-line rule flapped on a rolling-window wobble. The
-//    deadband is capped at half the threshold so a low threshold keeps a resume line above 0
-//    (it never strands paused-forever), and a real reset or lower-usage subscription still
-//    clears it.
-//  - otherwise → 'none'.
-function autoPauseDecision({ prevPct, curPct, threshold, sentinel } = {}) {
-  if (!(typeof threshold === 'number' && Number.isFinite(threshold) && threshold > 0)) {
-    return 'none';
-  }
-  const prev = typeof prevPct === 'number' && Number.isFinite(prevPct) ? prevPct : 0;
-  const cur = typeof curPct === 'number' && Number.isFinite(curPct) ? curPct : 0;
-  const s = String(sentinel == null ? '' : sentinel).trim();
-  const resumeAt = threshold - Math.min(AUTO_RESUME_DEADBAND_PCT, threshold / 2);
+// One window's auto-RESUME line: its pause threshold minus the deadband, the deadband capped at
+// half the threshold so a low threshold keeps a resume line above 0 (never strands paused-forever).
+function autoResumeLine(threshold) {
+  return threshold - Math.min(AUTO_RESUME_DEADBAND_PCT, threshold / 2);
+}
 
-  if (prev < threshold && cur >= threshold && !PAUSE_SENTINELS.has(s)) return 'pause';
-  if (s === 'paused-usage' && cur < resumeAt) return 'resume';
+// null / NaN / non-numeric reads as 0 — an absent percentage must never look like a crossing.
+function pctOrZero(v) {
+  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+}
+
+// PURE: the usage auto-pilot's rising-edge (pause) / hysteresis (resume) rule, over ONE OR MORE
+// rate-limit windows (5h and weekly today). Takes either `windows: [{prevPct,curPct,threshold,
+// wasOver}]` or the flat single-window `{prevPct,curPct,threshold}` shorthand; `sentinel` is the
+// control file.
+//  - A window whose threshold isn't a finite number > 0 is DISARMED and dropped; no armed window
+//    left → 'none' (auto-pilot off). A window the caller omits (no reading) simply isn't armed, so
+//    a missing weekly number can neither pause nor block a resume.
+//  - prevPct / curPct null/NaN are treated as 0.
+//  - RISING EDGE (ANY armed window): prev below and cur at/above that window's threshold, and the
+//    file is NOT a paused sentinel (running/'') → 'pause'. Any one window hitting its limit is
+//    reason enough to freeze, and it never clobbers a manual pause.
+//  - RESUME: file is exactly 'paused-usage', NO armed window is still at/above its own threshold,
+//    and every window that WENT OVER during this pause span (`wasOver`, tracked by the caller) has
+//    fallen below its own resume line. Two rules in one because they answer different questions:
+//    the threshold check stops a resume that would undo a limit still being exceeded, while the
+//    deadband is purely anti-flap and therefore applies ONLY to a window that actually tripped —
+//    a rolling % wobbling across its own line is what flapped the gate. Applying the deadband to
+//    an innocent window instead strands the gate: a weekly sitting quietly at 85 (threshold 90,
+//    resume line 80) would hold every 5h auto-pause open long after 5h reset to 0.
+//    `wasOver` DEFAULTS TO TRUE when omitted — the conservative reading, so a caller that doesn't
+//    track spans keeps the plain hysteresis behaviour.
+//  - otherwise → 'none'.
+function autoPauseDecision({ windows, prevPct, curPct, threshold, sentinel } = {}) {
+  const armed = (Array.isArray(windows) ? windows : [{ prevPct, curPct, threshold }])
+    .filter((w) => w && typeof w.threshold === 'number' && Number.isFinite(w.threshold) && w.threshold > 0)
+    .map((w) => ({
+      prev: pctOrZero(w.prevPct),
+      cur: pctOrZero(w.curPct),
+      threshold: w.threshold,
+      wasOver: w.wasOver !== false,
+    }));
+  if (armed.length === 0) return 'none';
+  const s = String(sentinel == null ? '' : sentinel).trim();
+
+  if (!PAUSE_SENTINELS.has(s) && armed.some((w) => w.prev < w.threshold && w.cur >= w.threshold)) {
+    return 'pause';
+  }
+  if (
+    s === 'paused-usage' &&
+    armed.every((w) => w.cur < w.threshold) &&
+    armed.every((w) => !w.wasOver || w.cur < autoResumeLine(w.threshold))
+  ) {
+    return 'resume';
+  }
   return 'none';
 }
 

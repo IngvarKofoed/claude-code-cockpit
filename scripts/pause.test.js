@@ -289,6 +289,148 @@ test('autoPauseDecision: a null/undefined curPct is treated as 0 (no rising edge
   );
 });
 
+// ---- autoPauseDecision: multi-window (5h + weekly) -----------------------
+
+test('autoPauseDecision: ANY armed window crossing its own threshold pauses', () => {
+  // The weekly window crosses while the 5h one sits comfortably low: still a pause.
+  assert.strictEqual(
+    autoPauseDecision({
+      windows: [
+        { prevPct: 20, curPct: 25, threshold: 90 }, // 5h, nowhere near
+        { prevPct: 88, curPct: 91, threshold: 90 }, // weekly, rising edge
+      ],
+      sentinel: 'running',
+    }),
+    'pause',
+  );
+});
+
+test('autoPauseDecision: no resume while ANY armed window is still at/above its threshold', () => {
+  // 5h has reset to ~0 but weekly is still over its limit -> stay paused. Resuming here would
+  // undo the very pause the weekly window asked for.
+  assert.strictEqual(
+    autoPauseDecision({
+      windows: [
+        { prevPct: 95, curPct: 2, threshold: 90 }, // 5h reset
+        { prevPct: 93, curPct: 93, threshold: 90 }, // weekly still over
+      ],
+      sentinel: 'paused-usage',
+    }),
+    'none',
+  );
+  // Both windows tripped during this span, both now below their resume lines (90 - 10 = 80).
+  assert.strictEqual(
+    autoPauseDecision({
+      windows: [
+        { prevPct: 95, curPct: 2, threshold: 90 },
+        { prevPct: 93, curPct: 79, threshold: 90 },
+      ],
+      sentinel: 'paused-usage',
+    }),
+    'resume',
+  );
+});
+
+test('autoPauseDecision: the resume deadband applies ONLY to a window that went over', () => {
+  // The trap this rule exists to avoid: 5h tripped the pause and has reset, while weekly sits
+  // quietly at 85 — under its own threshold 90, but inside the deadband band [80,90). Gating on
+  // an innocent window would hold every 5h auto-pause open for the days weekly spends in that
+  // band, so wasOver:false lets the resume through.
+  assert.strictEqual(
+    autoPauseDecision({
+      windows: [
+        { prevPct: 95, curPct: 2, threshold: 90, wasOver: true }, // tripped, now reset
+        { prevPct: 85, curPct: 85, threshold: 90, wasOver: false }, // never crossed
+      ],
+      sentinel: 'paused-usage',
+    }),
+    'resume',
+  );
+  // Same numbers, but weekly DID go over earlier in this pause span: the deadband holds it.
+  assert.strictEqual(
+    autoPauseDecision({
+      windows: [
+        { prevPct: 95, curPct: 2, threshold: 90, wasOver: true },
+        { prevPct: 85, curPct: 85, threshold: 90, wasOver: true },
+      ],
+      sentinel: 'paused-usage',
+    }),
+    'none',
+  );
+  // An innocent window still blocks a resume while it is at/above its own THRESHOLD — the
+  // no-resume-under-an-exceeded-limit rule doesn't depend on span history.
+  assert.strictEqual(
+    autoPauseDecision({
+      windows: [
+        { prevPct: 95, curPct: 2, threshold: 90, wasOver: true },
+        { prevPct: 91, curPct: 91, threshold: 90, wasOver: false },
+      ],
+      sentinel: 'paused-usage',
+    }),
+    'none',
+  );
+});
+
+test('autoPauseDecision: an omitted wasOver defaults to true (plain hysteresis)', () => {
+  // Backward-compatible default: a caller that tracks no span history keeps the conservative
+  // deadband on every window (the single-window tests above rely on this).
+  assert.strictEqual(
+    autoPauseDecision({ windows: [{ prevPct: 96, curPct: 85, threshold: 95 }], sentinel: 'paused-usage' }),
+    'none',
+  );
+});
+
+test('autoPauseDecision: a DISARMED window neither pauses nor blocks a resume', () => {
+  // Weekly threshold 0 (off) while pegged at 100: it must not pause...
+  assert.strictEqual(
+    autoPauseDecision({
+      windows: [
+        { prevPct: 20, curPct: 25, threshold: 90 },
+        { prevPct: 99, curPct: 100, threshold: 0 },
+      ],
+      sentinel: 'running',
+    }),
+    'none',
+  );
+  // ...and it must not hold a resume the armed window has earned.
+  assert.strictEqual(
+    autoPauseDecision({
+      windows: [
+        { prevPct: 95, curPct: 2, threshold: 90 },
+        { prevPct: 99, curPct: 100, threshold: 0 },
+      ],
+      sentinel: 'paused-usage',
+    }),
+    'resume',
+  );
+});
+
+test('autoPauseDecision: an empty / all-disarmed windows list -> none', () => {
+  assert.strictEqual(autoPauseDecision({ windows: [], sentinel: 'running' }), 'none');
+  assert.strictEqual(
+    autoPauseDecision({ windows: [{ prevPct: 0, curPct: 100, threshold: 0 }], sentinel: 'running' }),
+    'none',
+  );
+  // A garbage entry is dropped, not thrown on.
+  assert.strictEqual(
+    autoPauseDecision({ windows: [null, undefined, { threshold: 'x' }], sentinel: 'paused-usage' }),
+    'none',
+  );
+});
+
+test('autoPauseDecision: multi-window still never clobbers a manual pause', () => {
+  assert.strictEqual(
+    autoPauseDecision({
+      windows: [
+        { prevPct: 20, curPct: 95, threshold: 90 },
+        { prevPct: 88, curPct: 91, threshold: 90 },
+      ],
+      sentinel: 'paused',
+    }),
+    'none',
+  );
+});
+
 // ---- readPauseState / writePauseState round-trip -------------------------
 // Mirrors config.test.js's pattern: paths.js reads its env vars lazily on
 // every call, so redirecting XDG_STATE_HOME (and the Windows equivalents) to

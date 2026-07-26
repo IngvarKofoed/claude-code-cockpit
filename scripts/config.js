@@ -30,8 +30,12 @@ const DEFAULT_CONFIG = {
   subscriptionLabelPattern: '\\(([^)]+)\\)',
   events: { sessionFinished: true, needsInput: true, longRunning: false, turnFailed: true, safeToClose: true },
   longRunningThresholdMs: 300000,
-  // Pause gate: master switch (default ON) + usage auto-pilot. autoPauseFiveHourPct
-  // is the 5h rate-limit threshold that auto-pauses (0 = off; default 90). There is
+  // Pause gate: master switch (default ON) + usage auto-pilot. autoPauseFiveHourPct /
+  // autoPauseWeeklyPct are the 5h and 7-day rate-limit thresholds that auto-pause
+  // (0 = off; either one crossing pauses, both must fall back below their resume line to
+  // auto-resume). The 5h default is 90; the WEEKLY one ships OFF (0) on purpose — the 7-day
+  // window only falls back below its resume line as old usage ages out, so a weekly
+  // auto-pause can hold for days, which is too heavy to impose by default. There is
   // deliberately NO migration (a boolean can't tell a deliberate opt-out from the old
   // default): a persisted explicit `false` stays off, but the on-by-default reaches any
   // config that merely OMITS the key — a fresh/config-less install OR an existing
@@ -39,6 +43,7 @@ const DEFAULT_CONFIG = {
   // the gate hook (see pause.js) fill an absent key from here.
   pauseGateEnabled: true,
   autoPauseFiveHourPct: 90,
+  autoPauseWeeklyPct: 0,
   cost: {
     enabled: true,
     currency: 'USD',
@@ -259,11 +264,13 @@ function validateConfig(input) {
     }
   }
 
-  // Usage auto-pilot threshold: a percentage clamped to [0,100] (0 = off).
-  if ('autoPauseFiveHourPct' in input) {
-    const n = toNum(input.autoPauseFiveHourPct);
-    if (n === null) errors.push('autoPauseFiveHourPct must be a number');
-    else cfg.autoPauseFiveHourPct = Math.min(100, clampMin(n, 0));
+  // Usage auto-pilot thresholds (per rate-limit window): a percentage clamped to [0,100] (0 = off).
+  for (const key of ['autoPauseFiveHourPct', 'autoPauseWeeklyPct']) {
+    if (key in input) {
+      const n = toNum(input[key]);
+      if (n === null) errors.push(`${key} must be a number`);
+      else cfg[key] = Math.min(100, clampMin(n, 0));
+    }
   }
 
   if ('cost' in input) {

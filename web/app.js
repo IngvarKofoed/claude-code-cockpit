@@ -2212,6 +2212,11 @@ function settingsHTML(cfg) {
         `<input class="input" id="set-autoPauseFiveHourPct" type="number" min="0" max="100" step="1" value="${num(cfg.autoPauseFiveHourPct)}"><span class="chip">%</span>`
       ) +
       fieldRow(
+        "Auto-pause at weekly usage %",
+        "Same for the 7-day window; either limit pauses, both must fall back below before it auto-resumes. A weekly pause can hold for days (the window only frees up as old usage ages out); 0 = off",
+        `<input class="input" id="set-autoPauseWeeklyPct" type="number" min="0" max="100" step="1" value="${num(cfg.autoPauseWeeklyPct)}"><span class="chip">%</span>`
+      ) +
+      fieldRow(
         "Subscription label pattern",
         "A regex extracting the meaningful part of a verbose subscription name (capture group 1, else the whole match). Default pulls the parenthesized part: \"FOSS Analytical (Lyra)\" → \"Lyra\". Clear to show the raw name unchanged. Applied read-time only — never edits stored data.",
         `<input class="input input--wide" id="set-subscriptionLabelPattern" type="text" placeholder="\\(([^)]+)\\)" value="${esc(cfg.subscriptionLabelPattern != null ? cfg.subscriptionLabelPattern : "")}">`
@@ -2314,6 +2319,7 @@ function readSettingsForm() {
     usagePace: $("set-usagePace").value,
     pauseGateEnabled: cb("set-pauseGateEnabled"),
     autoPauseFiveHourPct: nv("set-autoPauseFiveHourPct", 0),
+    autoPauseWeeklyPct: nv("set-autoPauseWeeklyPct", 0),
     subscriptionLabelPattern: $("set-subscriptionLabelPattern").value,
     events: {
       sessionFinished: cb("set-ev-sessionFinished"),
