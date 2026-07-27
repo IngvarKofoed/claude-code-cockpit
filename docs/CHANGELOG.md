@@ -813,3 +813,13 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     Weekly ships OFF (0), unlike the 5h: that window frees up only as old usage ages out, so a weekly
     auto-pause can hold for DAYS — too heavy to impose by default. Arming it while already over pauses
     on the next statusline push (a disarmed window keeps no rising-edge memory, by design).
+
+89. Session names now honour the user's `/rename` (v0.34.1): `readUsage` reads the transcript's
+    `custom-title` alongside `ai-title` and prefers it, tracking both separately so precedence
+    doesn't hinge on line order. Only `ai-title` was read before, so a renamed session showed the
+    stale generated name — or, since `ai-title` is now rarely emitted, no name at all on every Live card.
+    Blank text counts as absent, so clearing one name falls back to the other rather than blanking the card.
+
+90. The idle-session title backfill no longer skips already-named sessions (v0.34.1) — it dropped out on
+    `s.title != null`, which is exactly the case a `/rename` hits, so a rename while idle never reached the
+    Live card. The transcript-mtime gate alone now bounds the cost: one re-read per actual transcript write.
