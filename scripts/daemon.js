@@ -1501,9 +1501,10 @@ function updateSessionTokens(sid, usage) {
   if (!session) return;
   session.tokens = usage.totals;
   session.cost = cfg.cost.enabled ? pricing.estimateCost(usage.byModel, cfg.cost.rates).total : null;
-  // Backfill the session's AI-generated name from the transcript (same source as the
-  // Sessions view). Only overwrite when present, so a transient read before the
-  // ai-title line flushes can't clear a name we already have.
+  // Backfill the session's name from the transcript (same source as the Sessions view:
+  // the user's /rename `custom-title` when there is one, else the generated `ai-title`).
+  // Only overwrite when present, so a transient read before the name line flushes can't
+  // clear a name we already have.
   if (usage.title != null && String(usage.title).trim() !== '') session.title = usage.title;
   // Backfill the session's DISPLAYED model from the transcript. The SessionStart
   // hook is the ONLY event that ever carries `model`, and it may omit it (docs:
@@ -2807,13 +2808,16 @@ function pollTokens() {
     if (!x || !x.transcriptPath) continue;
     const running = s.status === 'running';
     // Idle-but-live sessions accrue no new tokens, so they're normally skipped. The one
-    // exception: a session still MISSING its name — Claude Code writes the `ai-title` to
-    // the transcript ASYNC, often after the turn's Stop, so without this the Live card
-    // shows no name until the next prompt (while the Sessions view, reading the transcript
-    // directly, already shows it). Gate that extra read on the transcript mtime changing,
-    // so an idle session that never gains a title isn't re-parsed on every poll.
+    // exception is the session NAME, which can land or CHANGE while the session sits idle:
+    // Claude Code writes the `ai-title` ASYNC, often after the turn's Stop, and a user
+    // /rename appends a `custom-title` at any moment. Without this the Live card keeps the
+    // stale name (or none) until the next prompt, while the Sessions view, reading the
+    // transcript directly, already shows the new one. The transcript-mtime gate below is
+    // what keeps this cheap — an idle session whose file hasn't moved is never re-parsed,
+    // so this costs one read per actual transcript write, not one per poll. (Gating on
+    // `s.title == null` instead, as this did before, would skip every already-named
+    // session — exactly the ones a /rename targets.)
     if (!running) {
-      if (s.title != null) continue;
       let mtimeMs;
       try { mtimeMs = fs.statSync(x.transcriptPath).mtimeMs; } catch (_e) { continue; }
       if (x.titlePollMtimeMs === mtimeMs) continue;

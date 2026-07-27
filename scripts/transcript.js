@@ -87,6 +87,13 @@ function readUsageContent(content) {
   if (!content || !content.trim()) return result; // empty -> ok:false
   result.ok = true;
 
+  // The session name has two independent sources, tracked separately so precedence
+  // doesn't depend on which line landed last: `ai-title` (Claude Code's generated
+  // name, refined as the session grows) and `custom-title` (what the user set with
+  // /rename). The user's name always wins — see the resolve below the loop.
+  let aiTitle = null;
+  let customTitle = null;
+
   const lines = content.split('\n');
   const seen = new Set();
   for (let i = 0; i < lines.length; i++) {
@@ -102,10 +109,18 @@ function readUsageContent(content) {
 
     if (result.cwd == null && typeof obj.cwd === 'string' && obj.cwd) result.cwd = obj.cwd;
 
-    // The session's AI-generated name arrives as `ai-title` lines and is refined
-    // as the session grows, so the LAST one wins. Captured in this same pass for
-    // the Sessions list; a missing ai-title just leaves title:null.
-    if (obj.type === 'ai-title' && typeof obj.aiTitle === 'string') result.title = obj.aiTitle;
+    // Both name lines are re-emitted as the session grows, so the LAST one of each
+    // kind wins. Blank text is treated as absent so a cleared name falls back to the
+    // other source rather than blanking the card.
+    if (obj.type === 'ai-title' && typeof obj.aiTitle === 'string' && obj.aiTitle.trim() !== '') {
+      aiTitle = obj.aiTitle;
+    } else if (
+      obj.type === 'custom-title' &&
+      typeof obj.customTitle === 'string' &&
+      obj.customTitle.trim() !== ''
+    ) {
+      customTitle = obj.customTitle;
+    }
 
     const parsed = parseUsageLine(obj);
     if (!parsed) continue; // no usage on this line
@@ -126,6 +141,11 @@ function readUsageContent(content) {
       result.totals[k] += entry[k];
     }
   }
+
+  // A name the user typed is intentional; the generated one is a guess. Prefer the
+  // custom name whenever there is one, and leave title:null when neither source
+  // appeared (the Sessions list renders that as "Untitled session").
+  result.title = customTitle != null ? customTitle : aiTitle;
 
   return result;
 }
