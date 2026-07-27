@@ -93,6 +93,7 @@ claude-code-cockpit/
 │   ├── repo.js                  # PURE-ish: cwd → git root, name, branch (no subprocess)
 │   ├── pricing.js               # PURE: tokens + model → estimated cost
 │   ├── notify.js                # node-notifier wrapper (detached worker, reused)
+│   ├── focus-terminal.js        # macOS: pid → tty → raise that Terminal window
 │   ├── config.js                # read / merge / write / validate config (reused pattern)
 │   ├── paths.js                 # XDG/APPDATA dirs + port/pid/snapshot paths (reused)
 │   └── *.test.js                # node --test unit tests for the pure modules
@@ -197,6 +198,16 @@ A **separate blocking `PreToolUse` hook** runs in parallel with `emit.js`, polli
 gate.js now emits a `Gated` marker when it enters its poll loop (freezing a tool call), which the daemon folds into a per-session `gatedSince` anchor and an `atRest` classification. The global `Resumed` event clears `gatedSince` for every session — including during boot-time log replay — so a parked-then-resumed session never survives as falsely parked. The daemon fires a single 'safe to close' OS notification (gated on `osNotifications` + the new `events.safeToClose` toggle) when all live sessions are at rest, surfaced on the dashboard with per-session `atRest` badges and an all-at-rest banner.
 
 **Known limitation:** a session blocked mid-tool-call during a pause counts the frozen wait as active time; pause-aware clock is deferred.
+
+## Focus terminal (`scripts/focus-terminal.js`)
+
+A Live card can raise the **Terminal window running that session**, for jumping straight to a session that needs input. The chain reuses state the cockpit already holds: `emit.js` stamps `owner_pid` (its `process.ppid`, i.e. the Claude Code process) on **every** event, so the daemon resolves that pid's controlling terminal with `ps -o tty=` and matches it against the `tty` each Terminal tab exposes through AppleScript, then selects the tab, raises its window, and activates the app.
+
+The tty is resolved **once per session** — a process's tty is fixed for its lifetime — and the *miss* is cached too, so a session with no terminal (a headless launchd agent, where `ps` reports `??`) never re-forks `ps` on each event it emits. Resolution is skipped during boot replay (which would fork per log line) and covered instead by a single sweep after replay, so sessions restored across a restart get their button immediately rather than on their next event, which for an idle session could be hours away. `toCard` exposes only a derived `focusable` boolean.
+
+**`POST /api/focus` takes a `sessionId`, never a terminal.** The daemon re-derives the device from its own state, so a page that reaches the endpoint still cannot name the window it wants raised, and the tty reaches `osascript` through `argv` rather than a shell. The device is never sent to the browser.
+
+**Terminal.app on macOS only.** iTerm2, Ghostty, a VS Code integrated terminal, and any multiplexer (the session's tty is a tmux pty, not a window) all resolve to no match and surface as a `no-window` toast; non-macOS platforms report `unsupported-platform`. The button is hidden entirely unless a tty resolved, so the common cases degrade to *absent* rather than *broken*.
 
 ## The daemon (`daemon.js`)
 
