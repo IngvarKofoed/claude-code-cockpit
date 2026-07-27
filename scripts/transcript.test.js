@@ -184,7 +184,7 @@ test('readUsage: empty / whitespace-only file -> ok:false', () => {
   assert.strictEqual(r.messages.length, 0);
 });
 
-// --- ai-title capture (Sessions list) ----------------------------------------
+// --- session-name capture (Sessions list + Live cards) -----------------------
 
 test('readUsage: last ai-title wins across multiple lines', () => {
   const file = writeFixture([
@@ -197,7 +197,7 @@ test('readUsage: last ai-title wins across multiple lines', () => {
   assert.strictEqual(r.totals.input, 1); // usage still parsed alongside the title
 });
 
-test('readUsage: no ai-title line -> title null', () => {
+test('readUsage: no name line at all -> title null', () => {
   const file = writeFixture([JSON.stringify({ uuid: 'a', model: 'm', usage: { input_tokens: 1 } })]);
   assert.strictEqual(readUsage(file).title, null);
 });
@@ -211,4 +211,45 @@ test('readUsage: malformed / torn line tolerated while capturing a later ai-titl
   const r = readUsage(file);
   assert.strictEqual(r.ok, true);
   assert.strictEqual(r.title, 'Good title');
+});
+
+test('readUsage: custom-title alone becomes the title', () => {
+  const file = writeFixture([
+    JSON.stringify({ uuid: 'a', model: 'm', usage: { input_tokens: 1 } }),
+    JSON.stringify({ type: 'custom-title', customTitle: 'Cockpit name' }),
+  ]);
+  const r = readUsage(file);
+  assert.strictEqual(r.title, 'Cockpit name');
+  assert.strictEqual(r.totals.input, 1); // usage still parsed alongside the title
+});
+
+test('readUsage: last custom-title wins across repeated renames', () => {
+  const file = writeFixture([
+    JSON.stringify({ type: 'custom-title', customTitle: 'First name' }),
+    JSON.stringify({ type: 'custom-title', customTitle: 'Second name' }),
+  ]);
+  assert.strictEqual(readUsage(file).title, 'Second name');
+});
+
+test('readUsage: user custom-title outranks the ai-title in either line order', () => {
+  const aiLast = writeFixture([
+    JSON.stringify({ type: 'custom-title', customTitle: 'User name' }),
+    JSON.stringify({ type: 'ai-title', aiTitle: 'AI guess' }),
+  ]);
+  assert.strictEqual(readUsage(aiLast).title, 'User name');
+
+  const customLast = writeFixture([
+    JSON.stringify({ type: 'ai-title', aiTitle: 'AI guess' }),
+    JSON.stringify({ type: 'custom-title', customTitle: 'User name' }),
+  ]);
+  assert.strictEqual(readUsage(customLast).title, 'User name');
+});
+
+test('readUsage: blank / malformed custom-title falls back to the ai-title', () => {
+  const file = writeFixture([
+    JSON.stringify({ type: 'ai-title', aiTitle: 'AI guess' }),
+    JSON.stringify({ type: 'custom-title' }), // no customTitle -> ignored
+    JSON.stringify({ type: 'custom-title', customTitle: '   ' }), // cleared -> ignored
+  ]);
+  assert.strictEqual(readUsage(file).title, 'AI guess');
 });
