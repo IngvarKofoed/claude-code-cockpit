@@ -1243,12 +1243,12 @@ test('toCard exposes atRest and keeps gatedSince', () => {
 
 // --- terminal focus ----------------------------------------------------------
 
-test('newSession starts with tty null', () => {
+test('newSession starts with focusTarget null', () => {
   const state = run([ev('SessionStart')]);
-  assert.strictEqual(state.sessions.s1.tty, null);
+  assert.strictEqual(state.sessions.s1.focusTarget, null);
 });
 
-test('toCard reports focusable false until a tty is resolved', () => {
+test('toCard reports focusable false until a focus target is resolved', () => {
   const state = run([ev('SessionStart')]);
   const card = snapshot(state, 0).sessions.find((x) => x.sessionId === 's1');
   assert.strictEqual(card.focusable, false);
@@ -1256,15 +1256,22 @@ test('toCard reports focusable false until a tty is resolved', () => {
 
 test('toCard reports focusable true once the daemon resolves a tty', () => {
   const state = run([ev('SessionStart')]);
-  state.sessions.s1.tty = '/dev/ttys004'; // what the daemon caches from ownerPid
+  state.sessions.s1.focusTarget = '/dev/ttys004'; // what the daemon caches from ownerPid
   const card = snapshot(state, 0).sessions.find((x) => x.sessionId === 's1');
   assert.strictEqual(card.focusable, true);
 });
 
-test('toCard never leaks the raw tty to the browser', () => {
-  // The client sends only a sessionId back; it has no business knowing the device.
+test('toCard reports focusable true for a Windows window-pid target', () => {
   const state = run([ev('SessionStart')]);
-  state.sessions.s1.tty = '/dev/ttys004';
+  state.sessions.s1.focusTarget = 'pid:4242';
   const card = snapshot(state, 0).sessions.find((x) => x.sessionId === 's1');
-  assert.strictEqual(card.tty, undefined);
+  assert.strictEqual(card.focusable, true);
+});
+
+test('toCard never leaks the raw focus target to the browser', () => {
+  // The client sends only a sessionId back; it has no business knowing the device or pid.
+  const state = run([ev('SessionStart')]);
+  state.sessions.s1.focusTarget = '/dev/ttys004';
+  const card = snapshot(state, 0).sessions.find((x) => x.sessionId === 's1');
+  assert.strictEqual(card.focusTarget, undefined);
 });

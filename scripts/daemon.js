@@ -340,6 +340,12 @@ function loadSnapshot() {
       const s = state.sessions[sid];
       if (!s) continue;
       if (s.status === 'idle-waiting') s.status = 'idle'; // migrate a retired status
+      // Pre-0.36 snapshots held the macOS tty under `tty`. Carry it into the platform-
+      // neutral field (the value is still valid — same process, same terminal) and DROP
+      // the old key: toCard spreads the session and only deletes what it knows about, so
+      // a lingering `tty` would reach the browser, which must never learn the device.
+      if (s.focusTarget == null && typeof s.tty === 'string') s.focusTarget = s.tty;
+      delete s.tty;
       if (staleDay) s.engagedSince = null;
     }
   }
@@ -1205,8 +1211,8 @@ function handleEvent(ev) {
   if (replaying) return; // boot replay: rebuild live state only, no side effects
 
   // Sits below the replay guard on purpose: a cold boot replays a whole day of events and
-  // would otherwise fork a `ps` per line. Boot's own sweep covers restored sessions.
-  resolveTtyOnce(sid);
+  // would otherwise probe the OS per line. Boot's own sweep covers restored sessions.
+  resolveFocusTargetOnce(sid);
 
   // Global pause transitions (session-less Paused/Resumed) are NOT folded here: reconcile()
   // is the single writer AND the single folder of the pause tracker (it appends the line and
@@ -2581,34 +2587,37 @@ function handleReposDelete(req, res) {
 // records + surfaces the state. reconcile() treats the file as paused only when the feature
 // is enabled, so arming it while disabled records/shows nothing (matching the gate, which
 // fails open when disabled) — the dashboard hides the button in that case anyway.
-// Resolve a session's controlling terminal ONCE, so its Live card can offer to raise the
-// Terminal window. A process's tty is fixed for its lifetime, and `ttyAttempted` makes the
-// MISS case terminal too: a headless session (a launchd agent, no tty) must not re-spawn
-// `ps` on every event it emits. Fire-and-forget — the flag rides out on a later broadcast.
-function resolveTtyOnce(sid) {
+// Resolve a session's focus target ONCE, so its Live card can offer to raise the terminal
+// window (macOS: its tty; Windows: the pid of the ancestor owning the window). Both are
+// fixed for a session's lifetime, and `focusAttempted` makes the MISS case terminal too:
+// a headless session (a launchd agent with no tty, a Windows service with no window) must
+// not re-spawn `ps`/PowerShell on every event it emits — which matters more on Windows,
+// where the probe is a PowerShell start-up rather than a `ps` fork. Fire-and-forget — the
+// flag rides out on a later broadcast.
+function resolveFocusTargetOnce(sid) {
   if (sid == null) return;
   const session = state.sessions[sid];
-  if (!session || session.tty != null || session.ownerPid == null) return;
+  if (!session || session.focusTarget != null || session.ownerPid == null) return;
   const x = extra.get(sid) || {};
-  if (x.ttyAttempted) return;
-  x.ttyAttempted = true;
+  if (x.focusAttempted) return;
+  x.focusAttempted = true;
   extra.set(sid, x);
-  focusTerminal.ttyForPid(session.ownerPid).then((tty) => {
+  focusTerminal.resolveFocusTarget(session.ownerPid).then((target) => {
     const s = state.sessions[sid];
-    if (!s || tty == null) return;
-    s.tty = tty;
+    if (!s || target == null) return;
+    s.focusTarget = target;
     markDirty();
   });
 }
 
-// Boot sweep: sessions restored across a restart have no tty yet and may stay idle for
+// Boot sweep: sessions restored across a restart have no target yet and may stay idle for
 // hours, so waiting for their next event would leave their cards buttonless until then.
-function resolveMissingTtys() {
-  for (const sid of Object.keys(state.sessions)) resolveTtyOnce(sid);
+function resolveMissingFocusTargets() {
+  for (const sid of Object.keys(state.sessions)) resolveFocusTargetOnce(sid);
 }
 
-// Raise the Terminal window hosting a session. The request names a SESSION, never a
-// terminal: the device comes from state the daemon resolved itself, so the browser can't
+// Raise the terminal window hosting a session. The request names a SESSION, never a
+// terminal: the target comes from state the daemon resolved itself, so the browser can't
 // ask for an arbitrary window — or an arbitrary command — to be run.
 function handleFocus(req, res) {
   readBody(req, (raw) => {
@@ -2621,10 +2630,10 @@ function handleFocus(req, res) {
     const sid = body && typeof body.sessionId === 'string' ? body.sessionId : null;
     const session = sid ? state.sessions[sid] : null;
     if (!session) return json(res, { ok: false, reason: 'unknown-session' }, 404);
-    if (!session.tty) return json(res, { ok: false, reason: 'no-terminal' }, 409);
+    if (!session.focusTarget) return json(res, { ok: false, reason: 'no-terminal' }, 409);
 
     focusTerminal
-      .focusTty(session.tty)
+      .focusTarget(session.focusTarget)
       .then((r) => json(res, r, r.ok ? 200 : 409))
       .catch((e) => {
         log('focus failed ' + ((e && e.stack) || e));
@@ -2980,8 +2989,8 @@ function main() {
   // Resolve terminals for every session that survived the restart. handleEvent only
   // resolves on a session's NEXT event, which for an idle session may be hours away —
   // without this sweep their cards would sit buttonless until someone typed at them.
-  // One `ps` per live session, once per boot.
-  resolveMissingTtys();
+  // One probe per live session, once per boot.
+  resolveMissingFocusTargets();
 
   // Back-fill any turns that completed while the daemon was down, for sessions
   // still open across this restart. catchUpIngest seeds each session's counted-id

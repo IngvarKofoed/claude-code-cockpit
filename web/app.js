@@ -597,7 +597,7 @@ function cardHTML(s) {
     <div class="card__body">
       <div class="card__head">
         <span class="card__repo" title="${esc(s.repoName || "")}">${esc(s.repoName || "(unknown)")}</span>
-        ${s.focusable ? `<button class="focus-btn" type="button" data-focus-session="${esc(s.sessionId)}" title="Bring this session's Terminal window to the front" aria-label="Focus terminal">${TERMINAL_SVG}</button>` : ""}
+        ${s.focusable ? `<button class="focus-btn" type="button" data-focus-session="${esc(s.sessionId)}" title="Bring this session's terminal window to the front" aria-label="Focus terminal">${TERMINAL_SVG}</button>` : ""}
         <span class="badge">${esc(STATUS_LABEL[status] || status)}</span>
       </div>
       ${title}${where}
@@ -1194,15 +1194,17 @@ function renderLive() {
 // Why a focus attempt failed, in the user's terms. The daemon returns a stable reason
 // code; anything unrecognised falls back to the generic line rather than leaking a slug.
 const FOCUS_ERRORS = {
-  "no-window": "No Terminal window found — the session may be in tmux or another app",
+  "no-window": "No terminal window found — the session may be in tmux or another app",
   "no-terminal": "This session isn't running in a terminal",
   "unknown-session": "That session is no longer live",
-  "unsupported-platform": "Focusing a terminal only works on macOS",
+  "unsupported-platform": "Focusing a terminal works on macOS and Windows only",
   "osascript-failed": "Couldn't talk to Terminal",
+  "powershell-failed": "Couldn't reach PowerShell to raise the window",
+  "focus-refused": "Windows wouldn't bring that window to the front",
 };
 
-// Ask the daemon to raise this session's Terminal window. Only the session id goes over
-// the wire — the daemon owns the tty and does the lookup itself.
+// Ask the daemon to raise this session's terminal window. Only the session id goes over
+// the wire — the daemon owns the target and does the lookup itself.
 async function focusTerminal(sessionId) {
   if (!sessionId) return;
   try {

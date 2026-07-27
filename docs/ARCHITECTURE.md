@@ -93,7 +93,7 @@ claude-code-cockpit/
 │   ├── repo.js                  # PURE-ish: cwd → git root, name, branch (no subprocess)
 │   ├── pricing.js               # PURE: tokens + model → estimated cost
 │   ├── notify.js                # node-notifier wrapper (detached worker, reused)
-│   ├── focus-terminal.js        # macOS: pid → tty → raise that Terminal window
+│   ├── focus-terminal.js        # pid → tty (macOS) / window pid (Windows) → raise it
 │   ├── config.js                # read / merge / write / validate config (reused pattern)
 │   ├── paths.js                 # XDG/APPDATA dirs + port/pid/snapshot paths (reused)
 │   └── *.test.js                # node --test unit tests for the pure modules
@@ -201,13 +201,16 @@ gate.js now emits a `Gated` marker when it enters its poll loop (freezing a tool
 
 ## Focus terminal (`scripts/focus-terminal.js`)
 
-A Live card can raise the **Terminal window running that session**, for jumping straight to a session that needs input. The chain reuses state the cockpit already holds: `emit.js` stamps `owner_pid` (its `process.ppid`, i.e. the Claude Code process) on **every** event, so the daemon resolves that pid's controlling terminal with `ps -o tty=` and matches it against the `tty` each Terminal tab exposes through AppleScript, then selects the tab, raises its window, and activates the app.
+A Live card can raise the **terminal window running that session**, for jumping straight to a session that needs input. Both platform chains reuse state the cockpit already holds: `emit.js` stamps `owner_pid` (its `process.ppid`, i.e. the Claude Code process) on **every** event, and the daemon turns that pid into an opaque **focus target** it stores per session:
 
-The tty is resolved **once per session** — a process's tty is fixed for its lifetime — and the *miss* is cached too, so a session with no terminal (a headless launchd agent, where `ps` reports `??`) never re-forks `ps` on each event it emits. Resolution is skipped during boot replay (which would fork per log line) and covered instead by a single sweep after replay, so sessions restored across a restart get their button immediately rather than on their next event, which for an idle session could be hours away. `toCard` exposes only a derived `focusable` boolean.
+- **macOS** — resolve the pid's controlling terminal with `ps -o tty=` (target `/dev/ttys004`), match it against the `tty` each Terminal tab exposes through AppleScript, then select the tab, raise its window, and activate the app. Tab-exact.
+- **Windows** — walk the `Win32_Process` parent chain to the first process owning a window (target `pid:1234`), then restore it if minimized and `SetForegroundWindow`, falling back to `WScript.Shell.AppActivate` when Windows refuses the raw call. The walk is bounded and doubly guarded against raising the *wrong* window: `CreationDate` so a recycled pid can't pass as a live ancestor, and a stop list (`explorer.exe` and the session-critical processes) because every chain reaches the desktop shell eventually and its "main window" is the taskbar. A VS Code integrated terminal resolves to the VS Code window — which is where that session actually is, so unlike macOS it focuses usefully. **Window-level only:** Windows Terminal keeps every tab in one `WindowsTerminal.exe` window and exposes no way to select a tab by pid, so a `wt.exe` session raises the right window but lands on whichever tab was last active — a legacy conhost window (`cmd.exe`, a standalone `pwsh`) is one window per session and focuses exactly. Both PowerShell scripts are fixed text with an integer-validated pid interpolated in, handed over as base64 `-EncodedCommand` (no shell, and no command-line quoting to get wrong).
 
-**`POST /api/focus` takes a `sessionId`, never a terminal.** The daemon re-derives the device from its own state, so a page that reaches the endpoint still cannot name the window it wants raised, and the tty reaches `osascript` through `argv` rather than a shell. The device is never sent to the browser.
+The target is resolved **once per session** — a pid's tty and its window owner are both fixed for its lifetime — and the *miss* is cached too, so a session with no window (a headless launchd agent where `ps` reports `??`, a Windows service) never re-probes on each event it emits. That matters more on Windows, where the probe is a PowerShell start-up rather than a `ps` fork. Resolution is skipped during boot replay (which would probe per log line) and covered instead by a single sweep after replay, so sessions restored across a restart get their button immediately rather than on their next event, which for an idle session could be hours away. `toCard` exposes only a derived `focusable` boolean.
 
-**Terminal.app on macOS only.** iTerm2, Ghostty, a VS Code integrated terminal, and any multiplexer (the session's tty is a tmux pty, not a window) all resolve to no match and surface as a `no-window` toast; non-macOS platforms report `unsupported-platform`. The button is hidden entirely unless a tty resolved, so the common cases degrade to *absent* rather than *broken*.
+**`POST /api/focus` takes a `sessionId`, never a terminal.** The daemon re-derives the target from its own state, so a page that reaches the endpoint still cannot name the window it wants raised. `focusTarget` routes on the target's **shape**, not the running platform, so a target carried in a snapshot from another OS fails a shape check rather than reaching the wrong OS command. The target is never sent to the browser.
+
+**Unfocusable cases degrade to *absent*, not broken.** iTerm2, Ghostty, a VS Code integrated terminal, and any multiplexer (the session's tty is a tmux pty, not a window) resolve to no match on macOS and surface as a `no-window` toast; a platform that is neither macOS nor Windows reports `unsupported-platform`. The button is hidden entirely unless a target resolved.
 
 ## The daemon (`daemon.js`)
 

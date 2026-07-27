@@ -835,3 +835,31 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     Skipped during boot replay, which would fork per log line; a post-replay sweep covers restored
     sessions instead, so an idle one gets its button at boot rather than hours later on its next event.
     Cards receive only a derived `focusable` bool — the tty stays server-side.
+
+93. Focusing a session's terminal now works on WINDOWS too (v0.36.0): the daemon walks the
+    `Win32_Process` parent chain to the first ancestor owning a window, then raises it
+    (SetForegroundWindow, AppActivate fallback). WINDOW-level only — Windows Terminal keeps
+    every tab in one window and exposes no way to select a tab by pid, so a wt.exe session
+    lands on the last-active tab; legacy conhost (cmd.exe, standalone pwsh) focuses exactly.
+
+94. The per-session focus handle is now the platform-neutral `session.focusTarget` — a tty
+    (`/dev/ttys004`) or a window pid (`pid:1234`) — replacing `session.tty` (v0.36.0).
+    `focusTarget()` dispatches on the value's SHAPE, not the running platform, so a target
+    from another machine's snapshot fails a shape check instead of reaching the wrong OS
+    command. A pre-0.36 snapshot's `tty` is migrated on load and the old key DELETED: `toCard`
+    spreads the session, so a lingering field would have reached the browser.
+
+95. The Windows ancestor walk STOPS at explorer.exe and the session-critical processes
+    (v0.36.0). Every chain reaches explorer.exe eventually, and its "main window" is the
+    desktop/taskbar — so a shell reporting no console window of its own (a legacy conhost
+    window belongs to a conhost.exe CHILD, unreachable by walking up) would have resolved
+    to the taskbar. Now that case degrades to a hidden button, not a wrong one.
+    Known limit, matching the macOS tty: a target pid recycled between resolve and click
+    could raise an unrelated window. Bounded — the host dying reaps the session.
+
+96. The Windows ancestor walk guards pid REUSE with `CreationDate` (v0.36.0) —
+    `Win32_Process` keeps reporting a `ParentProcessId` after the parent exits, so without the
+    check a recycled pid could raise an unrelated app's window. PowerShell is invoked as base64
+    `-EncodedCommand` (a fixed script + an integer-validated pid), which removes command-line
+    quoting from the picture entirely — the scripts embed C# needing double quotes.
+    Not verified on real Windows: written and unit-tested from macOS.
