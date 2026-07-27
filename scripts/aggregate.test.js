@@ -1240,3 +1240,31 @@ test('toCard exposes atRest and keeps gatedSince', () => {
   assert.strictEqual(card.atRest, true);
   assert.strictEqual(card.gatedSince, '2026-07-02T10:00:05.000Z');
 });
+
+// --- terminal focus ----------------------------------------------------------
+
+test('newSession starts with tty null', () => {
+  const state = run([ev('SessionStart')]);
+  assert.strictEqual(state.sessions.s1.tty, null);
+});
+
+test('toCard reports focusable false until a tty is resolved', () => {
+  const state = run([ev('SessionStart')]);
+  const card = snapshot(state, 0).sessions.find((x) => x.sessionId === 's1');
+  assert.strictEqual(card.focusable, false);
+});
+
+test('toCard reports focusable true once the daemon resolves a tty', () => {
+  const state = run([ev('SessionStart')]);
+  state.sessions.s1.tty = '/dev/ttys004'; // what the daemon caches from ownerPid
+  const card = snapshot(state, 0).sessions.find((x) => x.sessionId === 's1');
+  assert.strictEqual(card.focusable, true);
+});
+
+test('toCard never leaks the raw tty to the browser', () => {
+  // The client sends only a sessionId back; it has no business knowing the device.
+  const state = run([ev('SessionStart')]);
+  state.sessions.s1.tty = '/dev/ttys004';
+  const card = snapshot(state, 0).sessions.find((x) => x.sessionId === 's1');
+  assert.strictEqual(card.tty, undefined);
+});

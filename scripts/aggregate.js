@@ -45,6 +45,11 @@ function newSession(event) {
     // Persists for the session's life — only SessionStart carries it.
     subscription: null,
     ownerPid: null,
+    // Controlling terminal of ownerPid (`/dev/ttys004`), resolved ONCE by the daemon the
+    // first time it sees the pid — a process's tty never changes for its lifetime. null
+    // means "not resolved yet" or "no terminal at all" (a headless launchd agent); both
+    // read the same to the UI. Daemon-internal: toCard exposes only the derived boolean.
+    tty: null,
     permissionMode: null,
     effortLevel: null,
     status: 'idle',
@@ -424,6 +429,11 @@ function toCard(s) {
   // spread (unlike the internal anchors above — the client renders the honest paused badge
   // from card.atRest and freezes the timer at card.gatedSince).
   card.atRest = atRest(s);
+  // Whether the Live card can offer "focus this session's terminal". The device itself
+  // stays server-side — the client posts a sessionId and the daemon re-derives the tty,
+  // so the browser can never name the window it wants raised.
+  card.focusable = s.tty != null;
+  delete card.tty;
   return card;
 }
 

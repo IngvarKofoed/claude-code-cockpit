@@ -637,6 +637,25 @@ body {
 .path svg { width: 13px; height: 13px; flex: none; opacity: 0.8; }
 .path:hover { background: var(--surface-2); color: var(--ink); }
 
+/* Focus-terminal button in the card head. Sized off .path's icon so it sits on the same
+   optical line as the repo name; card__head's flex gap keeps it clear of the badge. */
+.focus-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--ink-2);
+  padding: 3px;
+  margin-left: -4px;
+  border-radius: 6px;
+  cursor: pointer;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+}
+.focus-btn svg { width: 14px; height: 14px; opacity: 0.75; }
+.focus-btn:hover { background: var(--surface-2); color: var(--ink); }
+.focus-btn:hover svg { opacity: 1; }
+
 .card__activity {
   display: flex;
   align-items: center;

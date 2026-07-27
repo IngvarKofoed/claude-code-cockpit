@@ -395,6 +395,10 @@ const BRANCH_SVG =
 const COPY_SVG =
   '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">' +
   '<rect x="5" y="5" width="8" height="9" rx="1.5"/><path d="M3 11V3a1 1 0 0 1 1-1h6"/></svg>';
+// A terminal window with a prompt caret — the "raise this session's window" affordance.
+const TERMINAL_SVG =
+  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">' +
+  '<rect x="1.8" y="2.8" width="12.4" height="10.4" rx="1.5"/><path d="M4.6 6.6 6.8 8.4l-2.2 1.8"/></svg>';
 // A flat tag/label glyph for the session name, in the same stroke style as BRANCH_SVG.
 const TITLE_SVG =
   '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">' +
@@ -593,6 +597,7 @@ function cardHTML(s) {
     <div class="card__body">
       <div class="card__head">
         <span class="card__repo" title="${esc(s.repoName || "")}">${esc(s.repoName || "(unknown)")}</span>
+        ${s.focusable ? `<button class="focus-btn" type="button" data-focus-session="${esc(s.sessionId)}" title="Bring this session's Terminal window to the front" aria-label="Focus terminal">${TERMINAL_SVG}</button>` : ""}
         <span class="badge">${esc(STATUS_LABEL[status] || status)}</span>
       </div>
       ${title}${where}
@@ -1179,8 +1184,37 @@ function renderLive() {
   cards.querySelectorAll(".path").forEach((btn) =>
     btn.addEventListener("click", () => copyPath(btn.dataset.path))
   );
+  cards.querySelectorAll(".focus-btn").forEach((btn) =>
+    btn.addEventListener("click", () => focusTerminal(btn.dataset.focusSession))
+  );
   collectTimers();
   tick(); // paint timers immediately rather than waiting up to a second
+}
+
+// Why a focus attempt failed, in the user's terms. The daemon returns a stable reason
+// code; anything unrecognised falls back to the generic line rather than leaking a slug.
+const FOCUS_ERRORS = {
+  "no-window": "No Terminal window found — the session may be in tmux or another app",
+  "no-terminal": "This session isn't running in a terminal",
+  "unknown-session": "That session is no longer live",
+  "unsupported-platform": "Focusing a terminal only works on macOS",
+  "osascript-failed": "Couldn't talk to Terminal",
+};
+
+// Ask the daemon to raise this session's Terminal window. Only the session id goes over
+// the wire — the daemon owns the tty and does the lookup itself.
+async function focusTerminal(sessionId) {
+  if (!sessionId) return;
+  try {
+    await api("/api/focus", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId }),
+    });
+  } catch (e) {
+    const reason = e && e.data && e.data.reason;
+    toast(FOCUS_ERRORS[reason] || "Couldn't focus the terminal", true);
+  }
 }
 
 async function copyPath(path) {
