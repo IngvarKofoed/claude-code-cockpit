@@ -33,6 +33,10 @@
           <span class="conn__dot"></span>
           <span id="connText">connecting…</span>
         </div>
+        <!-- Running daemon's version, from /api/state `daemon.version`. Written only once a
+             snapshot carries one (no placeholder), so it can never show a version the daemon
+             isn't actually on; empty until then, and :empty collapses the flex gap. -->
+        <span class="ver" id="ver" title="Cockpit daemon version"></span>
       </div>
     </header>
 

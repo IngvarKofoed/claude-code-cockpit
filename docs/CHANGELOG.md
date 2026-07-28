@@ -1176,3 +1176,15 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      renumbering the UNPUSHED side up (+12 → 133–145) and leaving the pushed numbers alone.
      That is the rule for any future collision: whichever side is already on origin keeps its
      numbers, since other entries and PR history already reference them.
+
+147. The topbar now shows the RUNNING daemon's version after the `● live` indicator, from the
+     `daemon.version` already on every `/api/state` frame. Makes entry 103's upgrade seam
+     visible: a stale daemon (or a stale tab) is now readable at a glance instead of needing
+     `/health`. Written only when a frame carries a version — never a placeholder — so it can't
+     display a version the daemon isn't on; empty until the first snapshot, and `:empty` hides it.
+
+148. Released v0.43.0, carrying entry 147. Bumped per entry 103 — the plugin cache is keyed by
+     version and `ensure.js` only replaces a running daemon when `/health` reports a DIFFERENT
+     one, so a UI-only change still needs the bump to reach anyone. Fittingly, this release is
+     the first whose own arrival is visible in the topbar. `marketplace.json` stays at 0.2.0,
+     unmaintained since that release, so it is deliberately left alone.

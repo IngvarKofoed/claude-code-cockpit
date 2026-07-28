@@ -2557,6 +2557,11 @@ function applyState(state) {
   App.state = state;
   if (state.config) App.cfg = state.config;
   if (typeof state.now === "number") App.clockOffset = state.now - Date.now();
+  // Topbar version, beside the connection indicator. Written only when the frame carries one (so
+  // a partial payload leaves the last known version rather than blanking it) and only on a real
+  // change — this runs on every SSE frame, and the version moves once per daemon restart.
+  const ver = state.daemon && state.daemon.version ? "v" + state.daemon.version : null;
+  if (ver && $("ver").textContent !== ver) $("ver").textContent = ver;
   syncPauseUI(); // before renderLive/renderSessions — displayStatus() reads App.state.paused
   detectSoundCues(state.sessions || []);
   renderLive();

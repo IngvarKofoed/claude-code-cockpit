@@ -201,6 +201,17 @@ body {
 .conn[data-state="reconnecting"] .conn__dot { background: var(--st-waiting); }
 .conn[data-state="lost"] .conn__dot { background: var(--st-error); }
 
+/* Daemon version, at the far right of the topbar. Smaller and more muted than the conn text so
+   it reads as a footnote to the status, not a second status. :empty hides it before the first
+   snapshot so the topbar__right gap doesn't dangle beside the conn indicator. */
+.ver {
+  font-size: 11px;
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.ver:empty { display: none; }
+
 @keyframes pulse {
   0% { box-shadow: 0 0 0 0 rgba(51, 193, 122, 0.5); }
   70% { box-shadow: 0 0 0 6px rgba(51, 193, 122, 0); }
