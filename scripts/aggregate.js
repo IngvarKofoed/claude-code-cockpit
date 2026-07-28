@@ -110,7 +110,29 @@ function newSession(event) {
     // (or transcript unreadable). Display only: a DERIVED or deliberately user-typed
     // name, never the verbatim last prompt (the privacy boundary).
     title: null,
+    // Context-window fill for this session: { usedPct, tokens, updatedAt } from the
+    // statusline forwarder's push (see setSessionContext), or null until one arrives —
+    // it needs the installed statusline, so a session without it simply has no gauge.
+    // Per-SESSION, unlike the rate-limit windows (which are account-wide and live in
+    // the daemon's single `rateLimitUsage`), so it is never subscription-filtered.
+    context: null,
   };
+}
+
+// Record a context-window reading on a session. Returns whether the NUMBERS changed, so
+// the daemon can skip an SSE broadcast for the many identical pushes the statusline makes
+// (one per render) while still refreshing `updatedAt` — that timestamp is liveness, letting
+// the gauge distinguish "same number, still reporting" from "stopped reporting".
+//
+// A null reading is ignored rather than applied: a push carrying no (or an unreadable)
+// context_window must leave the last known value alone, never blank the gauge mid-turn.
+// An absent session is a no-op — a push can name a session this daemon never saw.
+function setSessionContext(session, ctx, nowMs) {
+  if (!session || !ctx) return false;
+  const prev = session.context;
+  const changed = !prev || prev.usedPct !== ctx.usedPct || prev.tokens !== ctx.tokens;
+  session.context = { usedPct: ctx.usedPct, tokens: ctx.tokens, updatedAt: nowMs };
+  return changed;
 }
 
 // Opportunistically refresh the stable metadata a session carries whenever an
@@ -784,4 +806,5 @@ module.exports = {
   countedSessions,
   accumulateActiveFromEvents,
   accumulateSessionStatsFromEvents,
+  setSessionContext,
 };

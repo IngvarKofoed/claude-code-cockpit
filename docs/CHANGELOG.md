@@ -994,3 +994,22 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      Found by making the card always visible: a single-subscription range (e.g. Today) had no
      per-day data at all, so the chart fell to its all-zero empty state while the range aggregate
      plainly had cost. Cost is one memoized merge+price per day in range, so the gate bought little.
+
+118. Live cards now show a CONTEXT-WINDOW gauge (v0.40.0): a thin meter + `ctx N%` under the card
+     head, so you can see which session is near compaction without reading its statusline.
+     The statusline forwarder already computed the percentage but sent only `rate_limits`; it now
+     also forwards `context_window` as a THREE-FIELD projection (percentage + the two token
+     counts), keeping the forwarded set an allowlist rather than the whole object.
+     Applied per SESSION, before every rate-limit guard: a stale-subscription push carries wrong
+     account-wide numbers but its own session's true fill, and an API-key session has no
+     `rate_limits` at all yet still has a context window. Either half alone is now a valid push.
+
+119. That gauge degrades rather than lying: no reading omits the row entirely (a session without the
+     statusline installed costs no card height, and never shows a misleading 0%), an unreadable one
+     never clears the last known value, and a reading older than 10 min dims — it is frozen, not
+     current. An unchanged reading is stored but does NOT broadcast; the statusline pushes on every
+     render and each broadcast rebuilds the whole card grid.
+
+120. New Live sort "Context % (fullest first)" (v0.40.0), per-browser like the other two.
+     Sessions with no reading sink BELOW every session that has one instead of sorting as 0% —
+     unknown is not empty, the same rule the rest of the accounting follows.

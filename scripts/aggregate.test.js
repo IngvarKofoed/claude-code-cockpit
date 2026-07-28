@@ -17,6 +17,7 @@ const {
   countedSessions,
   accumulateActiveFromEvents,
   accumulateSessionStatsFromEvents,
+  setSessionContext,
 } = require('./aggregate');
 
 // Build a normalized event record with sensible defaults; override per case.
@@ -1356,4 +1357,61 @@ test('ownerPidVerified survives a snapshot round-trip', () => {
   restored.sessions = JSON.parse(JSON.stringify(state.sessions));
   assert.strictEqual(restored.sessions.s1.ownerPidVerified, true);
   assert.strictEqual(restored.sessions.s1.ownerPid, 39420);
+});
+
+// --- context window (statusline push -> per-session gauge) -------------------
+
+test('a new session starts with no context window', () => {
+  const state = run([ev('SessionStart')]);
+  assert.strictEqual(state.sessions.s1.context, null);
+});
+
+test('setSessionContext stores the reading and reports it changed', () => {
+  const state = run([ev('SessionStart')]);
+  const changed = setSessionContext(state.sessions.s1, { usedPct: 62, tokens: 120000 }, 1000);
+  assert.strictEqual(changed, true);
+  assert.deepStrictEqual(state.sessions.s1.context, { usedPct: 62, tokens: 120000, updatedAt: 1000 });
+});
+
+test('setSessionContext: an unchanged reading reports no change but refreshes liveness', () => {
+  // The statusline pushes on every render, so an unchanged reading must not
+  // trigger an SSE broadcast — but updatedAt still advances so the gauge can
+  // tell "same number, still reporting" from "stopped reporting".
+  const state = run([ev('SessionStart')]);
+  setSessionContext(state.sessions.s1, { usedPct: 62, tokens: 120000 }, 1000);
+  const changed = setSessionContext(state.sessions.s1, { usedPct: 62, tokens: 120000 }, 5000);
+  assert.strictEqual(changed, false);
+  assert.strictEqual(state.sessions.s1.context.updatedAt, 5000);
+});
+
+test('setSessionContext: a moved percentage or token count reports changed', () => {
+  const state = run([ev('SessionStart')]);
+  setSessionContext(state.sessions.s1, { usedPct: 62, tokens: 120000 }, 1000);
+  assert.strictEqual(setSessionContext(state.sessions.s1, { usedPct: 63, tokens: 120000 }, 2000), true);
+  assert.strictEqual(setSessionContext(state.sessions.s1, { usedPct: 63, tokens: 130000 }, 3000), true);
+});
+
+test('setSessionContext: a null reading never clears an existing gauge', () => {
+  // A push carrying no context_window (or an unreadable one) must leave the last
+  // known reading alone rather than blanking the card mid-turn.
+  const state = run([ev('SessionStart')]);
+  setSessionContext(state.sessions.s1, { usedPct: 62, tokens: 120000 }, 1000);
+  assert.strictEqual(setSessionContext(state.sessions.s1, null, 2000), false);
+  assert.deepStrictEqual(state.sessions.s1.context, { usedPct: 62, tokens: 120000, updatedAt: 1000 });
+});
+
+test('setSessionContext: a missing session is a no-op, not a throw', () => {
+  // A push can name a session the daemon has never seen (snapshot loss, missed
+  // SessionStart); it must not take the usage handler down.
+  assert.strictEqual(setSessionContext(null, { usedPct: 10, tokens: 5 }, 1000), false);
+  assert.strictEqual(setSessionContext(undefined, { usedPct: 10, tokens: 5 }, 1000), false);
+});
+
+test('the context reading survives a snapshot round-trip', () => {
+  // Sessions are restored from snapshot.json on boot; the gauge should come back
+  // (with its original updatedAt, so a stale reading reads as stale).
+  const state = run([ev('SessionStart')]);
+  setSessionContext(state.sessions.s1, { usedPct: 44, tokens: 90000 }, 1000);
+  const restored = JSON.parse(JSON.stringify(state.sessions));
+  assert.deepStrictEqual(restored.s1.context, { usedPct: 44, tokens: 90000, updatedAt: 1000 });
 });

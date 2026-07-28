@@ -1,7 +1,15 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
-const { normalizeUsage, normalizeUsageWindow, sameUsageWindows, applyPattern, subLabel } = require('./usage');
+const {
+  normalizeUsage,
+  normalizeUsageWindow,
+  normalizeContextWindow,
+  pushSessionId,
+  sameUsageWindows,
+  applyPattern,
+  subLabel,
+} = require('./usage');
 
 test('normalizeUsageWindow converts resets_at seconds -> ms and keeps usedPct', () => {
   assert.deepStrictEqual(normalizeUsageWindow({ used_percentage: 23.5, resets_at: 1738425600 }), {
@@ -88,6 +96,65 @@ test('sameUsageWindows: ignores sessionId (only rate-limit numbers gate a broadc
   const a = { fiveHour: { usedPct: 10, resetsAt: 1 }, sevenDay: null, sessionId: 's1' };
   const b = { fiveHour: { usedPct: 10, resetsAt: 1 }, sevenDay: null, sessionId: 's2' };
   assert.strictEqual(sameUsageWindows(a, b), true);
+});
+
+// ---- normalizeContextWindow --------------------------------------------
+
+test('normalizeContextWindow: keeps usedPct and sums the two token counts', () => {
+  assert.deepStrictEqual(
+    normalizeContextWindow({ used_percentage: 62.4, total_input_tokens: 100000, total_output_tokens: 20000 }),
+    { usedPct: 62.4, tokens: 120000 }
+  );
+});
+
+test('normalizeContextWindow clamps used_percentage to [0,100]', () => {
+  assert.strictEqual(normalizeContextWindow({ used_percentage: 250 }).usedPct, 100);
+  assert.strictEqual(normalizeContextWindow({ used_percentage: -5 }).usedPct, 0);
+});
+
+test('normalizeContextWindow: non-finite used_percentage -> whole window null', () => {
+  assert.strictEqual(normalizeContextWindow({ used_percentage: 'nope', total_input_tokens: 5 }), null);
+  assert.strictEqual(normalizeContextWindow({ total_input_tokens: 5 }), null);
+});
+
+test('normalizeContextWindow: absent token counts -> tokens null, never a wrong zero', () => {
+  assert.deepStrictEqual(normalizeContextWindow({ used_percentage: 40 }), { usedPct: 40, tokens: null });
+  assert.deepStrictEqual(normalizeContextWindow({ used_percentage: 40, total_input_tokens: 'x' }), {
+    usedPct: 40,
+    tokens: null,
+  });
+});
+
+test('normalizeContextWindow: one token count present is summed alone', () => {
+  assert.deepStrictEqual(normalizeContextWindow({ used_percentage: 40, total_input_tokens: 900 }), {
+    usedPct: 40,
+    tokens: 900,
+  });
+  assert.deepStrictEqual(normalizeContextWindow({ used_percentage: 40, total_output_tokens: 7 }), {
+    usedPct: 40,
+    tokens: 7,
+  });
+});
+
+test('normalizeContextWindow: non-object -> null', () => {
+  assert.strictEqual(normalizeContextWindow(null), null);
+  assert.strictEqual(normalizeContextWindow(42), null);
+  assert.strictEqual(normalizeContextWindow(undefined), null);
+});
+
+// ---- pushSessionId -----------------------------------------------------
+
+test('pushSessionId: a non-empty string passes through', () => {
+  assert.strictEqual(pushSessionId({ session_id: 'abc-123' }), 'abc-123');
+});
+
+test('pushSessionId: absent/blank/non-string -> null (attribution fails open)', () => {
+  assert.strictEqual(pushSessionId({}), null);
+  assert.strictEqual(pushSessionId({ session_id: '' }), null);
+  assert.strictEqual(pushSessionId({ session_id: 42 }), null);
+  assert.strictEqual(pushSessionId({ session_id: null }), null);
+  assert.strictEqual(pushSessionId(null), null);
+  assert.strictEqual(pushSessionId('x'), null);
 });
 
 // ---- applyPattern ------------------------------------------------------
