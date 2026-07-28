@@ -2752,8 +2752,72 @@ function syncFocusTitle(session) {
     // /rename fix, which beats silently hiding the button. Only a genuine miss hides it.
     const matched = !m.reason || m.reason === 'ambiguous-tab';
     const next = matched ? 'wt:' + cur : null;
-    if (s.focusTitle === next) return;
-    s.focusTitle = next;
+    if (s.focusTitle !== next) {
+      s.focusTitle = next;
+      markDirty();
+    }
+    // No WT tab owns this session. Before giving up, try to find a terminal WINDOW by the
+    // same title (see syncFocusWindow) — that is the only key left for a terminal with
+    // neither a UIA tab list nor reachable process ancestry, e.g. Tabby.
+    if (!matched) syncFocusWindow(s);
+  });
+}
+
+// Titled top-level windows, cached like wtTabsCached and for the same reason: the
+// enumeration is a PowerShell start-up, and every unmatched session would otherwise pay
+// for its own.
+let windowsCache = { at: 0, windows: [] };
+const WINDOWS_TTL_MS = 15000;
+
+function windowsCached() {
+  if (Date.now() - windowsCache.at < WINDOWS_TTL_MS) return Promise.resolve(windowsCache.windows);
+  return focusTerminal.listWindows().then((windows) => {
+    if (windows) windowsCache = { at: Date.now(), windows };
+    return windowsCache.windows;
+  });
+}
+
+// Last-resort target: the pid of a terminal WINDOW whose title is this session's.
+//
+// Reached only when the WT tab path found nothing and the ancestor walk has not produced a
+// target, so it costs a WT user nothing. It exists for a terminal that closes every other
+// channel — Tabby measured on all three: UIA exposes one Pane (no Chromium a11y tree, so
+// no tab to select), and the session's process ancestry is severed above the shell, so no
+// ancestor owns a window. The window title is what is left.
+//
+// Deliberately NOT latched like resolveFocusTargetOnce: the title arrives after
+// SessionStart, and in a multi-tab terminal it only reaches the WINDOW while that tab is
+// active — so a miss now may be a hit later and must stay retryable. Once it lands, the
+// result is a plain `pid:` target, cached for the session's life, so the button stops
+// depending on which tab is in front.
+//
+// "Retryable" means on a TOKEN READ (its caller, syncFocusTitle, hangs off
+// updateSessionTokens) and once per boot sweep — not on a timer. So an idle session with no
+// matching window at boot picks one up on its next activity, not seconds later. Measured:
+// with a matching window open, an otherwise-quiet session stayed unfocusable for 20s and
+// resolved as soon as it did anything. Acceptable, since the button matters when a session
+// wants attention, which is exactly when it is producing events.
+//
+// Known limit, and the reason this is last: it is WINDOW-level. A session in a background
+// tab of such a terminal emits no signal at all, so the raise lands on that window's
+// active tab — the pre-UIA Windows Terminal behaviour, honest but not tab-exact.
+function syncFocusWindow(session) {
+  if (process.platform !== 'win32' || !session) return;
+  if (session.focusTarget != null) return;
+  const title = typeof session.title === 'string' && session.title.trim() ? session.title : null;
+  if (title == null) return;
+  windowsCached().then((windows) => {
+    const s = state.sessions[session.sessionId];
+    if (!s || s.focusTarget != null) return;
+    // Re-read the title: an await elapsed, and a /rename may have moved it on.
+    const cur = typeof s.title === 'string' && s.title.trim() ? s.title : null;
+    if (cur == null) return;
+    const m = focusTerminal.matchTerminalWindow(windows, cur);
+    // An AMBIGUOUS window is a refusal, not a match — unlike the WT tab case, where the
+    // click can at least name the /rename fix. Here there is no tab to select afterwards,
+    // so guessing would just raise one of several terminals with no recourse.
+    if (!m.win) return;
+    s.focusTarget = 'pid:' + m.win.pid;
     markDirty();
   });
 }
@@ -2809,9 +2873,36 @@ function handleFocus(req, res) {
       FOCUS_DEADLINE_MS,
     );
 
+    // A `pid:` target that reports no-window is SPENT: the window it named is gone. Drop it
+    // so the session's next token read can re-derive one, instead of leaving a visible button
+    // that can only ever fail. It matters most for a title-derived target (syncFocusWindow),
+    // which — unlike an ancestor pid, whose process outlives the session by construction —
+    // names a window that can close while the session lives, or that a collision never owned.
+    //
+    // Dropping the target is NOT enough on its own: an ancestor-derived target comes from
+    // resolveFocusTargetOnce, whose `focusAttempted` latch would then refuse to resolve
+    // again, and no other path can re-derive one (a VS Code host is deliberately absent from
+    // TERMINAL_IMAGES, so the title fallback cannot rescue it either). That would turn one
+    // transient miss into a permanently buttonless session — entry 110's bug shape exactly.
+    // So the latch is released too, which is what makes the comment above actually true.
+    // This re-arms only on a FAILED USER CLICK, not per event, so it cannot reintroduce the
+    // per-event PowerShell storm that the resolve-once latch exists to prevent.
+    const dropSpentWindowTarget = () => {
+      const s = state.sessions[sid];
+      if (!s || typeof s.focusTarget !== 'string' || !s.focusTarget.startsWith('pid:')) return;
+      s.focusTarget = null;
+      const x = extra.get(sid);
+      if (x && x.focusAttempted) x.focusAttempted = false;
+      markDirty();
+    };
+
     const attempt = (i, last) => {
       if (settled) return;
-      if (i >= targets.length) return answer(last || { ok: false, reason: 'no-window' }, 409);
+      if (i >= targets.length) {
+        const final = last || { ok: false, reason: 'no-window' };
+        if (final.reason === 'no-window') dropSpentWindowTarget();
+        return answer(final, 409);
+      }
       return focusTerminal.focusTarget(targets[i]).then((r) => {
         if (settled) return;
         if (r.ok) return answer(r, 200);

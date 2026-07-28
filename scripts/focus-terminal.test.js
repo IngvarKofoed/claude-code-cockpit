@@ -3,11 +3,16 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
 const {
+  TERMINAL_IMAGES,
   parseTtyDevice,
   parseWindowPid,
   parseWtTabs,
+  parseWindowList,
+  parseFocusWindowResult,
   normalizeTabName,
   matchWtTabs,
+  matchTerminalWindow,
+  focusWindowScript,
   ttyForPid,
   windowPidForPid,
   focusTty,
@@ -134,6 +139,51 @@ test('focusWindowPid: an invalid pid is refused before anything is spawned', asy
   assert.strictEqual(r.reason, 'invalid-target');
 });
 
+test('parseFocusWindowResult: the raise script\'s three answers stay distinct', () => {
+  // 'notfound' means the ancestor owns no window at all (a ConPTY client reports
+  // MainWindowHandle = 0); 'failed' means the window exists and Windows would not raise
+  // it. Collapsing them would tell a user "no terminal found" about a window they can see.
+  assert.deepStrictEqual(parseFocusWindowResult('ok\n'), { ok: true });
+  assert.deepStrictEqual(parseFocusWindowResult('notfound\n'), { ok: false, reason: 'no-window' });
+  assert.deepStrictEqual(parseFocusWindowResult('failed\n'), {
+    ok: false,
+    reason: 'focus-refused',
+  });
+});
+
+test('parseFocusWindowResult: a failed PowerShell run is not read as a refusal', () => {
+  // runPowerShell resolves null when the spawn itself failed — distinct from a script
+  // that ran and reported it could not raise the window.
+  assert.deepStrictEqual(parseFocusWindowResult(null), {
+    ok: false,
+    reason: 'powershell-failed',
+  });
+  assert.deepStrictEqual(parseFocusWindowResult('unexpected garbage'), {
+    ok: false,
+    reason: 'focus-refused',
+  });
+});
+
+test('focusWindowScript: only an integer pid is ever interpolated', () => {
+  for (const bad of ['4242; calc.exe', 4242.5, -1, 0, null, undefined, '4242']) {
+    assert.throws(() => focusWindowScript(bad), TypeError, String(bad));
+  }
+  assert.match(focusWindowScript(4242), /\$id = 4242\b/);
+});
+
+test('focusWindowScript: acquires foreground rights and CONFIRMS the raise', () => {
+  // Both steps are load-bearing, and both were missing. A detached daemon has no
+  // foreground rights, so SetForegroundWindow alone silently does nothing (measured:
+  // returns false, window stays back) — the synthetic VK_LMENU tap is what grants them.
+  // And the answer must come from GetForegroundWindow, not from a return value, or the
+  // endpoint reports ok for a raise that never happened. Asserted here because a
+  // "simplification" that drops either one restores a bug that looks like a dead button.
+  const script = focusWindowScript(4242);
+  assert.match(script, /keybd_event\(0xA4, 0, 0/);
+  assert.match(script, /keybd_event\(0xA4, 0, 2/);
+  assert.match(script, /GetForegroundWindow\(\) -eq \[int64\]\$h/);
+});
+
 // --- resolveFocusTarget / focusTarget (platform routing) ---------------------
 
 test('resolveFocusTarget: a bogus pid resolves to null on every platform', async () => {
@@ -147,6 +197,92 @@ test('focusTarget: a target of no known shape is refused', async () => {
     assert.strictEqual(r.ok, false, String(bad));
     assert.strictEqual(r.reason, 'invalid-target', String(bad));
   }
+});
+
+// --- matchTerminalWindow / parseWindowList (title -> terminal window) --------
+
+const WINDOWS = [
+  { pid: 32152, image: 'Tabby.exe', class: 'Chrome_WidgetWin_1', title: '✳ scrape naics data' },
+  { pid: 40016, image: 'cmd.exe', class: 'ConsoleWindowClass', title: 'COCKPIT_TEST' },
+  { pid: 36624, image: 'chrome.exe', class: 'Chrome_WidgetWin_1', title: '✳ scrape naics data' },
+];
+
+test('matchTerminalWindow: a uniquely titled terminal window matches, glyph notwithstanding', () => {
+  const m = matchTerminalWindow(WINDOWS, '⠂ Scrape NAICS data');
+  assert.strictEqual(m.reason, undefined);
+  assert.strictEqual(m.win.pid, 32152);
+});
+
+test('matchTerminalWindow: a non-terminal window with the same title is NEVER the match', () => {
+  // The whole reason the image allowlist exists: Tabby's window class is
+  // Chrome_WidgetWin_1, identical to Chrome's, so class cannot tell them apart. A browser
+  // tab named after the session must not be raised as if it were the terminal — and must
+  // not make the real terminal look ambiguous either, which is why it is filtered first.
+  const m = matchTerminalWindow(WINDOWS, '✳ scrape naics data');
+  assert.strictEqual(m.reason, undefined);
+  assert.strictEqual(m.win.image, 'Tabby.exe');
+
+  const onlyBrowser = [WINDOWS[2]];
+  assert.strictEqual(matchTerminalWindow(onlyBrowser, '✳ scrape naics data').reason, 'no-window');
+});
+
+test('matchTerminalWindow: two terminals with one title REFUSE rather than guess', () => {
+  const twins = [
+    { pid: 1, image: 'Tabby.exe', class: 'Chrome_WidgetWin_1', title: '✳ Claude Code' },
+    { pid: 2, image: 'cmd.exe', class: 'ConsoleWindowClass', title: '✳ Claude Code' },
+  ];
+  const m = matchTerminalWindow(twins, '✳ Claude Code');
+  assert.strictEqual(m.reason, 'ambiguous-window');
+  assert.strictEqual(m.count, 2);
+  assert.strictEqual(m.win, undefined);
+});
+
+test('matchTerminalWindow: the image test is case-insensitive', () => {
+  // Get-Process reports ProcessName with the OS's casing, which varies by image.
+  const win = [{ pid: 9, image: 'TABBY.EXE', class: 'X', title: 'work' }];
+  assert.strictEqual(matchTerminalWindow(win, 'work').win.pid, 9);
+});
+
+test('matchTerminalWindow: an empty title reports no-title, never a match', () => {
+  for (const bad of ['', '   ', null, undefined]) {
+    assert.strictEqual(matchTerminalWindow(WINDOWS, bad).reason, 'no-title');
+  }
+});
+
+test('matchTerminalWindow: a non-array window list is tolerated', () => {
+  assert.strictEqual(matchTerminalWindow(null, 'work').reason, 'no-window');
+  assert.strictEqual(matchTerminalWindow(undefined, 'work').reason, 'no-window');
+});
+
+test('parseWindowList: reads the enumeration JSON', () => {
+  const out = parseWindowList('[{"pid":32152,"image":"Tabby.exe","class":"Chrome_WidgetWin_1","title":"x"}]');
+  assert.deepStrictEqual(out, [
+    { pid: 32152, image: 'Tabby.exe', class: 'Chrome_WidgetWin_1', title: 'x' },
+  ]);
+});
+
+test('parseWindowList: a lone object (PowerShell drops the array) still reads as one window', () => {
+  assert.strictEqual(parseWindowList('{"pid":7,"image":"cmd.exe","class":"c","title":"t"}').length, 1);
+});
+
+test('parseWindowList: malformed entries are dropped, not thrown on', () => {
+  const out = parseWindowList('[{"pid":0},{"pid":-1},{"pid":"x"},null,7,{"pid":5}]');
+  assert.deepStrictEqual(out, [{ pid: 5, image: '', class: '', title: '' }]);
+});
+
+test('parseWindowList: unparseable or empty output is an empty list', () => {
+  for (const bad of ['', '   ', 'not json', null, undefined]) {
+    assert.deepStrictEqual(parseWindowList(bad), []);
+  }
+});
+
+test('TERMINAL_IMAGES: browsers and editors are not on the allowlist', () => {
+  // A regression guard on the rule, not the list: adding a general-purpose app here would
+  // let any window titled like the session be raised as the terminal.
+  for (const img of ['chrome.exe', 'msedge.exe', 'firefox.exe', 'code.exe', 'explorer.exe']) {
+    assert.ok(!TERMINAL_IMAGES.has(img), img);
+  }
+  assert.ok(TERMINAL_IMAGES.has('tabby.exe'));
 });
 
 test('focusTarget: routes on the target SHAPE, not the running platform', async () => {

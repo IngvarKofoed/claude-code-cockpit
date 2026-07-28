@@ -1013,14 +1013,84 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
 120. New Live sort "Context % (fullest first)" (v0.40.0), per-browser like the other two.
      Sessions with no reading sink BELOW every session that has one instead of sorting as 0% —
      unknown is not empty, the same rule the rest of the accounting follows.
+121. The owner probe's ceiling is 2500ms, up from 1200 (v0.41.0). `wmic` costs ~200ms on the machine
+     entry 107 measured but 1057–1243ms on a ~550-process Windows 11 box, so the old ceiling was a
+     coin flip there: 2 of 6 SessionStarts recorded a pid. The cost of a miss is bigger than entry
+     101's reaper, because entry 110 made focus-target resolution WAIT on the verified pid — so a
+     timed-out probe also means no `pid:` target, i.e. no Focus button, for the whole session.
 
-121. Opus 5 now prices out of the box (v0.41.0) at the Opus 4.5+ tier ($5/$25, cacheRead 0.5 / cacheWrite 6.25).
+122. A CLASSIC console window now actually focuses (v0.41.0) — cmd.exe/powershell.exe under conhost,
+     i.e. any machine whose default terminal is the Console Host rather than WT. Resolution already
+     worked: the console window belongs to the console CLIENT, a plain ancestor reporting a real
+     MainWindowHandle, while only its conhost.exe child reports 0. The RAISE was broken — a detached
+     daemon has no foreground rights. Entry 102 was right about the walk, wrong about the raise.
+
+123. That raise now synthesises a VK_LMENU tap first (v0.41.0): after an input event Windows grants
+     this process foreground rights and the next `SetForegroundWindow` succeeds. Measured cold, the
+     alternatives ALL fail — plain SetForegroundWindow, `SwitchToThisWindow`, and `AttachThreadInput`
+     to the foreground thread (attach succeeds, the raise still doesn't). Accepted cost: the tap
+     lands on whatever is in front, where a lone ALT can pop a menu bar. Do not "simplify" it away.
+
+124. The window raise is CONFIRMED against `GetForegroundWindow`, not a return value (v0.41.0) —
+     in the spirit of entry 106, which confirms only the tab SELECTION. It previously reported `ok` from
+     `SetForegroundWindow`'s boolean, which is exactly the call that lies here, so a click that
+     raised nothing still toasted success. `no-window` (no ancestor owns one — every ConPTY client
+     reports MainWindowHandle = 0) stays distinct from `focus-refused` (it exists, Windows declined).
+
+125. The config tests derive their fixture path from `paths.configPath()` instead of hand-building
+     the POSIX XDG layout (v0.41.0), so they exercise the real file on Windows too, where
+     `configDir()` reads APPDATA. One test was merely RED there. The malformed-json one was worse:
+     it passed VACUOUSLY, asserting the defaults a MISSING file already returns, so the never-throws
+     branch it exists to cover had never run on Windows. Confirmed by mutation; an existsSync pins it.
+
+126. Tabby closes every join key the other Windows paths use (v0.41.0), measured: UIA exposes ONE
+     Pane (no Chromium a11y tree, so no TabItem to select), and the process ancestry is SEVERED — the
+     npm `claude` shim runs via an `sh.exe` whose parent has already exited, so 4/4 live sessions walk
+     to a dead pid and Tabby.exe is never an ancestor. Do not re-attempt UIA or traversal for it.
+
+127. New LAST-RESORT Windows target: the pid of a visible terminal WINDOW whose title is the
+     session's (v0.41.0). Reached only after the WT tab path misses AND the ancestor walk has no
+     target, so a WT user pays nothing. It resolves to an ordinary `pid:` target — one new resolution
+     step, not a fourth target shape, so the confirmed raise and its tests are the proven ones.
+     Not latched: the title arrives late, and in a multi-tab terminal only while that tab is active.
+
+128. That match is gated on a terminal-image ALLOWLIST, never window class (v0.41.0) — Tabby's class
+     is `Chrome_WidgetWin_1`, identical to Chrome's, so class cannot vouch for a terminal and a
+     browser tab named after the session would have been raised as one. Non-terminals are filtered
+     BEFORE the ambiguity count, so a browser can neither win nor block a real match. An unlisted
+     terminal gets no button — add to the list rather than loosening the rule.
+
+129. Known limits of that target, both deliberate. It is WINDOW-level, so a session in a BACKGROUND
+     tab emits no signal at all (no window title, no UIA node) and stays unfocusable — the pre-UIA
+     Windows Terminal situation, honest but not tab-exact. And Tabby needs `disableDynamicTitle:
+     false` in its profile: with the default `true` the shell title never reaches the tab or the
+     window, so there is nothing to match and the button correctly stays hidden.
+
+130. A `pid:` target that reports `no-window` is now RETIRED on the spot (v0.41.0), so the next sweep
+     re-derives one instead of leaving a visible button that can only ever fail. Needed by entry 127:
+     an ancestor pid outlives the session by construction, but a TITLE-derived one names a window that
+     can close while the session lives — or that a title collision never owned. Found by killing a
+     matched window and watching the card keep its button across a daemon restart.
+
+131. Retiring a spent `pid:` target now RELEASES the resolve-once latch too (v0.41.0, review fix).
+     Entry 130 nulled the target but left `focusAttempted` set, and nothing else can re-derive an
+     ancestor-derived one — a VS Code host is deliberately off TERMINAL_IMAGES, so the title
+     fallback cannot rescue it. One transient no-window click therefore made a session permanently
+     buttonless: entry 110's bug shape, reintroduced. Re-arms per failed CLICK, never per event.
+
+132. Correction to entry 124 and the architecture doc: the WT tab path confirms its tab SELECTION,
+     not that the window came forward — it still reports ok from `` alone. Only the `pid:`
+     raise is GetForegroundWindow-confirmed. The WT path is verified working in practice (its UIA
+     Select() brings WT along) so it is left as is, but must not be described as raise-confirmed.
+
+
+133. Opus 5 now prices out of the box (v0.41.0) at the Opus 4.5+ tier ($5/$25, cacheRead 0.5 / cacheWrite 6.25).
      It was unpriced, so every Opus 5 turn rendered "—" and its cost was silently dropped from
      totals (`estimateCost().total` sums only priced models) — $989 of real spend in this store.
      Known limit: fast mode bills $10/$50 but carries the same model id, so it under-estimates.
 
 
-122. Rates resolve through a base-model fallback, so a context-window variant id
+134. Rates resolve through a base-model fallback, so a context-window variant id
      (`claude-opus-5[1m]`) prices at its base rate instead of reading as unpriced. Safe because
      Opus 4.7+/Sonnet 5 ship 1M context with no long-context premium; an explicit variant entry
      still wins, leaving room for a future premium variant. Also fixes `claude-opus-4-8[1m]`.
@@ -1028,53 +1098,54 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      variant as priced yet add $0, breaking its Σ-classes === day-total invariant.
 
 
-123. CONFIG_VERSION 2 adds a rate key that first shipped as a v2 default to a persisted `rates`
+135. CONFIG_VERSION 2 adds a rate key that first shipped as a v2 default to a persisted `rates`
      map. A saved map REPLACES the defaults (entry 5), so anyone who had touched Settings would
      price Opus 5 as "—" forever. Re-adding is safe only for never-before-shipped keys: their
      absence can't be a deliberate Settings removal, which is why the v0→v1 step still never
      re-adds a missing key. An existing entry, at any value, is left untouched.
 
 
-124. Cache writes are now tracked and priced by TTL: `cacheWrite` (5-minute, 1.25x input) and a
+136. Cache writes are now tracked and priced by TTL: `cacheWrite` (5-minute, 1.25x input) and a
      new `cacheWrite1h` (1-hour, 2x input) fifth token class, split at the source from the
      transcript's `cache_creation.ephemeral_{5m,1h}_input_tokens`. Claude Code writes ~41% of
      its cache at 1h, so one blended rate understated cost badly — measured $2,153 on Opus 4.8
      alone. `cache_creation_input_tokens` stays authoritative for the sum (5m is its remainder).
 
 
-125. `cacheWrite1h` is OPTIONAL in a rate and falls back to `cacheWrite` (`pricing.RATE_FALLBACK`).
+137. `cacheWrite1h` is OPTIONAL in a rate and falls back to `cacheWrite` (`pricing.RATE_FALLBACK`).
      This is load-bearing, not politeness: adding it to the REQUIRED classes would fail
      `isCompleteRate` for every rates map saved before it existed and render the whole dashboard
      unpriced. Absent means "price 1h at the 5m rate" — the old behavior — never $0, which would
      make 1-hour cache writes free. `validateRate` omits the key rather than defaulting it to 0.
 
 
-126. CONFIG_VERSION 3 fills in `cacheWrite1h` only on a persisted rate whose four required
+138. CONFIG_VERSION 3 fills in `cacheWrite1h` only on a persisted rate whose four required
      classes still equal the shipped default — an entry the user never edited. A CUSTOMIZED rate
      is deliberately left alone so its own `cacheWrite` keeps governing both TTLs via the
      fallback, which is what that number meant when it was saved; injecting 2x-input there would
      silently re-price a deliberate choice.
 
 
-127. Settings' rate editor gained a "Cache write 1h" column (and relabelled the other to
+139. Settings' rate editor gained a "Cache write 1h" column (and relabelled the other to
      "Cache write 5m"). Not cosmetic: the save path rebuilds `rates` from that table, so without
      the column every save would silently strip the 1h rate back to 5m pricing. A BLANK cell is
      meaningful and round-trips as an absent key (the fallback), never as 0.
 
 
-128. Pricing gained the rest of the current table — Mythos 5, plus the deprecated/retired Opus
+140. Pricing gained the rest of the current table — Mythos 5, plus the deprecated/retired Opus
      4.1/4.0, Sonnet 4 and Haiku 3.5 tiers so a backfilled old transcript prices instead of "—".
      `baseModelId` also strips a dated snapshot suffix (`claude-haiku-4-5-20251001`), a pricing
      identity since a snapshot always bills at its alias's rate; that alone recovered $85.
      Sonnet 5 deliberately STAYS at the post-intro $3/$15 (entry 22), so it over-states by 50%
      until the intro rate lapses 2026-08-31 — a known, accepted gap, not an oversight.
 
-129. Released v0.41.0, carrying entries 121–128. The bump is load-bearing per entry 103:
-     `ensure.js` replaces a running daemon only when `/health` reports a DIFFERENT version — and
-     0.40.0 was already taken by the context-window gauge (entries 118–120), so reusing it would
-     have left every daemon already on 0.40.0 running the old, unpriced code.
+141. Tagged the pricing work (entries 133–140) v0.41.0 locally, per entry 103's rule that only a
+     version change replaces a running daemon. That tag COLLIDED: the Windows-focus work
+     (entries 121–132) reached origin as v0.41.0 first, so the two never shared a release.
+     Pricing only ever reaches anyone as v0.42.0 (entry 145), which is the first version
+     carrying both. The `(v0.41.0)` tags on 133–140 record their commit, not what shipped.
 
-130. Reclaimed 18px above the Live card grid (measured 192→174px from the topbar border to the
+142. Reclaimed 18px above the Live card grid (measured 192→174px from the topbar border to the
      first card) by trimming only VERTICAL chrome: `.main` top padding, `.tile` and `.usage-bar`
      block padding, and the usage bar's head/foot margins. No font size, track, or horizontal
      padding changed — tile width is already fully spent on the widest value (a 3-figure cost).
@@ -1082,20 +1153,26 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      viewport width (8 tiles, `minmax(150px,1fr)` → 7 columns), which is by far the bigger win
      there — but it needs the tile narrower than its widest value, so it was left alone.
 
-131. The usage colour ramp's amber line moved 50% → 65% (red stays 80): the warning band is now
+143. The usage colour ramp's amber line moved 50% → 65% (red stays 80): the warning band is now
      the last third of a window rather than half of it. Governs all three meters at once — the
      5h bar, the weekly bar, and the per-card context gauge (`web/app.js:usageColor`) — plus the
      statusline's own `threshColor`, which duplicates the ramp and must be kept in step.
 
-132. New per-browser toggle "Show context gauge" (Settings > Dashboard, under Show folder path,
+144. New per-browser toggle "Show context gauge" (Settings > Dashboard, under Show folder path,
      default on) hides the Live card's context meter — worth 23px of card height, the biggest
      single lever there. Rides the existing `cockpit.liveShow` pref and its generic
      `set-show-*` handler, so it needs no new plumbing and never PUTs config. The "Context %"
      live sort is untouched by it: the reading still arrives and still orders the grid.
 
-133. Released v0.42.0, carrying entries 130–132. The bump is load-bearing per entry 103: the
-     plugin cache is keyed by version and `ensure.js` only replaces a running daemon when
-     `/health` reports a DIFFERENT one, so the dashboard assets stay stale without it.
+145. Released v0.42.0, carrying entries 142–144 AND the pricing work (133–140) that the v0.41.0
+     collision (entry 141) left unreleased. The bump is load-bearing per entry 103: the plugin
+     cache is keyed by version and `ensure.js` only replaces a running daemon when `/health`
+     reports a DIFFERENT one, so a box already on 0.41.0 would keep serving stale assets.
      The statusline is the exception — its 65% ramp needs the installed `statusLine.command`
      re-pointed at the new plugin dir (entry 43), not just a daemon restart.
 
+146. Changelog numbers 121–132 were double-booked once, by two branches that each numbered from
+     121 off a shared base (pricing locally, Windows focus via PR #4). Resolved at the merge by
+     renumbering the UNPUSHED side up (+12 → 133–145) and leaving the pushed numbers alone.
+     That is the rule for any future collision: whichever side is already on origin keeps its
+     numbers, since other entries and PR history already reference them.
