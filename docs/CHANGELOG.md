@@ -1074,3 +1074,28 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      0.40.0 was already taken by the context-window gauge (entries 118–120), so reusing it would
      have left every daemon already on 0.40.0 running the old, unpriced code.
 
+130. Reclaimed 18px above the Live card grid (measured 192→174px from the topbar border to the
+     first card) by trimming only VERTICAL chrome: `.main` top padding, `.tile` and `.usage-bar`
+     block padding, and the usage bar's head/foot margins. No font size, track, or horizontal
+     padding changed — tile width is already fully spent on the widest value (a 3-figure cost).
+     Deliberately NOT taken: the ribbon's tile grid wraps to a second 85px row below ~1315px
+     viewport width (8 tiles, `minmax(150px,1fr)` → 7 columns), which is by far the bigger win
+     there — but it needs the tile narrower than its widest value, so it was left alone.
+
+131. The usage colour ramp's amber line moved 50% → 65% (red stays 80): the warning band is now
+     the last third of a window rather than half of it. Governs all three meters at once — the
+     5h bar, the weekly bar, and the per-card context gauge (`web/app.js:usageColor`) — plus the
+     statusline's own `threshColor`, which duplicates the ramp and must be kept in step.
+
+132. New per-browser toggle "Show context gauge" (Settings > Dashboard, under Show folder path,
+     default on) hides the Live card's context meter — worth 23px of card height, the biggest
+     single lever there. Rides the existing `cockpit.liveShow` pref and its generic
+     `set-show-*` handler, so it needs no new plumbing and never PUTs config. The "Context %"
+     live sort is untouched by it: the reading still arrives and still orders the grid.
+
+133. Released v0.42.0, carrying entries 130–132. The bump is load-bearing per entry 103: the
+     plugin cache is keyed by version and `ensure.js` only replaces a running daemon when
+     `/health` reports a DIFFERENT one, so the dashboard assets stay stale without it.
+     The statusline is the exception — its 65% ramp needs the installed `statusLine.command`
+     re-pointed at the new plugin dir (entry 43), not just a daemon restart.
+

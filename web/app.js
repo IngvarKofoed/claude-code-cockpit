@@ -19,7 +19,7 @@ const App = {
   histBuilt: false, // History view scaffolding (family cards + pivot toolbar) built once
   liveSort: "status", // "status" (server waiting-first) | "name" (alpha) | "context" (fullest first); set from localStorage in init
   theme: "dark", // "dark" (default) | "light"; per-browser localStorage pref, set in init
-  liveShow: { title: true, branch: true, path: true }, // which Live-card location lines to show; per-browser localStorage pref, set in init
+  liveShow: { title: true, branch: true, path: true, ctx: true }, // which optional Live-card rows to show (3 location lines + the context gauge); per-browser localStorage pref, set in init
   repoRows: [], // normalized rows currently shown in the per-repo table
   repoSort: { key: "activeMs", dir: -1 }, // dir: 1 asc, -1 desc
   sessionsPage: 0, // current 0-based page of the Sessions view
@@ -494,7 +494,13 @@ function chip(text, mono) {
 // hasn't pushed yet), so a session without one costs no card height rather than showing an
 // empty track. A reading older than USAGE_STALE_MS dims: the session stopped reporting, so
 // the fill is frozen at whatever it last was rather than current.
+//
+// Also omitted when the per-browser App.liveShow.ctx toggle is off (Settings > Dashboard) —
+// the row is the card's tallest optional element, so hiding it is the biggest single lever on
+// card height. The "Context %" live sort is deliberately NOT affected: the reading still
+// arrives and still orders the grid, this only stops drawing it.
 function contextGaugeHTML(s) {
+  if (!App.liveShow.ctx) return "";
   const c = s.context;
   if (!c || typeof c.usedPct !== "number") return "";
   const pct = Math.max(0, Math.min(100, c.usedPct));
@@ -786,9 +792,12 @@ function elapsedFrac(resetsAt, windowMs, now) {
   return clamp01((now - (resetsAt - windowMs)) / windowMs);
 }
 
-// Fill colour by the statusline convention: green < 50, amber < 80, red >= 80.
+// Fill colour by the statusline convention: green < 65, amber < 80, red >= 80. The amber line
+// sits at 65 (not the midpoint) so the warning band is the last third of the window rather than
+// half of it — at 50% of a 5h window or a context you are usually still fine.
+// statusline/statusline-render.js:threshColor implements the same ramp; keep the two in step.
 function usageColor(pct) {
-  return pct >= 80 ? "var(--st-error)" : pct >= 50 ? "var(--st-waiting)" : "var(--st-running)";
+  return pct >= 80 ? "var(--st-error)" : pct >= 65 ? "var(--st-waiting)" : "var(--st-running)";
 }
 
 // The active config's pace mode, defaulting unknown/missing to "both".
@@ -2291,6 +2300,11 @@ function settingsHTML(cfg) {
       fieldRow("Show branch", "Git branch line on each live card (this browser only)", sw("set-show-branch", App.liveShow.branch)) +
       fieldRow("Show folder path", "Working-directory path line on each live card (this browser only)", sw("set-show-path", App.liveShow.path)) +
       fieldRow(
+        "Show context gauge",
+        "Context-window meter on each live card (this browser only)",
+        sw("set-show-ctx", App.liveShow.ctx)
+      ) +
+      fieldRow(
         "Live view sort",
         "Order the live session cards (this browser only)",
         `<select class="select" id="set-liveSort">
@@ -2679,14 +2693,20 @@ function init() {
   App.theme = th === "light" ? "light" : "dark";
   applyTheme(); // reconcile the <html> attribute with App.theme (the head bootstrap may have set it)
 
-  // Per-browser Live-card line visibility (session name / branch / folder path). Any key
-  // omitted or non-false stays visible, so a partial/older stored object still defaults on.
+  // Per-browser Live-card row visibility (session name / branch / folder path / context gauge).
+  // Any key omitted or non-false stays visible, so a partial/older stored object still defaults
+  // on — which is what carries the ctx gauge's default-on to a browser whose pref predates it.
   // The JSON.parse keeps its own guard so a malformed stored value falls back to all-on.
   try {
     const raw = loadPref("cockpit.liveShow");
     if (raw) {
       const v = JSON.parse(raw) || {};
-      App.liveShow = { title: v.title !== false, branch: v.branch !== false, path: v.path !== false };
+      App.liveShow = {
+        title: v.title !== false,
+        branch: v.branch !== false,
+        path: v.path !== false,
+        ctx: v.ctx !== false,
+      };
     }
   } catch (_e) {
     /* malformed stored value — keep all lines shown */

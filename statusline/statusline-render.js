@@ -72,10 +72,11 @@ const C = {
   white: "\x1b[97m", brightYellow: "\x1b[93m", pink: "\x1b[95m", brightBlue: "\x1b[94m",
 };
 
-// green < 50% < yellow < 80% <= red; gray when unknown.
+// green < 65% <= yellow < 80% <= red; gray when unknown.
+// The dashboard's web/app.js:usageColor implements the same ramp — keep the two in step.
 function threshColor(pct) {
   if (pct == null) return C.gray;
-  if (pct < 50) return C.green;
+  if (pct < 65) return C.green;
   if (pct < 80) return C.yellow;
   return C.red;
 }

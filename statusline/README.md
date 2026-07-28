@@ -20,8 +20,9 @@ A single colored line, segments separated by ` · `:
 | ctx-bar | threshold | Context-window used %, as a bar + label |
 | 5h-bar | threshold | 5-hour rate-limit used %, as a bar + label, with reset time (`↻`) |
 
-Bar/label colour follows the usual convention: green below 50%, amber below 80%,
+Bar/label colour follows the usual convention: green below 65%, amber below 80%,
 red at 80% or more; gray when the value is unknown (shown as `—`, never a wrong 0).
+The dashboard's usage bars and context gauge use the same ramp.
 
 The 5h bar only appears for Claude.ai (Pro/Max) subscribers, and only after the
 first API response of a session — API-key users won't see it (and nothing is

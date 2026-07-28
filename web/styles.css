@@ -250,7 +250,11 @@ body {
 
 .main {
   flex: 1;
-  padding: 12px 22px 22px;
+  /* Top padding is deliberately tighter than the bottom: it is the gap between the sticky
+     topbar's border and the first content row, and on a laptop it competes with the Live
+     grid for above-the-fold height. Part of the ~18px reclaimed for the Live view (see the
+     .tile / .usage-bar padding notes) — chrome only, no content was shrunk. */
+  padding: 8px 22px 22px;
   max-width: 1400px;
   width: 100%;
   margin: 0 auto;
@@ -281,11 +285,15 @@ body {
   gap: 10px;
   margin-bottom: 14px;
 }
+/* Vertical padding is trimmed (8, not the 11 the horizontal pairing would suggest): the ribbon
+   sits directly above the Live card grid, so every px of tile height costs a px of grid. The
+   horizontal 16 is unchanged — it sets the tile's WIDTH budget, and the widest value (a 3-digit
+   cost) already needs all of it. */
 .tile {
   background: var(--surface-1);
   border: 1px solid var(--border);
   border-radius: var(--r);
-  padding: 11px 16px;
+  padding: 8px 16px;
 }
 .tile__label {
   font-size: 11px;
@@ -337,11 +345,13 @@ body {
   font-size: 13px;
 }
 
+/* Vertical padding + the head/foot margins below are trimmed for the same reason as .tile: this
+   is the ribbon's last row before the card grid. The track, %, and foot text are untouched. */
 .usage-bar {
   background: var(--surface-1);
   border: 1px solid var(--border);
   border-radius: var(--r);
-  padding: 10px 14px;
+  padding: 8px 14px;
 }
 /* Expired / absent windows are dimmed (they carry no live fill). A `stale` bar is NOT dimmed —
    it keeps its fill + a live-drifting pace cue, and the "updated Xm ago" note flags it as old. */
@@ -353,7 +363,7 @@ body {
   align-items: baseline;
   justify-content: space-between;
   gap: 10px;
-  margin-bottom: 6px;
+  margin-bottom: 4px;
 }
 .usage-bar__label {
   font-size: 11px;
@@ -403,7 +413,7 @@ body {
   flex-wrap: wrap;
   gap: 4px 8px;
   min-height: 14px;
-  margin-top: 6px;
+  margin-top: 4px;
   font-size: 12px;
   color: var(--ink-muted);
 }
