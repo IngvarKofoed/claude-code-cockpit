@@ -1076,14 +1076,24 @@ function tickUsage(now) {
 
 // The active subscription rendered as a leading ribbon TILE (matching the stat tiles) — it
 // identifies whose account the row's totals belong to (server-derived, `App.state.subscription =
-// { id, label } | null`). Returns "" when null — no live session has a known subscription
-// (API-key / pre-feature) — so the tile just doesn't appear rather than showing a blank. The
-// tooltip carries this subscription's ALL-TIME tokens/cost (`App.state.subscriptionTotals[sub.id]`,
+// { id, label } | null`). The tile is ALWAYS rendered so the ribbon's leading column never
+// shifts: with no known subscription (API-key / pre-feature session, or no live session at all)
+// it reads "—" like any other unavailable value, with the reason in its tooltip. The tooltip
+// otherwise carries this subscription's ALL-TIME tokens/cost (`App.state.subscriptionTotals[sub.id]`,
 // a range-free total distinct from the History chart's range-scoped breakdown), falling back to the
 // plain description before totals are available. Its value is a name, not a stat.
 function subscriptionTileHTML() {
   const sub = App.state && App.state.subscription;
-  if (!sub || !sub.label) return "";
+  if (!sub || !sub.label) {
+    const title =
+      "Active subscription — no live session reports one (an API-key session, or one started before subscription capture)";
+    return (
+      `<div class="tile tile--sub" title="${esc(title)}">` +
+      `<div class="tile__label">Subscription</div>` +
+      `<div class="tile__value">—</div>` +
+      `</div>`
+    );
+  }
   const totals = App.state && App.state.subscriptionTotals && App.state.subscriptionTotals[sub.id];
   let title = "Active subscription — the newest live session's account";
   if (totals) {
@@ -1129,13 +1139,11 @@ function renderLiveRibbon() {
       hasCost = true;
     }
   }
-  // Lead with the active-subscription tile (identity for the row's totals; omitted when no live
-  // session has a known subscription), then the accounting tiles in the canonical order:
+  // Lead with the active-subscription tile (identity for the row's totals; always present, "—"
+  // when unknown), then the accounting tiles in the canonical order:
   // Tokens | Cost | Sessions | Chats | Tools | Agents | Active time. Cost sits after Tokens and
   // drops out (leaving the rest in order) when disabled.
-  const tiles = [];
-  const subTile = subscriptionTileHTML();
-  if (subTile) tiles.push(subTile);
+  const tiles = [subscriptionTileHTML()];
   tiles.push(tile("Tokens", fmtTokens(tok)));
   if (costEnabled()) tiles.push(tile("Cost", hasCost ? fmtCost(cost) : "—"));
   tiles.push(tile("Sessions", sessionsToday));
@@ -2097,27 +2105,26 @@ function drawHistory(h) {
     const ids = Object.keys(bySub)
       .filter((id) => sumTokens(bySub[id].tokens) > 0)
       .sort((a, b) => num(bySub[b].cost) - num(bySub[a].cost));
-    // Show this card only when the range has MULTIPLE subscriptions with activity — with one,
-    // its single line just restates "Tokens & cost per day". When cost display is ON also require
-    // at least one nonzero cost: an all-unpriced range has no cost signal, so HIDE it rather than
-    // render an empty "no history" chart on a visible card. When cost is OFF still show the card as
-    // the standard cost-off placeholder (like the sibling cost charts). Re-evaluated each draw, so
-    // switching range reveals/hides it. Toggling display (not an early return from drawHistory)
-    // keeps this block self-contained and robust to any chart added after it.
-    const hasCost = ids.some((id) => num(bySub[id].cost) > 0);
-    const show = ids.length >= 2 && (!costOn || hasCost);
-    const card = $("hc-sub-usage").closest(".card");
-    if (card) card.style.display = show ? "" : "none";
-    if (show && !costOn) {
+    // This card is ALWAYS shown — including with a single subscription, whose line restates
+    // "Tokens & cost per day" (the card was previously hidden below 2 subscriptions for exactly
+    // that reason; showing it is the deliberate choice). Because it can no longer hide, its empty
+    // state has to distinguish the two kinds of empty: no subscription activity at all, versus real
+    // activity whose models have no configured rate. lineChart treats an all-zero series as empty,
+    // so an unpriced range lands there — and "no history yet" would be plainly wrong for it.
+    const empty =
+      ids.length === 0
+        ? "No subscription history yet."
+        : "No cost recorded — the models these subscriptions used have no configured rate.";
+    if (!costOn) {
       lineChart($("hc-sub-usage"), [], { height: 360, empty: COST_OFF });
-    } else if (show) {
+    } else {
       const PAL = ["var(--series-1)", "var(--series-2)", "var(--series-3)", "var(--series-4)", "var(--series-5)", "var(--series-6)"];
       // Keep the top (PAL.length − 1) named and fold the rest into "Other"; if they all fit, keep all.
       const named = ids.length > PAL.length ? ids.slice(0, PAL.length - 1) : ids;
       const rest = ids.slice(named.length);
-      // A subscription with token activity but no configured rate has cost 0; since some other
-      // shown subscription has cost (the `hasCost` gate above), it isn't dropped — it plots as a
-      // flat $0 line rather than vanishing.
+      // A subscription with token activity but no configured rate has cost 0; as long as some
+      // other shown subscription has cost it isn't dropped — it plots as a flat $0 line rather
+      // than vanishing. (If NO subscription has cost, the whole chart falls to `empty` above.)
       const pt = (d, id) => {
         const rec = (d.bySubscription || {})[id];
         return { label: d.date, short: dayShort(d.date), value: rec ? num(rec.cost) : 0, value2: rec ? sumTokens(rec.tokens) : 0 };
@@ -2147,7 +2154,7 @@ function drawHistory(h) {
           ),
         });
       }
-      lineChart($("hc-sub-usage"), series, { height: 360, sharedScale: true, empty: "No subscription history yet." });
+      lineChart($("hc-sub-usage"), series, { height: 360, sharedScale: true, empty });
     }
   }
 }

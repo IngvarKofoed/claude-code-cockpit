@@ -1990,8 +1990,8 @@ function buildHistory(rangeRaw) {
       byRepo,
       byTool,
       byAgentType,
-      // bySubscription is added below in a second pass, but ONLY for the 2+-subscription
-      // case that actually renders it (see after the range aggregate).
+      // bySubscription is added below in a second pass, whenever cost display is on
+      // (see after the range aggregate).
     });
   }
 
@@ -2039,13 +2039,13 @@ function buildHistory(rangeRaw) {
   // time like every other subscription payload; range-scoped (distinct from state's all-time).
   const bySubscription = priceSubscriptionMap(mergeBySubscription(repoAgg));
 
-  // The per-day per-subscription split feeds ONLY the "Cost per subscription" chart, which the
-  // client shows for 2+ subscriptions with cost display on. So compute/serialize it per day only
-  // then — the common single-subscription (or cost-off) case skips the per-day merge+price and
-  // omits the field entirely (the client reads `(d.bySubscription || {})`). getRollup is memoized,
-  // so this second pass over the range re-derives nothing. The count comes off the range aggregate
-  // just built (its keys are the subscriptions with activity, null-sub already excluded).
-  if (cfg.cost.enabled && Object.keys(bySubscription).length >= 2) {
+  // The per-day per-subscription split feeds ONLY the "Cost per subscription" chart, so it is
+  // computed just for the case that renders it: cost display on. It is emitted for ANY number of
+  // subscriptions — the chart is always shown now, and a ≥2 gate here (mirroring the client's old
+  // one) left a single-subscription range with no per-day data at all, so the visible card fell to
+  // its all-zero empty state while the range aggregate plainly had cost. getRollup is memoized, so
+  // this second pass over the range re-derives nothing beyond one merge+price per day.
+  if (cfg.cost.enabled) {
     for (const d of perDay) {
       const r = getRollup(d.date);
       d.bySubscription = priceSubscriptionMap(mergeBySubscription(r && r.repos ? r.repos : {}));

@@ -976,3 +976,21 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      `node.exe` would cover it but risks verifying an unrelated node process as the host — and a WRONG
      verified pid reaps a LIVE session, strictly worse than the pre-probe behaviour. Closing it properly
      needs the ancestor's command line to confirm.
+
+115. The Live ribbon's Subscription tile is now ALWAYS rendered (v0.39.0), reading "—" with the
+     reason in its tooltip when no live session reports one (API-key / pre-feature session, or no
+     live session at all). Reverses entry 73's omit-when-unknown: the tile vanishing shifted the
+     ribbon's whole leading column, and "—" is how every other unavailable value already reads.
+
+116. The History "Cost per subscription" card is now ALWAYS shown (v0.39.0), reversing entry 72's
+     hide-below-2-subscriptions — a single subscription's line restating the chart above it is
+     accepted as the price of a stable view. Since it can no longer hide, its empty state
+     distinguishes the two empties: no activity at all vs. real activity on unpriced models
+     ("no rate configured"), because lineChart treats an all-zero-cost series as empty and
+     "no history yet" would be wrong for it.
+
+117. `/api/history` now emits per-day `bySubscription` for ANY number of subscriptions whenever
+     cost display is on (v0.39.0) — it was gated at 2+, mirroring the client gate entry 116 removed.
+     Found by making the card always visible: a single-subscription range (e.g. Today) had no
+     per-day data at all, so the chart fell to its all-zero empty state while the range aggregate
+     plainly had cost. Cost is one memoized merge+price per day in range, so the gate bought little.
