@@ -45,6 +45,10 @@ function newSession(event) {
     // Persists for the session's life — only SessionStart carries it.
     subscription: null,
     ownerPid: null,
+    // Whether ownerPid is the session's DURABLE host process rather than whatever
+    // spawned the last hook. Set by the `OwnerResolved` probe event; see updateMeta
+    // for why a verified pid must never be overwritten by the event stream.
+    ownerPidVerified: false,
     // How to raise this session's terminal window, resolved ONCE by the daemon the first
     // time it sees ownerPid: the controlling terminal on macOS (`/dev/ttys004`) or the
     // window-owning ancestor pid on Windows (`pid:1234`). Both are fixed for the pid's
@@ -52,6 +56,11 @@ function newSession(event) {
     // agent, a Windows service); both read the same to the UI. Daemon-internal: toCard
     // exposes only the derived boolean.
     focusTarget: null,
+    // The Windows Terminal TAB target (`wt:<session title>`), maintained by the daemon
+    // from the live session title rather than resolved once — the title arrives after
+    // SessionStart and changes on /rename. Null off Windows, or until a title exists.
+    // Daemon-internal like focusTarget; toCard folds it into `focusable`.
+    focusTitle: null,
     permissionMode: null,
     effortLevel: null,
     status: 'idle',
@@ -119,7 +128,10 @@ function updateMeta(session, event) {
   // owner_pid rides on EVERY event (emit.js sets process.ppid), so capture it
   // here — not only on SessionStart — so a session first seen via a later event
   // (e.g. after a snapshot loss) still carries a PID the reaper can check.
-  if (event.owner_pid != null) session.ownerPid = event.owner_pid;
+  // A VERIFIED pid (the OwnerResolved probe's claude.exe) outranks the stream and is
+  // never overwritten: on Windows every event's owner_pid is a throwaway per-hook
+  // shell, so letting later events clobber the probe would undo the whole point.
+  if (event.owner_pid != null && !session.ownerPidVerified) session.ownerPid = event.owner_pid;
   if (event.source != null) session.source = event.source;
   // Subscription rides on the SessionStart event only (emit.js embeds it there);
   // capture it whenever present and guarded like the other metadata, so it is
@@ -253,6 +265,22 @@ function applyEvent(state, event) {
       // ownerPid/source are captured in updateMeta (above), which runs first.
       session.status = 'idle';
       if (typeof event.ts === 'string') session.startedAt = event.ts;
+      break;
+
+    case 'OwnerResolved':
+      // The session's DURABLE host pid, resolved out-of-band by the SessionStart probe
+      // (Windows, where every event's own owner_pid is a per-hook shell that dies
+      // microseconds later). Marking it verified is what stops later events overwriting
+      // it and what lets the reaper treat a dead pid as real evidence. Carries no status
+      // meaning.
+      //
+      // The pid is assigned HERE rather than left to updateMeta, which refuses once
+      // verified: a `--resume` reuses the same session_id, so its probe emits a SECOND
+      // OwnerResolved carrying the new claude.exe. Deferring to updateMeta would drop
+      // that and strand the record on the previous run's dead pid — which, now trusted
+      // as evidence, reaps a live session. That is the entry-101 false reap, reintroduced.
+      if (event.owner_pid != null) session.ownerPid = event.owner_pid;
+      session.ownerPidVerified = true;
       break;
 
     case 'UserPromptSubmit': {
@@ -432,12 +460,13 @@ function toCard(s) {
   // spread (unlike the internal anchors above — the client renders the honest paused badge
   // from card.atRest and freezes the timer at card.gatedSince).
   card.atRest = atRest(s);
-  // Whether the Live card can offer "focus this session's terminal". The target itself
-  // (a tty on macOS, a window-owning pid on Windows) stays server-side — the client posts
-  // a sessionId and the daemon re-derives it, so the browser can never name the window it
-  // wants raised.
-  card.focusable = s.focusTarget != null;
+  // Whether the Live card can offer "focus this session's terminal". Both targets stay
+  // server-side — the client posts a sessionId and the daemon re-derives them, so the
+  // browser can never name the window it wants raised.
+  card.focusable = s.focusTarget != null || s.focusTitle != null;
   delete card.focusTarget;
+  delete card.focusTitle;
+  delete card.ownerPidVerified;
   return card;
 }
 

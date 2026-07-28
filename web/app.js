@@ -1201,6 +1201,14 @@ const FOCUS_ERRORS = {
   "osascript-failed": "Couldn't talk to Terminal",
   "powershell-failed": "Couldn't reach PowerShell to raise the window",
   "focus-refused": "Windows wouldn't bring that window to the front",
+  // Windows Terminal exposes no link from a tab back to the session running in it, so
+  // the tab NAME is the only key. Same-named tabs are indistinguishable — say what fixes
+  // it (/rename) rather than raising a coin-flip tab.
+  "ambiguous-tab":
+    "Several terminal tabs share this session's name — rename it with /rename to focus it",
+  "no-title": "This session has no name yet — rename it with /rename to focus its tab",
+  "tab-not-selected": "Raised the terminal window, but couldn't switch to this session's tab",
+  "focus-timeout": "Timed out trying to reach the terminal — try again",
 };
 
 // Ask the daemon to raise this session's terminal window. Only the session id goes over

@@ -49,6 +49,35 @@ const REAP_IDLE_FALLBACK_MS = 6 * 3600 * 1000; // reap PID-less sessions after 6
 const LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate daemon.log once it passes ~5MB (keep one .1 backup, ~10MB cap)
 const LOG_ROTATE_MS = 3600 * 1000; // check the log size hourly (plus once at boot)
 const REAP_GRACE_MS = 90 * 1000; // min quiet time before reaping a PID-dead session
+// Overall budget for one /api/focus request, across every target it tries. Comfortably
+// above a normal round-trip (~1s) but short enough that a wedged PowerShell still returns
+// a toast rather than leaving the browser hanging on an open fetch.
+const FOCUS_DEADLINE_MS = 12000;
+
+// Whether a dead `owner_pid` actually means the session's host is gone.
+//
+// On macOS/Linux the hook's parent is the Claude Code process (or a shell that
+// outlives the hook), so its liveness is a real signal. On WINDOWS it is not:
+// Claude Code spawns a FRESH powershell.exe per hook (claude.exe -> powershell
+// -> node emit.js), so `process.ppid` is a throwaway pid that dies microseconds
+// later — measured at ~136 distinct owner_pids across 146 events of ONE live
+// session. Trusting it there made every session look dead, so any session quiet
+// past REAP_GRACE_MS was reaped while still running; it only looked benign
+// because the next event re-registered the session, so the card vanished during
+// idle and silently came back on the next keystroke.
+//
+// A Windows session whose pid was VERIFIED by the SessionStart owner probe
+// (owner-pid.js) IS trustworthy: that pid is the real claude.exe, resolved from
+// inside the hook while its shell was still alive, and it outlives every event.
+// Sessions predating the probe — or where it found no claude.exe ancestor — keep
+// the conservative fallback: the generous idle timeout, exactly like a session
+// with no known pid. Cost there is unchanged (a force-quit lingers until
+// REAP_IDLE_FALLBACK_MS rather than ~90s), which is the honest reading when the
+// platform gives us no way to tell a force-quit apart from a pause.
+function ownerPidIsEvidence(session) {
+  if (process.platform !== 'win32') return true;
+  return !!(session && session.ownerPidVerified === true);
+}
 
 const STATIC = {
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
@@ -1212,6 +1241,8 @@ function handleEvent(ev) {
 
   // Sits below the replay guard on purpose: a cold boot replays a whole day of events and
   // would otherwise probe the OS per line. Boot's own sweep covers restored sessions.
+  // On Windows this no-ops until OwnerResolved supplies a pid worth walking from, which is
+  // why that event has to re-trigger it — otherwise the walk would never run at all.
   resolveFocusTargetOnce(sid);
 
   // Global pause transitions (session-less Paused/Resumed) are NOT folded here: reconcile()
@@ -1512,6 +1543,9 @@ function updateSessionTokens(sid, usage) {
   // Only overwrite when present, so a transient read before the name line flushes can't
   // clear a name we already have.
   if (usage.title != null && String(usage.title).trim() !== '') session.title = usage.title;
+  // The Windows Terminal tab is matched by this title, so the focus target follows it
+  // (including across a /rename, which is exactly when the tab name changes too).
+  syncFocusTitle(session);
   // Backfill the session's DISPLAYED model from the transcript. The SessionStart
   // hook is the ONLY event that ever carries `model`, and it may omit it (docs:
   // optional), so a resumed session or one first seen after a snapshot loss shows
@@ -2598,6 +2632,12 @@ function resolveFocusTargetOnce(sid) {
   if (sid == null) return;
   const session = state.sessions[sid];
   if (!session || session.focusTarget != null || session.ownerPid == null) return;
+  // On Windows, wait for the OwnerResolved probe before spending a PowerShell start-up.
+  // Every event's own owner_pid there is a per-hook shell that is already dead, so
+  // walking from it cannot succeed — and because the attempt latches below, that one
+  // guaranteed-to-fail walk would permanently foreclose the real one. Callers re-invoke
+  // when the verified pid lands.
+  if (process.platform === 'win32' && !session.ownerPidVerified) return;
   const x = extra.get(sid) || {};
   if (x.focusAttempted) return;
   x.focusAttempted = true;
@@ -2610,10 +2650,67 @@ function resolveFocusTargetOnce(sid) {
   });
 }
 
+// Windows Terminal tabs, cached briefly. Enumeration is a PowerShell + UIA start-up
+// (~1s), and syncFocusTitle needs it per session, so a short TTL keeps a burst of
+// sessions to one probe. Only a successful enumeration refreshes the cache — a failed
+// one must not be cached as "no tabs".
+let wtTabsCache = { at: 0, tabs: [] };
+const WT_TABS_TTL_MS = 15000;
+
+function wtTabsCached() {
+  if (Date.now() - wtTabsCache.at < WT_TABS_TTL_MS) return Promise.resolve(wtTabsCache.tabs);
+  return focusTerminal.listWtTabs().then((tabs) => {
+    if (tabs) wtTabsCache = { at: Date.now(), tabs };
+    return wtTabsCache.tabs;
+  });
+}
+
+// Keep the Windows Terminal TAB target in step with the session's live title. Unlike
+// focusTarget this is deliberately NOT resolved once: the title only arrives after
+// SessionStart (the daemon backfills it from the transcript) and changes on /rename,
+// and it is the sole key UI Automation gives us for a tab — every TabItem reports the
+// WindowsTerminal.exe pid, so there is no process link to cache instead.
+//
+// The target is only set when a WT tab ACTUALLY matches. Deriving it from the title
+// alone would mark every named Windows session focusable — including ones hosted in a
+// VS Code terminal or conhost, where the button could only ever fail — breaking the
+// rule that an unfocusable session shows no button rather than a broken one. A tab
+// that matches ambiguously still counts: clicking then explains the /rename fix, which
+// is more useful than hiding the button.
+function syncFocusTitle(session) {
+  if (process.platform !== 'win32' || !session) return;
+  const title = typeof session.title === 'string' && session.title.trim() ? session.title : null;
+  if (title == null) {
+    if (session.focusTitle != null) {
+      session.focusTitle = null;
+      markDirty();
+    }
+    return;
+  }
+  wtTabsCached().then((tabs) => {
+    const s = state.sessions[session.sessionId] || session;
+    // Re-read the title: an await elapsed, and a /rename may have moved it on.
+    const cur = typeof s.title === 'string' && s.title.trim() ? s.title : null;
+    const m = cur == null ? { reason: 'no-title' } : focusTerminal.matchWtTabs(tabs, cur);
+    // A unique hit is focusable; so is an ambiguous one — the click then names the
+    // /rename fix, which beats silently hiding the button. Only a genuine miss hides it.
+    const matched = !m.reason || m.reason === 'ambiguous-tab';
+    const next = matched ? 'wt:' + cur : null;
+    if (s.focusTitle === next) return;
+    s.focusTitle = next;
+    markDirty();
+  });
+}
+
 // Boot sweep: sessions restored across a restart have no target yet and may stay idle for
 // hours, so waiting for their next event would leave their cards buttonless until then.
+// The title sync runs here too, so a snapshot written before focusTitle existed picks it
+// up at boot rather than on the session's next token read.
 function resolveMissingFocusTargets() {
-  for (const sid of Object.keys(state.sessions)) resolveFocusTargetOnce(sid);
+  for (const sid of Object.keys(state.sessions)) {
+    resolveFocusTargetOnce(sid);
+    syncFocusTitle(state.sessions[sid]);
+  }
 }
 
 // Raise the terminal window hosting a session. The request names a SESSION, never a
@@ -2630,15 +2727,52 @@ function handleFocus(req, res) {
     const sid = body && typeof body.sessionId === 'string' ? body.sessionId : null;
     const session = sid ? state.sessions[sid] : null;
     if (!session) return json(res, { ok: false, reason: 'unknown-session' }, 404);
-    if (!session.focusTarget) return json(res, { ok: false, reason: 'no-terminal' }, 409);
 
-    focusTerminal
-      .focusTarget(session.focusTarget)
-      .then((r) => json(res, r, r.ok ? 200 : 409))
-      .catch((e) => {
-        log('focus failed ' + ((e && e.stack) || e));
-        json(res, { ok: false, reason: 'error' }, 500);
+    // Ordered attempts. The Windows Terminal TAB target goes first where one exists:
+    // it is tab-exact, whereas the window-pid target can only raise a whole window —
+    // and on a default Windows 11 setup resolves to nothing at all, because the
+    // default-terminal handoff puts the window outside the session's process tree.
+    // The pid target stays as the fallback for hosts that ARE in that tree, chiefly a
+    // VS Code integrated terminal.
+    const targets = [session.focusTitle, session.focusTarget].filter(Boolean);
+    if (!targets.length) return json(res, { ok: false, reason: 'no-terminal' }, 409);
+
+    // The chain can run several PowerShell round-trips back to back, so it needs one
+    // overall deadline: without it a browser fetch could hang for the sum of every
+    // per-call timeout, showing neither success nor a toast — a button that just looks
+    // dead, which invites re-clicks that each spawn another PowerShell/UIA pair.
+    let settled = false;
+    const answer = (payload, code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      json(res, payload, code);
+    };
+    const deadline = setTimeout(
+      () => answer({ ok: false, reason: 'focus-timeout' }, 504),
+      FOCUS_DEADLINE_MS,
+    );
+
+    const attempt = (i, last) => {
+      if (settled) return;
+      if (i >= targets.length) return answer(last || { ok: false, reason: 'no-window' }, 409);
+      return focusTerminal.focusTarget(targets[i]).then((r) => {
+        if (settled) return;
+        if (r.ok) return answer(r, 200);
+        // Definitive answers, not misses — do not fall through to the window target.
+        // 'ambiguous-tab': we deliberately declined to guess, so raising SOME window
+        // next would defeat that. 'tab-not-selected': a window was already raised.
+        if (r.reason === 'ambiguous-tab' || r.reason === 'tab-not-selected') {
+          return answer(r, 409);
+        }
+        return attempt(i + 1, r);
       });
+    };
+
+    Promise.resolve(attempt(0, null)).catch((e) => {
+      log('focus failed ' + ((e && e.stack) || e));
+      answer({ ok: false, reason: 'error' }, 500);
+    });
   });
 }
 
@@ -2883,7 +3017,7 @@ function reapStale() {
     const last = Date.parse(s.lastActivityAt);
     const idleMs = Number.isFinite(last) ? now - last : Infinity;
     let dead;
-    if (pid) {
+    if (pid && ownerPidIsEvidence(s)) {
       // Reap a PID-dead session only after a short grace with no events. If the
       // hook's parent happens to be a transient per-hook shell (whose PID dies
       // immediately), this avoids reaping a session that is actively emitting

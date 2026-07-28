@@ -11,14 +11,11 @@
 // `tool_output` into the record. Only counts, names, and metadata are stored.
 
 const fs = require('fs');
-const http = require('http');
 const os = require('os');
 const path = require('path');
-const paths = require('./paths');
 const { resolveRepo } = require('./repo');
+const { appendEvent, pingDaemon } = require('./event-log');
 
-// Best-effort daemon ping budget; the durable append already happened by then.
-const PING_TIMEOUT_MS = 150;
 // Hard backstop so a stalled socket can never keep the hook process alive.
 const EXIT_GUARD_MS = 400;
 
@@ -47,18 +44,12 @@ function readStdin() {
 
 function parsePayload(raw) {
   try {
-    const obj = JSON.parse(raw);
+    // Strip a leading BOM before parsing — JSON.parse rejects one, which would turn a
+    // perfectly good payload into {} and emit a contentless event.
+    const obj = JSON.parse(String(raw).replace(/^﻿/, ''));
     return obj && typeof obj === 'object' ? obj : {};
   } catch (_e) {
     return {};
-  }
-}
-
-function readTrim(filePath) {
-  try {
-    return fs.readFileSync(filePath, 'utf8').trim();
-  } catch (_e) {
-    return '';
   }
 }
 
@@ -156,57 +147,6 @@ function buildRecord(payload) {
   // never re-reads the file, so this durable capture is replay-correct after a switch).
   if (payload.hook_event_name === 'SessionStart') setIf(record, 'sub', readSubscription());
   return record;
-}
-
-// Append one object as a single JSON line to a JSONL file, creating its parent
-// dir first. A single small-line append is atomic on local filesystems; the
-// daemon's reader tolerates a torn final line where it isn't guaranteed.
-function writeJsonlLine(filePath, obj) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.appendFileSync(filePath, JSON.stringify(obj) + '\n');
-}
-
-function appendEvent(record) {
-  writeJsonlLine(paths.eventLogPath(paths.dateStr()), record);
-}
-
-// Wake-up nudge only — carries no authoritative data (body is ignored by the
-// daemon, which always re-reads the log). Never blocks past PING_TIMEOUT_MS.
-function pingDaemon(done) {
-  let called = false;
-  const complete = () => {
-    if (called) return;
-    called = true;
-    done();
-  };
-  try {
-    const port = parseInt(readTrim(paths.portPath()), 10);
-    if (!port) return complete();
-    const token = readTrim(paths.tokenPath());
-    const body = '{}';
-    const headers = {
-      'content-type': 'application/json',
-      'content-length': Buffer.byteLength(body),
-    };
-    if (token) headers.authorization = `Bearer ${token}`;
-    const req = http.request(
-      { host: '127.0.0.1', port, path: '/internal/event', method: 'POST', timeout: PING_TIMEOUT_MS, headers },
-      (res) => {
-        res.resume(); // drain so the socket can close
-        res.on('end', complete);
-        res.on('error', complete);
-      }
-    );
-    req.on('timeout', () => {
-      req.destroy();
-      complete();
-    });
-    req.on('error', complete);
-    req.write(body);
-    req.end();
-  } catch (_e) {
-    complete();
-  }
 }
 
 function main() {

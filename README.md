@@ -48,6 +48,39 @@ directory:
 The first time a session starts after installing, the daemon is spawned
 automatically and dependencies are installed once.
 
+### Optional: the usage-bar statusline
+
+The Live page's **session-5h and weekly usage bars** are fed by a statusline
+renderer shipped in [`statusline/`](statusline/README.md). Claude Code's
+statusline payload is the only local carrier of Anthropic's rate-limit numbers —
+hooks and transcripts don't have them — so **those two bars stay empty until you
+install it**. Everything else in the cockpit works without it.
+
+Claude Code has a single statusline slot and does not support
+`${CLAUDE_PLUGIN_ROOT}` there, so **the plugin cannot wire this up for you** —
+it is a one-time, explicit install. Run it from the repo root:
+
+```sh
+node statusline/install.js
+```
+
+That works on every OS. It edits your user-scope `~/.claude/settings.json`,
+backs it up first, preserves your other settings, and is a no-op if already
+installed. Shell wrappers are provided if you prefer one — `install.sh`,
+`install.cmd`, `install.bat`, `install.ps1` — and all four just call
+`install.js`. **Restart Claude Code** afterwards.
+
+To do it by hand instead, set `statusLine.command` to
+`node "<absolute path>/statusline/statusline-render.js"`. On **Windows** write
+that path with forward slashes (`C:/Users/you/...`) — Git Bash silently drops
+unquoted backslashes.
+
+If you installed from a marketplace, point at the plugin's install directory and
+**re-run the installer after every plugin upgrade**: the version is part of that
+path, and the old directory is garbage-collected about a week later. See
+[`statusline/README.md`](statusline/README.md) for what the line shows and
+exactly what it forwards to the daemon.
+
 ## Usage
 
 Slash commands (namespace `cockpit`):

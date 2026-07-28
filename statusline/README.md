@@ -38,10 +38,43 @@ the payload (cwd, cost, model, session id) is sent or stored — the forward is
 stripped to `rate_limits` for privacy. The POST is fire-and-forget on a ~150 ms
 budget and can never delay the rendered line or fail your session.
 
-## Install (all platforms — the primary path)
+## Install (all platforms)
 
-Claude Code's `statusLine.command` runs a shell command after each assistant
-message. Point it at this renderer in your **user settings** (`~/.claude/settings.json`):
+Run the installer from the repo root:
+
+```sh
+node statusline/install.js
+```
+
+That is the whole thing on every OS. It edits your **user-scope**
+`~/.claude/settings.json`, writes a timestamped backup first, preserves your
+other settings, and is idempotent (a re-run when it's already installed is a
+no-op). If a *different* `statusLine` is already configured it warns you that
+it's being replaced — Claude Code has a single statusline slot. It refuses to
+touch a `settings.json` that isn't valid JSON rather than overwriting it.
+
+**Restart Claude Code** afterwards for the statusline to take effect.
+
+Four thin wrappers exist for whichever shell you're in; all four just call
+`install.js`, so they behave identically:
+
+| Wrapper | Run it with |
+| --- | --- |
+| `install.sh` | `sh statusline/install.sh` |
+| `install.cmd` | `statusline\install.cmd` |
+| `install.bat` | `statusline\install.bat` |
+| `install.ps1` | `powershell -ExecutionPolicy Bypass -File statusline\install.ps1` |
+
+`install.cmd` and `install.bat` are byte-identical — `cmd.exe` treats the two
+extensions the same, but which one people reach for differs. The
+`-ExecutionPolicy Bypass` on the PowerShell one avoids Windows' default block on
+unsigned scripts; the `.cmd`/`.bat` wrappers sidestep script policy entirely.
+
+## Install (manual)
+
+If you'd rather not run a script, `statusLine.command` is just a shell command
+Claude Code runs after each assistant message. Point it at this renderer in your
+**user settings** (`~/.claude/settings.json`) by hand:
 
 ```json
 {
@@ -53,7 +86,9 @@ message. Point it at this renderer in your **user settings** (`~/.claude/setting
 ```
 
 Use the **absolute path** to this file. `node` must be on your `PATH` (it already
-is if you use this plugin). This works on macOS, Linux, and Windows.
+is if you use this plugin). This works on macOS, Linux, and Windows. The
+installer above writes exactly this, computing the path from its own location —
+the two produce the same result.
 
 > **This replaces any existing `statusLine`.** Claude Code has a single statusline
 > slot. To revert, restore your settings backup or remove the `statusLine` key.
@@ -73,17 +108,3 @@ string and break the command. Use the absolute path instead. If you install this
 plugin from a marketplace (rather than a local clone), point the command at the
 plugin's install directory; **re-point it after a plugin upgrade**, since that
 directory can change (the old one is garbage-collected roughly a week later).
-
-## Install (Unix convenience)
-
-On macOS/Linux you can run the bundled installer, which edits your **user-scope**
-`~/.claude/settings.json`, writes a timestamped backup first, and is idempotent
-(re-running when it's already installed is a no-op):
-
-```sh
-sh statusline/install.sh
-```
-
-It computes the absolute renderer path from its own location. If a *different*
-`statusLine` is already configured, it warns you that it's being replaced. Windows
-users should use the manual JSON edit above.

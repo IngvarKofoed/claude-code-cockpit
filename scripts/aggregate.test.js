@@ -1275,3 +1275,85 @@ test('toCard never leaks the raw focus target to the browser', () => {
   const card = snapshot(state, 0).sessions.find((x) => x.sessionId === 's1');
   assert.strictEqual(card.focusTarget, undefined);
 });
+
+test('toCard reports focusable true for a Windows Terminal TAB target alone', () => {
+  // On a default Windows 11 setup the window is outside the session's process tree, so
+  // focusTarget stays null and the title-keyed tab target is the ONLY way in.
+  const state = run([ev('SessionStart')]);
+  state.sessions.s1.focusTitle = 'wt:testing';
+  const card = snapshot(state, 0).sessions.find((x) => x.sessionId === 's1');
+  assert.strictEqual(card.focusable, true);
+  assert.strictEqual(card.focusTitle, undefined); // daemon-internal, like focusTarget
+});
+
+// --- OwnerResolved (the durable Windows host pid) -----------------------------
+
+test('OwnerResolved records the durable pid and marks it verified', () => {
+  const state = run([
+    ev('SessionStart', { owner_pid: 111 }),
+    ev('OwnerResolved', { owner_pid: 39420 }),
+  ]);
+  assert.strictEqual(state.sessions.s1.ownerPid, 39420);
+  assert.strictEqual(state.sessions.s1.ownerPidVerified, true);
+});
+
+test('a verified owner pid is never clobbered by later events', () => {
+  // The whole point: on Windows every event's owner_pid is a throwaway per-hook shell,
+  // so letting the stream overwrite the probe's claude.exe would undo the fix.
+  const state = run([
+    ev('SessionStart', { owner_pid: 111 }),
+    ev('OwnerResolved', { owner_pid: 39420 }),
+    ev('PreToolUse', { owner_pid: 222, tool_name: 'Bash' }),
+    ev('Stop', { owner_pid: 333 }),
+  ]);
+  assert.strictEqual(state.sessions.s1.ownerPid, 39420);
+});
+
+test('a SECOND OwnerResolved refreshes the pid after a --resume', () => {
+  // A resume reuses the session_id, so its probe re-reports a NEW claude.exe. If the
+  // record kept the previous run's dead pid while still counting as reaper evidence,
+  // reapStale would drop a live session — the entry-101 false reap, reintroduced.
+  const state = run([
+    ev('SessionStart', { owner_pid: 111 }),
+    ev('OwnerResolved', { owner_pid: 39420 }),
+    ev('SessionStart', { owner_pid: 222 }),
+    ev('OwnerResolved', { owner_pid: 55555 }),
+  ]);
+  assert.strictEqual(state.sessions.s1.ownerPid, 55555);
+  assert.strictEqual(state.sessions.s1.ownerPidVerified, true);
+});
+
+test('OwnerResolved without a pid keeps the last verified one', () => {
+  const state = run([
+    ev('SessionStart', { owner_pid: 111 }),
+    ev('OwnerResolved', { owner_pid: 39420 }),
+    ev('OwnerResolved', {}),
+  ]);
+  assert.strictEqual(state.sessions.s1.ownerPid, 39420);
+});
+
+test('OwnerResolved carries no status meaning', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { prompt_id: 'p1' }),
+    ev('OwnerResolved', { owner_pid: 39420 }),
+  ]);
+  assert.strictEqual(state.sessions.s1.status, 'running');
+  assert.ok(state.sessions.s1.currentPrompt, 'the open turn survives the probe event');
+});
+
+test('an unverified session still takes owner_pid from the stream', () => {
+  // macOS/Linux never emit OwnerResolved; that path must be untouched.
+  const state = run([ev('SessionStart', { owner_pid: 111 }), ev('Stop', { owner_pid: 222 })]);
+  assert.strictEqual(state.sessions.s1.ownerPid, 222);
+  assert.strictEqual(state.sessions.s1.ownerPidVerified, false);
+});
+
+test('ownerPidVerified survives a snapshot round-trip', () => {
+  // The reaper reads it after a restart, so it has to be persisted, not re-derived.
+  const state = run([ev('SessionStart'), ev('OwnerResolved', { owner_pid: 39420 })]);
+  const restored = createState();
+  restored.sessions = JSON.parse(JSON.stringify(state.sessions));
+  assert.strictEqual(restored.sessions.s1.ownerPidVerified, true);
+  assert.strictEqual(restored.sessions.s1.ownerPid, 39420);
+});

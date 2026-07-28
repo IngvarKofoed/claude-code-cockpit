@@ -863,3 +863,116 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
     `-EncodedCommand` (a fixed script + an integer-validated pid), which removes command-line
     quoting from the picture entirely — the scripts embed C# needing double quotes.
     Not verified on real Windows: written and unit-tested from macOS.
+
+97. The root README now documents installing the statusline, under Install. It previously never
+    mentioned it at all, so the Live usage bars' one prerequisite was discoverable only by finding
+    `statusline/README.md` unprompted — users reasonably assumed installing the plugin was enough.
+    States up front that the plugin CANNOT wire this up (no `${CLAUDE_PLUGIN_ROOT}` in
+    `statusLine.command`), plus the Windows forward-slash rule and the re-point-after-upgrade caveat.
+
+98. The statusline installer is now cross-platform `statusline/install.js`; `install.sh` plus new
+    `.ps1`/`.cmd`/`.bat` are thin wrappers that exec it. Windows previously had no installer at all.
+    Logic sits in Node because the bash version already shelled out to node for the JSON edit — one
+    implementation replaces two rather than adding a second to keep in sync.
+    It writes the renderer path with FORWARD slashes on every platform: Claude Code runs
+    `statusLine.command` through a shell, and Git Bash silently eats unquoted backslashes.
+
+99. The installer now REFUSES to write when an existing `settings.json` doesn't parse, where the old
+    `install.sh` reset it to `{}` and rewrote. Clobbering the user's global settings over a stray
+    trailing comma is worse than making them fix one character; a backup only helps if noticed.
+    Its idempotency check also folds case on Windows — the drive letter varies by invoking shell
+    (`C:\` from cmd, `c:/` from Git Bash), so a re-run via another wrapper looked like a change.
+
+100. New `.gitattributes` pins `*.sh` to LF and `*.cmd`/`*.bat`/`*.ps1` to CRLF on checkout.
+     Previously nothing did, so correctness rode on each committer's `core.autocrlf`: one without it
+     would commit a CRLF `install.sh`, which dies on Linux/macOS with `bad interpreter: …^M`.
+     Git Bash tolerates CRLF, so that breakage would only ever surface for other people.
+
+101. On Windows a dead `owner_pid` no longer counts as evidence a session died, so the reaper falls
+     through to the generous idle timeout there (`OWNER_PID_IS_EVIDENCE`). Claude Code spawns a FRESH
+     powershell per hook, so `process.ppid` is a throwaway pid (~136 distinct across 146 events of one
+     live session) — every Windows session looked dead, and any quiet past the 90s grace was reaped
+     WHILE RUNNING. It read as benign only because the next event re-registered it: the card vanished
+     during idle and silently returned on the next keystroke.
+     Cost: a force-quit Windows session now lingers ~6h instead of 90s. Capturing the real claude.exe
+     pid would need a PowerShell parent-walk inside a hook while its shell lives — barred by the
+     hooks-must-never-block rule, and unrecoverable once the hook exits.
+
+102. Windows terminal focus is CONFIRMED NON-FUNCTIONAL on a default Windows 11 setup, and the parent
+     walk cannot fix it — the window belongs to `WindowsTerminal.exe` parented to `svchost.exe` by the
+     default-terminal handoff, so it is outside the session's process tree in both directions.
+     Entry 93's claim that a legacy `cmd.exe`/`pwsh` console "focuses exactly" is WRONG for Windows 11:
+     that console is a `0x4` ConPTY shim owning no window. Do not re-attempt via process traversal.
+     The only signal reaching the real window is the WT title, which tracks the ACTIVE TAB — so it can
+     never address a background tab, i.e. exactly the case the button exists for.
+
+103. Released v0.37.0, carrying entries 97–102. The bump is load-bearing, not ceremonial: the plugin
+     cache is keyed by version, and `ensure.js` only replaces a running daemon when `/health` reports a
+     DIFFERENT version — so entry 101's reaper fix could not reach a live daemon while both read 0.36.0.
+
+104. Windows terminal focus WORKS, via UI Automation (v0.38.0) — entry 102's "can never address a
+     background tab" is WRONG and superseded. The daemon enumerates Windows Terminal tabs through UIA,
+     Selects the matching one, and raises the window; verified 4/4 against a real background tab.
+     Entry 102 remains right about PROCESS traversal — that stays a dead end, do not re-attempt it.
+     UIA exposes no link to the hosted shell either (every TabItem reports the WindowsTerminal.exe pid).
+
+105. Because of that, the join key is the session TITLE — so the button works only for a session with a
+     DISTINCT name. Un-renamed sessions all read the literal "✳ Claude Code" and resolve to
+     `ambiguous-tab`, whose toast names the fix (/rename), rather than raising a coin-flip tab; a
+     titleless session hides the button. The `wt:<title>` target is re-derived from live state on every
+     title change, deliberately NOT resolved-once like the tty/pid targets — /rename renames the tab too.
+
+106. The tab Select is CONFIRMED before the script returns (poll IsSelected, one re-issue). WT applies
+     the UIA request on its own UI thread, so firing Select() and exiting can lose it — observed once as
+     the window coming forward still showing the previous tab. A raise whose selection never lands
+     reports `tab-not-selected`, kept distinct from `no-window` so the toast can say what happened.
+     `ambiguous-tab` and `tab-not-selected` are definitive: neither falls through to the window target.
+
+107. Windows sessions now carry a DURABLE owner pid, fixing entry 101's fallback (a force-quit session
+     lingered ~6h). The SessionStart hook walks up to the nearest claude.exe and logs an `OwnerResolved`
+     event; a verified pid is never overwritten by the event stream, and only a verified pid counts as
+     reaper evidence on Windows. It must run INSIDE the hook — once it exits the chain is gone.
+     Costs ~170ms via a wmic process-table snapshot walked in pure JS; PowerShell measured ~1.1s (fallback).
+
+108. Two shared modules extracted: `event-log.js` (hook-side append + daemon nudge, so ensure.js can log
+     events too) and `winproc.js` (PowerShell runner + ancestor walk, shared with the focus chain).
+     Hook payload parsing now strips a leading BOM — JSON.parse rejects one, which silently degraded a
+     whole payload to `{}`. Found when a BOM-prefixed test payload made the owner probe skip itself.
+
+109. A SECOND `OwnerResolved` now refreshes the pid (v0.38.0, review fix). `--resume` reuses the
+     session_id, so its probe re-reports a new claude.exe — but `updateMeta` refuses to write once
+     verified, so the record kept the previous run's DEAD pid while still counting as reaper evidence,
+     reaping a live session. That was entry 101's false reap, reintroduced. The pid is now assigned in
+     the `OwnerResolved` branch itself rather than deferred to `updateMeta`.
+
+110. Windows focus-target resolution now waits for the verified pid (v0.38.0, review fix). It ran on
+     SessionStart against the per-hook shell pid — already dead, so guaranteed to fail — and
+     `focusAttempted` latched that miss permanently, so the real pid arriving ~200ms later was never
+     tried. The `pid:` fallback (VS Code integrated terminals) could therefore never resolve mid-session.
+     Also saves one doomed PowerShell start-up per Windows session.
+
+111. `focusTitle` is only set when a Windows Terminal tab ACTUALLY matches (v0.38.0, review fix) —
+     it was derived from the session title alone, so every named Windows session showed a Focus button
+     even under VS Code or conhost, where it could only ever fail. That broke this project's own rule
+     that an unfocusable session shows NO button rather than a broken one. Enumeration is cached ~15s so
+     a burst of sessions costs one probe. An AMBIGUOUS match still counts: the click explains /rename.
+
+112. The owner probe no longer blows through SessionStart's exit guard (v0.38.0, review fix). One
+     deadline now spans BOTH stages — a slow wmic followed by a full-budget PowerShell fallback used to
+     run ~6s against a 4s guard, stalling the hook AND recording nothing. Ceiling cut 3000→1200ms
+     (measured ~200ms). `ensureDeps()` runs BEFORE the probe: its first-run `spawnSync('npm install')`
+     blocks the loop long enough to expire a probe started beforehand. And a TTY stdin is skipped —
+     `commands/open.md` tells users to run ensure.js directly, where the read would hang forever.
+
+113. `POST /api/focus` has an overall 12s deadline and per-call budgets cut to 8s (v0.38.0, review fix);
+     the chain could previously run ~35s with the browser fetch open and no toast, so the button just
+     looked dead and invited re-clicks that each spawned another PowerShell/UIA pair.
+     The select script also re-checks the tab NAME before selecting: the index came from an earlier
+     enumeration, so a tab closed or reordered in between meant selecting a different session's tab.
+     The expected name travels by ENVIRONMENT variable, never interpolated — a session title is free text.
+
+114. Known gap, deliberately left open: the owner probe matches only `claude.exe`, so an npm/global
+     install (`claude.cmd → node.exe`) gets no durable pid and keeps the ~6h idle reaper. Matching
+     `node.exe` would cover it but risks verifying an unrelated node process as the host — and a WRONG
+     verified pid reaps a LIVE session, strictly worse than the pre-probe behaviour. Closing it properly
+     needs the ancestor's command line to confirm.

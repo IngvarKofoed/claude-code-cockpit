@@ -5,10 +5,14 @@ const assert = require('node:assert');
 const {
   parseTtyDevice,
   parseWindowPid,
+  parseWtTabs,
+  normalizeTabName,
+  matchWtTabs,
   ttyForPid,
   windowPidForPid,
   focusTty,
   focusWindowPid,
+  focusWtTab,
   resolveFocusTarget,
   focusTarget,
 } = require('./focus-terminal');
@@ -151,6 +155,117 @@ test('focusTarget: routes on the target SHAPE, not the running platform', async 
   // which also proves the routing without raising a real window on the dev machine.
   const foreign = process.platform === 'darwin' ? 'pid:4242' : '/dev/ttys004';
   const r = await focusTarget(foreign);
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.reason, 'unsupported-platform');
+});
+
+// --- normalizeTabName (pure) --------------------------------------------------
+
+test('normalizeTabName: strips the animated status glyph Claude Code prefixes', () => {
+  // The spinner frame differs between reads of the same tab, so it must not affect a match.
+  assert.strictEqual(normalizeTabName('⠂ testing'), 'testing');
+  assert.strictEqual(normalizeTabName('⠐ testing'), 'testing');
+  assert.strictEqual(normalizeTabName('✳ Claude Code'), 'claude code');
+});
+
+test('normalizeTabName: casefolds and collapses whitespace', () => {
+  assert.strictEqual(normalizeTabName('  My   Session  '), 'my session');
+});
+
+test('normalizeTabName: a non-string is empty, never a throw', () => {
+  for (const bad of [null, undefined, 42, {}]) assert.strictEqual(normalizeTabName(bad), '');
+});
+
+test('normalizeTabName: leading punctuation is stripped from BOTH sides, so it still matches', () => {
+  // Stripping is lossy, but it is applied to the tab name and the session title alike,
+  // so a title that genuinely starts with punctuation still compares equal to its tab.
+  assert.strictEqual(normalizeTabName('[wip] fix'), normalizeTabName('⠂ [wip] fix'));
+});
+
+// --- matchWtTabs (pure) -------------------------------------------------------
+
+const TABS = [
+  { hwnd: 263814, index: 0, name: '⠂ testing' },
+  { hwnd: 263814, index: 1, name: '✳ Claude Code' },
+  { hwnd: 2032158, index: 0, name: '✳ Claude Code' },
+];
+
+test('matchWtTabs: a uniquely named tab matches, spinner frame notwithstanding', () => {
+  const r = matchWtTabs(TABS, 'testing');
+  assert.deepStrictEqual(r.tab, { hwnd: 263814, index: 0, name: '⠂ testing' });
+  assert.strictEqual(r.reason, undefined);
+});
+
+test('matchWtTabs: duplicate names REFUSE rather than guess', () => {
+  // Two un-renamed sessions both read "Claude Code". Raising either would be a coin
+  // flip, and raising the wrong terminal is worse than raising none.
+  const r = matchWtTabs(TABS, 'Claude Code');
+  assert.strictEqual(r.tab, undefined);
+  assert.strictEqual(r.reason, 'ambiguous-tab');
+  assert.strictEqual(r.count, 2);
+});
+
+test('matchWtTabs: no tab by that name reports no-window', () => {
+  assert.strictEqual(matchWtTabs(TABS, 'nothing-here').reason, 'no-window');
+});
+
+test('matchWtTabs: an empty or missing title reports no-title, not a match', () => {
+  for (const bad of ['', '   ', null, undefined]) {
+    assert.strictEqual(matchWtTabs(TABS, bad).reason, 'no-title', String(bad));
+  }
+});
+
+test('matchWtTabs: a non-array tab list is tolerated', () => {
+  assert.strictEqual(matchWtTabs(null, 'testing').reason, 'no-window');
+});
+
+// --- parseWtTabs (pure) -------------------------------------------------------
+
+test('parseWtTabs: reads the enumeration JSON', () => {
+  const out = parseWtTabs('[{"hwnd":263814,"index":0,"name":"⠂ testing"}]');
+  assert.deepStrictEqual(out, [{ hwnd: 263814, index: 0, name: '⠂ testing' }]);
+});
+
+test('parseWtTabs: a lone object (PowerShell drops the array) still reads as one tab', () => {
+  const out = parseWtTabs('{"hwnd":263814,"index":0,"name":"x"}');
+  assert.strictEqual(out.length, 1);
+  assert.strictEqual(out[0].hwnd, 263814);
+});
+
+test('parseWtTabs: malformed entries are dropped, not thrown on', () => {
+  const out = parseWtTabs(
+    '[{"hwnd":0,"index":0,"name":"bad hwnd"},{"hwnd":5,"index":-1,"name":"bad index"},' +
+      '{"hwnd":5,"index":0,"name":"good"},null,7]',
+  );
+  assert.deepStrictEqual(out, [{ hwnd: 5, index: 0, name: 'good' }]);
+});
+
+test('parseWtTabs: unparseable or empty output is an empty list', () => {
+  for (const bad of ['', '   ', 'not json', null, undefined]) {
+    assert.deepStrictEqual(parseWtTabs(bad), [], String(bad));
+  }
+});
+
+// --- wt: target routing -------------------------------------------------------
+
+test('focusTarget: a wt: target routes to the Windows Terminal tab path', async (t) => {
+  if (process.platform === 'win32') {
+    return t.skip('would enumerate (and possibly raise) real tabs on this machine');
+  }
+  const r = await focusTarget('wt:some session');
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.reason, 'unsupported-platform');
+});
+
+test('focusTarget: an empty wt: target is not a valid shape', async () => {
+  const r = await focusTarget('wt:');
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.reason, 'invalid-target');
+});
+
+test('focusWtTab: off-Windows reports unsupported-platform without enumerating', async (t) => {
+  if (process.platform === 'win32') return t.skip('would enumerate real tabs here');
+  const r = await focusWtTab('anything');
   assert.strictEqual(r.ok, false);
   assert.strictEqual(r.reason, 'unsupported-platform');
 });
