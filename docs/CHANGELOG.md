@@ -1013,3 +1013,72 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
 120. New Live sort "Context % (fullest first)" (v0.40.0), per-browser like the other two.
      Sessions with no reading sink BELOW every session that has one instead of sorting as 0% —
      unknown is not empty, the same rule the rest of the accounting follows.
+121. The owner probe's ceiling is 2500ms, up from 1200 (v0.41.0). `wmic` costs ~200ms on the machine
+     entry 107 measured but 1057–1243ms on a ~550-process Windows 11 box, so the old ceiling was a
+     coin flip there: 2 of 6 SessionStarts recorded a pid. The cost of a miss is bigger than entry
+     101's reaper, because entry 110 made focus-target resolution WAIT on the verified pid — so a
+     timed-out probe also means no `pid:` target, i.e. no Focus button, for the whole session.
+
+122. A CLASSIC console window now actually focuses (v0.41.0) — cmd.exe/powershell.exe under conhost,
+     i.e. any machine whose default terminal is the Console Host rather than WT. Resolution already
+     worked: the console window belongs to the console CLIENT, a plain ancestor reporting a real
+     MainWindowHandle, while only its conhost.exe child reports 0. The RAISE was broken — a detached
+     daemon has no foreground rights. Entry 102 was right about the walk, wrong about the raise.
+
+123. That raise now synthesises a VK_LMENU tap first (v0.41.0): after an input event Windows grants
+     this process foreground rights and the next `SetForegroundWindow` succeeds. Measured cold, the
+     alternatives ALL fail — plain SetForegroundWindow, `SwitchToThisWindow`, and `AttachThreadInput`
+     to the foreground thread (attach succeeds, the raise still doesn't). Accepted cost: the tap
+     lands on whatever is in front, where a lone ALT can pop a menu bar. Do not "simplify" it away.
+
+124. The window raise is CONFIRMED against `GetForegroundWindow`, not a return value (v0.41.0) —
+     in the spirit of entry 106, which confirms only the tab SELECTION. It previously reported `ok` from
+     `SetForegroundWindow`'s boolean, which is exactly the call that lies here, so a click that
+     raised nothing still toasted success. `no-window` (no ancestor owns one — every ConPTY client
+     reports MainWindowHandle = 0) stays distinct from `focus-refused` (it exists, Windows declined).
+
+125. The config tests derive their fixture path from `paths.configPath()` instead of hand-building
+     the POSIX XDG layout (v0.41.0), so they exercise the real file on Windows too, where
+     `configDir()` reads APPDATA. One test was merely RED there. The malformed-json one was worse:
+     it passed VACUOUSLY, asserting the defaults a MISSING file already returns, so the never-throws
+     branch it exists to cover had never run on Windows. Confirmed by mutation; an existsSync pins it.
+
+126. Tabby closes every join key the other Windows paths use (v0.41.0), measured: UIA exposes ONE
+     Pane (no Chromium a11y tree, so no TabItem to select), and the process ancestry is SEVERED — the
+     npm `claude` shim runs via an `sh.exe` whose parent has already exited, so 4/4 live sessions walk
+     to a dead pid and Tabby.exe is never an ancestor. Do not re-attempt UIA or traversal for it.
+
+127. New LAST-RESORT Windows target: the pid of a visible terminal WINDOW whose title is the
+     session's (v0.41.0). Reached only after the WT tab path misses AND the ancestor walk has no
+     target, so a WT user pays nothing. It resolves to an ordinary `pid:` target — one new resolution
+     step, not a fourth target shape, so the confirmed raise and its tests are the proven ones.
+     Not latched: the title arrives late, and in a multi-tab terminal only while that tab is active.
+
+128. That match is gated on a terminal-image ALLOWLIST, never window class (v0.41.0) — Tabby's class
+     is `Chrome_WidgetWin_1`, identical to Chrome's, so class cannot vouch for a terminal and a
+     browser tab named after the session would have been raised as one. Non-terminals are filtered
+     BEFORE the ambiguity count, so a browser can neither win nor block a real match. An unlisted
+     terminal gets no button — add to the list rather than loosening the rule.
+
+129. Known limits of that target, both deliberate. It is WINDOW-level, so a session in a BACKGROUND
+     tab emits no signal at all (no window title, no UIA node) and stays unfocusable — the pre-UIA
+     Windows Terminal situation, honest but not tab-exact. And Tabby needs `disableDynamicTitle:
+     false` in its profile: with the default `true` the shell title never reaches the tab or the
+     window, so there is nothing to match and the button correctly stays hidden.
+
+130. A `pid:` target that reports `no-window` is now RETIRED on the spot (v0.41.0), so the next sweep
+     re-derives one instead of leaving a visible button that can only ever fail. Needed by entry 127:
+     an ancestor pid outlives the session by construction, but a TITLE-derived one names a window that
+     can close while the session lives — or that a title collision never owned. Found by killing a
+     matched window and watching the card keep its button across a daemon restart.
+
+131. Retiring a spent `pid:` target now RELEASES the resolve-once latch too (v0.41.0, review fix).
+     Entry 130 nulled the target but left `focusAttempted` set, and nothing else can re-derive an
+     ancestor-derived one — a VS Code host is deliberately off TERMINAL_IMAGES, so the title
+     fallback cannot rescue it. One transient no-window click therefore made a session permanently
+     buttonless: entry 110's bug shape, reintroduced. Re-arms per failed CLICK, never per event.
+
+132. Correction to entry 124 and the architecture doc: the WT tab path confirms its tab SELECTION,
+     not that the window came forward — it still reports ok from `` alone. Only the `pid:`
+     raise is GetForegroundWindow-confirmed. The WT path is verified working in practice (its UIA
+     Select() brings WT along) so it is left as is, but must not be described as raise-confirmed.

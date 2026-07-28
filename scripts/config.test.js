@@ -5,6 +5,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const paths = require('./paths');
 
 const {
   DEFAULT_CONFIG,
@@ -198,13 +199,20 @@ test('DEFAULT_CONFIG is frozen and not mutated by validateConfig', () => {
 
 // ---- read / write round-trip (redirects dirs to a temp dir) -----------
 
-test('readConfig/writeConfig: round-trip through a temp dir', () => {
+// paths.js reads its env vars lazily on every call, so overriding them keeps these tests
+// off the real config/state dirs. Both posix and Windows vars are set, because which pair
+// paths.js consults depends on the platform — which is exactly why the fixture path is
+// handed to the callback from `paths.configPath()` and must never be hand-built. Building
+// it as the POSIX XDG layout is what made the migration test below fail on Windows (where
+// configDir() reads APPDATA, so the fixture sat where readConfig never looked) and, worse,
+// made the malformed-json test pass VACUOUSLY there: it asserted the defaults that a
+// missing file already returns, so the "never throws" path it exists to cover went unrun.
+const CFG_ENV_KEYS = ['XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'APPDATA', 'LOCALAPPDATA', 'HOME', 'USERPROFILE'];
+
+function withTempConfigDir(fn) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cockpit-cfg-'));
-  // paths.js reads these env vars lazily on every call, so overriding them
-  // here keeps the test off the real config/state dirs. Cover posix + win.
-  const envKeys = ['XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'APPDATA', 'LOCALAPPDATA', 'HOME', 'USERPROFILE'];
   const saved = {};
-  for (const k of envKeys) saved[k] = process.env[k];
+  for (const k of CFG_ENV_KEYS) saved[k] = process.env[k];
   try {
     process.env.XDG_CONFIG_HOME = path.join(tmp, 'config');
     process.env.XDG_STATE_HOME = path.join(tmp, 'state');
@@ -212,7 +220,21 @@ test('readConfig/writeConfig: round-trip through a temp dir', () => {
     process.env.LOCALAPPDATA = path.join(tmp, 'localappdata');
     process.env.HOME = tmp;
     process.env.USERPROFILE = tmp;
+    // Resolved AFTER the override, so this is the file readConfig/writeConfig will use.
+    const file = paths.configPath();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    return fn(file);
+  } finally {
+    for (const k of CFG_ENV_KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
 
+test('readConfig/writeConfig: round-trip through a temp dir', () => {
+  withTempConfigDir(() => {
     // No file yet -> defaults.
     assert.deepStrictEqual(readConfig(), DEFAULT_CONFIG);
 
@@ -230,13 +252,7 @@ test('readConfig/writeConfig: round-trip through a temp dir', () => {
     assert.strictEqual(bad.ok, false);
     assert.ok(Array.isArray(bad.errors));
     assert.strictEqual(readConfig().port, 5555);
-  } finally {
-    for (const k of envKeys) {
-      if (saved[k] === undefined) delete process.env[k];
-      else process.env[k] = saved[k];
-    }
-    fs.rmSync(tmp, { recursive: true, force: true });
-  }
+  });
 });
 
 // ---- one-time migration (migrateRawConfig) ----------------------------
@@ -286,22 +302,8 @@ test('migrateRawConfig: config without a rates map just gets the version stamp',
 });
 
 test('readConfig: migrates a pre-version config on disk, persists once, then is idempotent', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cockpit-cfg-'));
-  const envKeys = ['XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'APPDATA', 'LOCALAPPDATA', 'HOME', 'USERPROFILE'];
-  const saved = {};
-  for (const k of envKeys) saved[k] = process.env[k];
-  try {
-    process.env.XDG_CONFIG_HOME = path.join(tmp, 'config');
-    process.env.XDG_STATE_HOME = path.join(tmp, 'state');
-    process.env.APPDATA = path.join(tmp, 'appdata');
-    process.env.LOCALAPPDATA = path.join(tmp, 'localappdata');
-    process.env.HOME = tmp;
-    process.env.USERPROFILE = tmp;
-
+  withTempConfigDir((file) => {
     // A config saved before v0.6.3: no configVersion, stale Opus 4.8 rate.
-    const cfgDir = path.join(tmp, 'config', 'claude-code-cockpit');
-    fs.mkdirSync(cfgDir, { recursive: true });
-    const file = path.join(cfgDir, 'config.json');
     fs.writeFileSync(file, JSON.stringify({ port: 5555, cost: { rates: { 'claude-opus-4-8': OLD_OPUS_48 } } }));
 
     const read = readConfig();
@@ -323,37 +325,16 @@ test('readConfig: migrates a pre-version config on disk, persists once, then is 
 
     // Second read is a stamped no-op — the value is stable, not re-touched.
     assert.deepStrictEqual(readConfig().cost.rates['claude-opus-4-8'], NEW_OPUS_48);
-  } finally {
-    for (const k of envKeys) {
-      if (saved[k] === undefined) delete process.env[k];
-      else process.env[k] = saved[k];
-    }
-    fs.rmSync(tmp, { recursive: true, force: true });
-  }
+  });
 });
 
 test('readConfig: malformed json file -> defaults (never throws)', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cockpit-cfg-'));
-  const envKeys = ['XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'APPDATA', 'LOCALAPPDATA', 'HOME', 'USERPROFILE'];
-  const saved = {};
-  for (const k of envKeys) saved[k] = process.env[k];
-  try {
-    process.env.XDG_CONFIG_HOME = path.join(tmp, 'config');
-    process.env.XDG_STATE_HOME = path.join(tmp, 'state');
-    process.env.APPDATA = path.join(tmp, 'appdata');
-    process.env.LOCALAPPDATA = path.join(tmp, 'localappdata');
-    process.env.HOME = tmp;
-    process.env.USERPROFILE = tmp;
-
-    const cfgDir = path.join(tmp, 'config', 'claude-code-cockpit');
-    fs.mkdirSync(cfgDir, { recursive: true });
-    fs.writeFileSync(path.join(cfgDir, 'config.json'), '{ this is not json ');
+  withTempConfigDir((file) => {
+    fs.writeFileSync(file, '{ this is not json ');
+    // Pin the fixture to the path readConfig actually reads. Without this the test can go
+    // vacuous again — a fixture written elsewhere leaves NO file, and a missing file
+    // returns these same defaults, so the malformed-json branch would silently stop running.
+    assert.ok(fs.existsSync(paths.configPath()));
     assert.deepStrictEqual(readConfig(), DEFAULT_CONFIG);
-  } finally {
-    for (const k of envKeys) {
-      if (saved[k] === undefined) delete process.env[k];
-      else process.env[k] = saved[k];
-    }
-    fs.rmSync(tmp, { recursive: true, force: true });
-  }
+  });
 });

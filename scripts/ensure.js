@@ -24,10 +24,14 @@ const { resolveOwnerPid } = require('./owner-pid');
 const DEFAULT_PORT = 4319;
 const HEALTH_TIMEOUT_MS = 300;
 // Hard ceiling for the owner probe, enforced across BOTH of its stages (see
-// resolveOwnerPid). It measures ~200ms via wmic, so this is generous — but it is on
-// SessionStart's critical path, and a wedged WMI service must not turn every session
-// start (including resume, /clear and /compact) into a multi-second stall.
-const OWNER_PROBE_MS = 1200;
+// resolveOwnerPid). It is on SessionStart's critical path, so a wedged WMI service must
+// not turn every session start (including resume, /clear and /compact) into a
+// multi-second stall — but the ceiling has to clear the SLOWEST plausible wmic, not the
+// fastest. 1200ms did not: wmic costs ~200ms on some machines and 1057–1243ms on others
+// (measured, 4 runs, a ~550-process Windows 11 box), so the probe was a coin flip there
+// — 2 of 6 SessionStarts recorded a pid, and the rest silently kept the ~6h idle reaper
+// AND could never resolve a focus target, which waits on the verified pid.
+const OWNER_PROBE_MS = 2500;
 // Backstop so we never hang SessionStart. On Windows it must outlast the owner probe,
 // or the backstop would fire first and kill the probe every time.
 const EXIT_GUARD_MS = process.platform === 'win32' ? OWNER_PROBE_MS + 800 : 1000;
