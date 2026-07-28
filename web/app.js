@@ -78,10 +78,21 @@ function loadPref(key) {
   }
 }
 
+// The five usage classes (cacheWrite = 5-minute TTL, cacheWrite1h = 1-hour TTL —
+// they bill at different rates, so the daemon tracks them apart).
+const TOKEN_CLASSES = ["input", "output", "cacheRead", "cacheWrite", "cacheWrite1h"];
+
 function sumTokens(t) {
   if (t == null) return 0;
   if (typeof t === "number") return num(t);
-  return num(t.input) + num(t.output) + num(t.cacheRead) + num(t.cacheWrite);
+  let s = 0;
+  for (const k of TOKEN_CLASSES) s += num(t[k]);
+  return s;
+}
+
+// Total cache-write tokens across both TTLs.
+function cacheWriteTokens(t) {
+  return num(t && t.cacheWrite) + num(t && t.cacheWrite1h);
 }
 
 function basename(p) {
@@ -1588,7 +1599,7 @@ const REPO_COLS = [
 ];
 
 function tokensBreakdown(t) {
-  return `in ${fmtTokens(t.input)} · out ${fmtTokens(t.output)} · cache ${fmtTokens(num(t.cacheRead) + num(t.cacheWrite))}`;
+  return `in ${fmtTokens(t.input)} · out ${fmtTokens(t.output)} · cache ${fmtTokens(num(t.cacheRead) + cacheWriteTokens(t))}`;
 }
 
 // Sum a repo's per-tool counts. Returns null when the field is absent (older data /
@@ -1993,7 +2004,7 @@ function parseLocalDate(s) {
 function avgContext(d) {
   const t = d.tokens || {};
   const chats = num(d.prompts);
-  return chats > 0 ? (num(t.input) + num(t.cacheRead) + num(t.cacheWrite)) / chats : 0;
+  return chats > 0 ? (num(t.input) + num(t.cacheRead) + cacheWriteTokens(t)) / chats : 0;
 }
 
 function histCats(perDay) {
@@ -2235,14 +2246,21 @@ function rateRowHTML(model, r) {
     <td><input class="r-output" type="number" min="0" step="0.01" value="${num(r.output)}"></td>
     <td><input class="r-cacheRead" type="number" min="0" step="0.01" value="${num(r.cacheRead)}"></td>
     <td><input class="r-cacheWrite" type="number" min="0" step="0.01" value="${num(r.cacheWrite)}"></td>
+    <td><input class="r-cacheWrite1h" type="number" min="0" step="0.01" placeholder="5m rate"
+      value="${r.cacheWrite1h == null ? "" : num(r.cacheWrite1h)}"></td>
     <td><button class="rm" type="button" title="Remove">×</button></td>
   </tr>`;
 }
 
 function ratesTableHTML(rates) {
   const rows = Object.keys(rates || {}).map((m) => rateRowHTML(m, rates[m])).join("");
+  // Cache writes are billed by TTL: 5m at 1.25x input, 1h at 2x. Leaving the 1h cell
+  // BLANK is meaningful — the model then falls back to its 5m rate (pricing.js), which
+  // is what a rate saved before this column existed already did. Blank is therefore
+  // shown and saved as absent, never as 0 (0 would price 1-hour cache writes free).
   return (
-    `<table class="rates"><thead><tr><th>Model</th><th>Input</th><th>Output</th><th>Cache read</th><th>Cache write</th><th></th></tr></thead>` +
+    `<table class="rates"><thead><tr><th>Model</th><th>Input</th><th>Output</th><th>Cache read</th>` +
+    `<th>Cache write 5m</th><th>Cache write 1h</th><th></th></tr></thead>` +
     `<tbody id="rates-body">${rows}</tbody></table>` +
     `<button class="btn" id="add-rate" type="button">+ Add model</button>`
   );
@@ -2407,6 +2425,10 @@ function readSettingsForm() {
       cacheRead: num(tr.querySelector(".r-cacheRead").value),
       cacheWrite: num(tr.querySelector(".r-cacheWrite").value),
     };
+    // Blank 1h cell -> omit the key, so pricing falls back to the 5m rate. Sending 0
+    // instead would silently price every 1-hour cache write as free.
+    const h1 = tr.querySelector(".r-cacheWrite1h").value.trim();
+    if (h1 !== "") rates[model].cacheWrite1h = num(h1);
   });
   // Send the FULL config: config.validateConfig rebuilds from defaults, so a
   // partial PUT would reset everything else. `port` isn't UI-editable — preserve it.

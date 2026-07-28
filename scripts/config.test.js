@@ -249,8 +249,9 @@ test('migrateRawConfig: stale Opus 4.8 default is corrected and version stamped'
   assert.strictEqual(changed, true);
   assert.strictEqual(config.configVersion, CONFIG_VERSION);
   assert.deepStrictEqual(config.cost.rates['claude-opus-4-8'], NEW_OPUS_48);
-  // A rate that didn't change value is left exactly as-is.
-  assert.deepStrictEqual(config.cost.rates['claude-haiku-4-5'], { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 });
+  // The four required classes are untouched (this rate matched the shipped default,
+  // so nothing was "corrected"), but v2->v3 fills in the new optional 1h rate.
+  assert.deepStrictEqual(config.cost.rates['claude-haiku-4-5'], DEFAULT_CONFIG.cost.rates['claude-haiku-4-5']);
 });
 
 test('migrateRawConfig: detects the stale default even when numbers are quoted', () => {
@@ -356,4 +357,58 @@ test('readConfig: malformed json file -> defaults (never throws)', () => {
     }
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+// ---- v1 -> v2 migration: rate keys added in v2 -------------------------
+
+test('migrateRawConfig: a v1 config gains the Opus 5 rate it could not have saved', () => {
+  const raw = { configVersion: 1, cost: { rates: { 'claude-opus-4-8': { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 } } } };
+  const { config, changed } = migrateRawConfig(raw);
+  assert.strictEqual(changed, true);
+  assert.strictEqual(config.configVersion, CONFIG_VERSION);
+  assert.deepStrictEqual(config.cost.rates['claude-opus-5'], DEFAULT_CONFIG.cost.rates['claude-opus-5']);
+});
+
+test('migrateRawConfig: an existing Opus 5 rate is never overwritten', () => {
+  const custom = { input: 7, output: 30, cacheRead: 0.7, cacheWrite: 8 };
+  const raw = { configVersion: 1, cost: { rates: { 'claude-opus-5': { ...custom } } } };
+  assert.deepStrictEqual(migrateRawConfig(raw).config.cost.rates['claude-opus-5'], custom);
+});
+
+test('migrateRawConfig: no rates map -> nothing added (live defaults already apply)', () => {
+  const { config } = migrateRawConfig({ configVersion: 1, port: 5000 });
+  assert.strictEqual(config.cost, undefined);
+  assert.strictEqual(config.configVersion, CONFIG_VERSION);
+});
+
+// ---- v2 -> v3 migration: the optional 1-hour cache-write rate --------------
+
+test('migrateRawConfig: an UNTOUCHED default rate gains the new cacheWrite1h', () => {
+  const untouched = { ...DEFAULT_CONFIG.cost.rates['claude-opus-4-8'] };
+  delete untouched.cacheWrite1h; // as saved before the class existed
+  const { config } = migrateRawConfig({ configVersion: 2, cost: { rates: { 'claude-opus-4-8': untouched } } });
+  assert.strictEqual(config.cost.rates['claude-opus-4-8'].cacheWrite1h,
+    DEFAULT_CONFIG.cost.rates['claude-opus-4-8'].cacheWrite1h);
+});
+
+test('migrateRawConfig: a CUSTOMIZED rate is NOT given a cacheWrite1h', () => {
+  // Its own cacheWrite must keep governing both TTLs (pricing's fallback) — injecting
+  // 2x-input here would silently re-price a number the user chose deliberately.
+  const custom = { input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5 };
+  const { config } = migrateRawConfig({ configVersion: 2, cost: { rates: { 'claude-opus-4-8': { ...custom } } } });
+  assert.deepStrictEqual(config.cost.rates['claude-opus-4-8'], custom);
+});
+
+test('migrateRawConfig: an explicit cacheWrite1h is never overwritten', () => {
+  const mine = { ...DEFAULT_CONFIG.cost.rates['claude-opus-4-8'], cacheWrite1h: 99 };
+  const { config } = migrateRawConfig({ configVersion: 2, cost: { rates: { 'claude-opus-4-8': mine } } });
+  assert.strictEqual(config.cost.rates['claude-opus-4-8'].cacheWrite1h, 99);
+});
+
+test('validateConfig: cacheWrite1h survives validation; absent stays absent (fallback applies)', () => {
+  const withIt = validateConfig({ cost: { rates: { m: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1.25, cacheWrite1h: 2 } } } });
+  assert.strictEqual(withIt.config.cost.rates.m.cacheWrite1h, 2);
+  const without = validateConfig({ cost: { rates: { m: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1.25 } } } });
+  assert.ok(without.valid);
+  assert.strictEqual('cacheWrite1h' in without.config.cost.rates.m, false);
 });

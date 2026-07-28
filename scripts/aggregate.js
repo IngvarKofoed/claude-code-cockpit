@@ -12,8 +12,12 @@ function num(v) {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
 
+// The five token classes — cacheWrite is 5-minute-TTL cache writes, cacheWrite1h
+// 1-hour-TTL ones, which bill at a different rate (see pricing.js).
+const TOKEN_CLASSES = ['input', 'output', 'cacheRead', 'cacheWrite', 'cacheWrite1h'];
+
 function emptyTokens() {
-  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0 };
 }
 
 // Epoch ms for an ISO string, or 0 when absent/unparseable — used only for
@@ -566,10 +570,7 @@ function bumpLastActive(repo, ts) {
 }
 
 function addTokens(dst, tokens) {
-  dst.input += num(tokens && tokens.input);
-  dst.output += num(tokens && tokens.output);
-  dst.cacheRead += num(tokens && tokens.cacheRead);
-  dst.cacheWrite += num(tokens && tokens.cacheWrite);
+  for (const k of TOKEN_CLASSES) dst[k] = num(dst[k]) + num(tokens && tokens[k]);
 }
 
 // Fold one completed turn's prompt + tokens into the repo (and per-model) totals.
@@ -635,7 +636,7 @@ function sumByModel(byModel) {
   const bm = byModel && typeof byModel === 'object' ? byModel : {};
   for (const model of Object.keys(bm)) {
     const t = bm[model] || {};
-    s += num(t.input) + num(t.output) + num(t.cacheRead) + num(t.cacheWrite);
+    for (const k of TOKEN_CLASSES) s += num(t[k]);
   }
   return s;
 }
@@ -792,6 +793,9 @@ function accumulateSessionStatsFromEvents(events) {
 }
 
 module.exports = {
+  // Exported so a test can assert this module's token-class list still matches
+  // pricing.USAGE_KEYS (separate copies — this pure module doesn't import pricing).
+  __testEmptyTokens: emptyTokens,
   createState,
   applyEvent,
   atRest,

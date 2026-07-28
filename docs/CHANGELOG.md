@@ -1013,3 +1013,64 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
 120. New Live sort "Context % (fullest first)" (v0.40.0), per-browser like the other two.
      Sessions with no reading sink BELOW every session that has one instead of sorting as 0% —
      unknown is not empty, the same rule the rest of the accounting follows.
+
+121. Opus 5 now prices out of the box (v0.41.0) at the Opus 4.5+ tier ($5/$25, cacheRead 0.5 / cacheWrite 6.25).
+     It was unpriced, so every Opus 5 turn rendered "—" and its cost was silently dropped from
+     totals (`estimateCost().total` sums only priced models) — $989 of real spend in this store.
+     Known limit: fast mode bills $10/$50 but carries the same model id, so it under-estimates.
+
+
+122. Rates resolve through a base-model fallback, so a context-window variant id
+     (`claude-opus-5[1m]`) prices at its base rate instead of reading as unpriced. Safe because
+     Opus 4.7+/Sonnet 5 ship 1M context with no long-context premium; an explicit variant entry
+     still wins, leaving room for a future premium variant. Also fixes `claude-opus-4-8[1m]`.
+     `daemon.costByTypeFor` had to resolve the same way or its cost-by-type split would count a
+     variant as priced yet add $0, breaking its Σ-classes === day-total invariant.
+
+
+123. CONFIG_VERSION 2 adds a rate key that first shipped as a v2 default to a persisted `rates`
+     map. A saved map REPLACES the defaults (entry 5), so anyone who had touched Settings would
+     price Opus 5 as "—" forever. Re-adding is safe only for never-before-shipped keys: their
+     absence can't be a deliberate Settings removal, which is why the v0→v1 step still never
+     re-adds a missing key. An existing entry, at any value, is left untouched.
+
+
+124. Cache writes are now tracked and priced by TTL: `cacheWrite` (5-minute, 1.25x input) and a
+     new `cacheWrite1h` (1-hour, 2x input) fifth token class, split at the source from the
+     transcript's `cache_creation.ephemeral_{5m,1h}_input_tokens`. Claude Code writes ~41% of
+     its cache at 1h, so one blended rate understated cost badly — measured $2,153 on Opus 4.8
+     alone. `cache_creation_input_tokens` stays authoritative for the sum (5m is its remainder).
+
+
+125. `cacheWrite1h` is OPTIONAL in a rate and falls back to `cacheWrite` (`pricing.RATE_FALLBACK`).
+     This is load-bearing, not politeness: adding it to the REQUIRED classes would fail
+     `isCompleteRate` for every rates map saved before it existed and render the whole dashboard
+     unpriced. Absent means "price 1h at the 5m rate" — the old behavior — never $0, which would
+     make 1-hour cache writes free. `validateRate` omits the key rather than defaulting it to 0.
+
+
+126. CONFIG_VERSION 3 fills in `cacheWrite1h` only on a persisted rate whose four required
+     classes still equal the shipped default — an entry the user never edited. A CUSTOMIZED rate
+     is deliberately left alone so its own `cacheWrite` keeps governing both TTLs via the
+     fallback, which is what that number meant when it was saved; injecting 2x-input there would
+     silently re-price a deliberate choice.
+
+
+127. Settings' rate editor gained a "Cache write 1h" column (and relabelled the other to
+     "Cache write 5m"). Not cosmetic: the save path rebuilds `rates` from that table, so without
+     the column every save would silently strip the 1h rate back to 5m pricing. A BLANK cell is
+     meaningful and round-trips as an absent key (the fallback), never as 0.
+
+
+128. Pricing gained the rest of the current table — Mythos 5, plus the deprecated/retired Opus
+     4.1/4.0, Sonnet 4 and Haiku 3.5 tiers so a backfilled old transcript prices instead of "—".
+     `baseModelId` also strips a dated snapshot suffix (`claude-haiku-4-5-20251001`), a pricing
+     identity since a snapshot always bills at its alias's rate; that alone recovered $85.
+     Sonnet 5 deliberately STAYS at the post-intro $3/$15 (entry 22), so it over-states by 50%
+     until the intro rate lapses 2026-08-31 — a known, accepted gap, not an oversight.
+
+129. Released v0.41.0, carrying entries 121–128. The bump is load-bearing per entry 103:
+     `ensure.js` replaces a running daemon only when `/health` reports a DIFFERENT version — and
+     0.40.0 was already taken by the context-window gauge (entries 118–120), so reusing it would
+     have left every daemon already on 0.40.0 running the old, unpriced code.
+

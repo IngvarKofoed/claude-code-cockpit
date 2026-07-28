@@ -14,8 +14,34 @@ function num(v) {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
 
+// The five token classes. cacheWrite is 5-minute-TTL cache writes, cacheWrite1h
+// 1-hour-TTL ones — they bill at different rates (1.25x vs 2x input), so they are
+// tracked apart. Kept as one list so a class can't be missed by a later edit.
+const TOKEN_CLASSES = ['input', 'output', 'cacheRead', 'cacheWrite', 'cacheWrite1h'];
+
 function emptyTokens() {
-  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0 };
+}
+
+// Split cache-creation tokens by TTL. `cache_creation_input_tokens` is the total;
+// the `cache_creation` sub-object breaks it into 5m/1h. Verified against real
+// transcripts: total === 5m + 1h exactly. Version-tolerant per this module's
+// contract — a transcript with no `cache_creation` object (an older Claude Code)
+// puts everything in the 5m bucket, which is what the daemon already assumed. Any
+// unexplained remainder also lands in 5m, so no token is ever dropped.
+function splitCacheWrite(usage) {
+  const total = num(usage.cache_creation_input_tokens);
+  const cc = usage.cache_creation;
+  if (!cc || typeof cc !== 'object') return { cacheWrite: total, cacheWrite1h: 0 };
+  const h1 = num(cc.ephemeral_1h_input_tokens);
+  const m5 = num(cc.ephemeral_5m_input_tokens);
+  // `cache_creation_input_tokens` is authoritative for the SUM, so derive 5m as
+  // the remainder: the two buckets then always add back up to it, whatever the
+  // sub-object says. If the total is missing but the parts aren't, trust the parts
+  // rather than reporting zero (the no-wrong-zero rule).
+  if (total <= 0) return { cacheWrite: m5, cacheWrite1h: h1 };
+  const capped1h = h1 > total ? total : h1;
+  return { cacheWrite: total - capped1h, cacheWrite1h: capped1h };
 }
 
 // Parse one already-JSON-decoded transcript line into a usage entry, or null if
@@ -45,6 +71,8 @@ function parseUsageLine(obj) {
   // session's DISPLAYED model (a subagent's model isn't the session's model).
   const sidechain = obj.isSidechain === true;
 
+  const cacheWrites = splitCacheWrite(usage);
+
   return {
     id,
     ts,
@@ -53,7 +81,8 @@ function parseUsageLine(obj) {
     input: num(usage.input_tokens),
     output: num(usage.output_tokens),
     cacheRead: num(usage.cache_read_input_tokens),
-    cacheWrite: num(usage.cache_creation_input_tokens),
+    cacheWrite: cacheWrites.cacheWrite,
+    cacheWrite1h: cacheWrites.cacheWrite1h,
   };
 }
 
@@ -136,7 +165,7 @@ function readUsageContent(content) {
 
     const key = entry.model || 'unknown';
     const bucket = result.byModel[key] || (result.byModel[key] = emptyTokens());
-    for (const k of ['input', 'output', 'cacheRead', 'cacheWrite']) {
+    for (const k of TOKEN_CLASSES) {
       bucket[k] += entry[k];
       result.totals[k] += entry[k];
     }
@@ -150,4 +179,7 @@ function readUsageContent(content) {
   return result;
 }
 
-module.exports = { readUsage, readUsageContent, parseUsageLine };
+// __testEmptyTokens is exported so a test can assert this module's token-class list
+// still matches pricing.USAGE_KEYS — the lists are separate copies (these pure
+// modules don't import pricing), and a drift would silently stop counting a class.
+module.exports = { readUsage, readUsageContent, parseUsageLine, __testEmptyTokens: emptyTokens };

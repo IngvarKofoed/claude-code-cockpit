@@ -615,7 +615,7 @@ test('snapshot on empty state yields no sessions', () => {
 
 // --- rollups -----------------------------------------------------------------
 
-const T = (o = {}) => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, ...o });
+const T = (o = {}) => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0, ...o });
 
 test('accumulateTurn: sums prompts, tokens, and byModel (NOT active time)', () => {
   let r = createRollup('2026-07-02');
@@ -638,7 +638,7 @@ test('accumulateTurn: sums prompts, tokens, and byModel (NOT active time)', () =
   const repo = r.repos['/code/acme-api'];
   assert.strictEqual(repo.activeMs, 0); // active time is event-derived, not from durationMs
   assert.strictEqual(repo.prompts, 2);
-  assert.deepStrictEqual(repo.tokens, { input: 110, output: 55, cacheRead: 3, cacheWrite: 7 });
+  assert.deepStrictEqual(repo.tokens, T({ input: 110, output: 55, cacheRead: 3, cacheWrite: 7 }));
   assert.strictEqual(repo.byModel['claude-sonnet-5'].input, 100);
   assert.strictEqual(repo.byModel['claude-opus-4-8'].cacheWrite, 7);
   assert.strictEqual(repo.lastActive, '2026-07-02T10:05:00.000Z'); // latest ts wins
@@ -651,7 +651,7 @@ test('accumulateTurn: tolerates missing tokens/duration (treated as zero)', () =
   const repo = r.repos['/r'];
   assert.strictEqual(repo.activeMs, 0);
   assert.strictEqual(repo.prompts, 1);
-  assert.deepStrictEqual(repo.tokens, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+  assert.deepStrictEqual(repo.tokens, T());
 });
 
 test('accumulateTurn: no repoRoot is a safe no-op', () => {
@@ -729,7 +729,7 @@ test('accumulateTurnByModel: one turn, tokens split per model, counted once', ()
   const repo = r.repos['/code/acme-api'];
   assert.strictEqual(repo.prompts, 1); // ONE turn, even though it spans two models
   assert.strictEqual(repo.activeMs, 0); // active time is event-derived, not from durationMs
-  assert.deepStrictEqual(repo.tokens, { input: 110, output: 205, cacheRead: 0, cacheWrite: 0 });
+  assert.deepStrictEqual(repo.tokens, T({ input: 110, output: 205 }));
   // Each model keeps its own bucket, so cost can be priced at each model's rate.
   assert.strictEqual(repo.byModel['claude-opus-4-8'].output, 200);
   assert.strictEqual(repo.byModel['claude-haiku-4-5'].input, 10);
@@ -745,7 +745,7 @@ test('accumulateTokensByModel: adds tokens per model WITHOUT counting a turn', (
   const repo = r.repos['/code/acme-api'];
   assert.strictEqual(repo.prompts, 0); // NOT a turn — backfill only
   assert.strictEqual(repo.activeMs, 0); // no duration attributed
-  assert.deepStrictEqual(repo.tokens, { input: 100, output: 50, cacheRead: 20, cacheWrite: 0 });
+  assert.deepStrictEqual(repo.tokens, T({ input: 100, output: 50, cacheRead: 20 }));
   assert.strictEqual(repo.byModel['claude-opus-4-8'].input, 100);
   assert.strictEqual(repo.lastActive, '2026-07-02T09:00:00.000Z');
 });

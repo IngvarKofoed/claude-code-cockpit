@@ -167,15 +167,42 @@ function num(v) {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
 
+// The five usage classes, owned by pricing.js so the cost math and the token
+// bookkeeping can't drift apart (cacheWrite = 5m TTL, cacheWrite1h = 1h TTL).
+const TOKEN_CLASSES = pricing.USAGE_KEYS;
+
 function emptyTokens() {
-  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  const out = {};
+  for (const k of TOKEN_CLASSES) out[k] = 0;
+  return out;
 }
 
 function addTokens(dst, t) {
-  dst.input += num(t && t.input);
-  dst.output += num(t && t.output);
-  dst.cacheRead += num(t && t.cacheRead);
-  dst.cacheWrite += num(t && t.cacheWrite);
+  for (const k of TOKEN_CLASSES) dst[k] = num(dst[k]) + num(t && t[k]);
+}
+
+// Extract just the usage classes from a wider object (e.g. a flat usage record),
+// so every class travels together and none is dropped by a hand-written literal.
+function pickTokens(src) {
+  const out = {};
+  for (const k of TOKEN_CLASSES) out[k] = num(src && src[k]);
+  return out;
+}
+
+// Grand total across every usage class. One helper so an added class can't be
+// missed by an emptiness test or a change check enumerating the classes by hand.
+function sumTokens(t) {
+  let s = 0;
+  for (const k of TOKEN_CLASSES) s += num(t && t[k]);
+  return s;
+}
+
+// True when two token records differ in ANY class. Used to decide whether a
+// transcript re-read actually moved the numbers.
+function tokensDiffer(a, b) {
+  if (!a || !b) return a !== b;
+  for (const k of TOKEN_CLASSES) if (num(a[k]) !== num(b[k])) return true;
+  return false;
 }
 
 // Local calendar day ('YYYY-MM-DD') for an ISO timestamp, or null if unparseable.
@@ -416,9 +443,13 @@ function loadSnapshot() {
 // tokens attributed to a past day) contributes tokens/cost only; a normal turn
 // record also counts as a turn (prompt + active time).
 function applyUsageRecord(rollup, u) {
+  // Fallback for a record with no byModel map: rebuild one from the flat totals.
+  // A record written before cacheWrite1h existed simply has no such field, so it
+  // reads as 0 and its cache writes stay priced at the 5m rate — the same figure
+  // that record was always worth. No rewrite, and no retroactive re-pricing.
   const byModel = u.byModel && typeof u.byModel === 'object'
     ? u.byModel
-    : { [u.model || 'unknown']: { input: u.input, output: u.output, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite } };
+    : { [u.model || 'unknown']: pickTokens(u) };
   // subId + the raw base name both come off the usage record (u.subscription / u.subscriptionName),
   // so a recomputed past day carries a real label — not just the id — even when the subscription
   // never appears on the live path within the aggregated range. subName may be absent on records
@@ -889,7 +920,7 @@ async function sessionActiveTotals() {
 // an opened-but-never-worked session. tokens:null means the transcript was unreadable, which
 // is UNKNOWN not zero, so it is NOT empty and stays listed as "—" (the no-wrong-zero rule).
 function isEmptyTokens(t) {
-  return t != null && num(t.input) + num(t.output) + num(t.cacheRead) + num(t.cacheWrite) === 0;
+  return t != null && sumTokens(t) === 0;
 }
 
 // sessionsFileList minus the sessions that spent 0 tokens. Classifying emptiness needs each
@@ -1156,7 +1187,7 @@ function isIdleEmptySession(s) {
   if (num(s.bgTasks) > 0) return false;
   const t = s.tokens;
   if (t == null) return false; // unknown tokens -> keep, never filter on a wrong zero
-  return num(t.input) + num(t.output) + num(t.cacheRead) + num(t.cacheWrite) === 0;
+  return sumTokens(t) === 0;
 }
 
 // Recompute the "safe to close" summary and fire the one-per-pause walk-away notification on
@@ -1492,10 +1523,10 @@ function recordTurn(sid, stopEvent, usage, fresh, seen, allBackfill = false) {
         subscription: subId, // the ingesting session's captured subscription id (or null)
         subscriptionName: subName, // raw base name (or null), so a recomputed past day keeps a real label
         byModel: g.byModel,
-        input: g.totals.input,
-        output: g.totals.output,
-        cacheRead: g.totals.cacheRead,
-        cacheWrite: g.totals.cacheWrite,
+        // Flat totals alongside byModel (the fallback applyUsageRecord reads for a
+        // record that lacks the map). Spread so a new usage class is persisted
+        // automatically instead of being silently dropped from new records.
+        ...pickTokens(g.totals),
         backfill: isTurn ? undefined : true,
         ids: g.ids,
       },
@@ -1828,10 +1859,6 @@ function aggregateReposAcrossDates(dates, { trackSessions = true } = {}) {
   return agg;
 }
 
-// Token classes in the canonical order pricing.js uses; local copy since it isn't
-// exported. Drives the costByType split below.
-const TOKEN_CLASSES = ['input', 'output', 'cacheRead', 'cacheWrite'];
-
 // Sum a { key -> count } map defensively (used for a repo's total tool count = Σ byTool).
 function sumCounts(map) {
   let s = 0;
@@ -1839,21 +1866,24 @@ function sumCounts(map) {
   return s;
 }
 
-// Cost split across the four token classes for a combined { model -> tokens } map,
+// Cost split across the four DISPLAY classes for a combined { model -> tokens } map,
 // priced from cfg.cost.rates. For each PRICED model (a complete rate — determined by
 // pricing.estimateCost, so unpriced/partial-rate models are skipped identically to it),
-// add tokens[class] × rate[class] / 1e6 per class. Σ over the classes therefore equals
-// pricing.estimateCost(byModel).total. Assumes cfg.cost.enabled (caller gates on it).
+// Σ over the classes equals pricing.estimateCost(byModel).total. The per-class math and
+// the rate lookup both live in pricing.costByClass, so this can't drift from the day
+// total — a bare rates[model] here would miss a "[1m]" variant's base rate, and a
+// locally-enumerated class list would silently drop 1-hour cache writes. 1h cache-write
+// cost folds into the cacheWrite band (same activity, different TTL).
+// Assumes cfg.cost.enabled (caller gates on it).
 function costByTypeFor(byModel, pricedIn) {
-  const out = emptyTokens();
+  const out = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   // priced = { model: cost|null } from estimateCost; buildHistory passes the map it
   // already computed for the day total so the same combined map isn't priced twice.
   const priced = pricedIn || pricing.estimateCost(byModel, cfg.cost.rates).byModel;
   for (const model of Object.keys(byModel || {})) {
     if (priced[model] == null) continue; // unpriced -> skipped, matching estimateCost
-    const rate = cfg.cost.rates[model] || {};
-    const usage = byModel[model] || {};
-    for (const k of TOKEN_CLASSES) out[k] += (num(usage[k]) * num(rate[k])) / 1e6;
+    const split = pricing.costByClass(byModel[model], pricing.resolveRate(model, cfg.cost.rates));
+    for (const k of Object.keys(out)) out[k] += split[k];
   }
   return out;
 }
@@ -3001,9 +3031,9 @@ function pollTokens() {
     }
     if (!usage.ok) continue;
     const before = s.tokens;
-    const changed = !before ||
-      before.input !== usage.totals.input || before.output !== usage.totals.output ||
-      before.cacheRead !== usage.totals.cacheRead || before.cacheWrite !== usage.totals.cacheWrite;
+    // Every class, not just four: a turn that only wrote 1-hour cache leaves the 5m
+    // figure untouched, so a hand-enumerated compare would miss it and skip the refresh.
+    const changed = !before || tokensDiffer(before, usage.totals);
     // Running: refresh on any token change. Idle title-backfill: refresh regardless (it may
     // bring a name with no token delta), but only broadcast when tokens or the title moved.
     if (changed || !running) {

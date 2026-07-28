@@ -12,7 +12,7 @@ const paths = require('./paths');
 // Schema version for one-time config migrations (see migrateRawConfig). Bump
 // this when a shipped default changes in a way that must reach users who have
 // already persisted the old value, and add the matching migration below.
-const CONFIG_VERSION = 1;
+const CONFIG_VERSION = 3;
 
 const DEFAULT_CONFIG = {
   configVersion: CONFIG_VERSION,
@@ -48,19 +48,38 @@ const DEFAULT_CONFIG = {
     enabled: true,
     currency: 'USD',
     rates: {
-      // USD per 1,000,000 tokens. cacheWrite is the 5-minute-TTL rate
-      // (1.25x input, Claude Code's default); cacheRead is 0.1x input.
-      'claude-fable-5': { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
-      'claude-opus-4-8': { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
-      'claude-opus-4-7': { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
-      'claude-opus-4-6': { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
-      'claude-opus-4-5': { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+      // USD per 1,000,000 tokens. cacheWrite is the 5-minute-TTL cache-write rate
+      // (1.25x input) and cacheWrite1h the 1-hour one (2x input); cacheRead is 0.1x
+      // input. Both TTLs occur in normal Claude Code use — roughly 40% of cache
+      // writes are 1h — so pricing them at one rate materially understates cost.
+      // cacheWrite1h is OPTIONAL in a rate and falls back to cacheWrite (see
+      // pricing.RATE_FALLBACK), which is what keeps an older saved map working.
+      'claude-fable-5': { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5, cacheWrite1h: 20 },
+      'claude-mythos-5': { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5, cacheWrite1h: 20 },
+      // Opus 5 prices at the Opus 4.5+ tier, and its 1M context is the default
+      // with no long-context premium — so the "[1m]" variant id bills the same
+      // (priced via pricing.js's base-id fallback, not a second entry here).
+      // Fast mode ($10/$50) is NOT distinguishable from the model id, so a
+      // fast-mode turn is under-estimated; accepted (no local signal for it).
+      'claude-opus-5': { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
+      'claude-opus-4-8': { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
+      'claude-opus-4-7': { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
+      'claude-opus-4-6': { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
+      'claude-opus-4-5': { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
       // Sonnet 5 has an intro rate of $2/$10 through 2026-08-31; this is the
       // standard post-intro rate it reverts to (see docs/CHANGELOG.md).
-      'claude-sonnet-5': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
-      'claude-sonnet-4-6': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
-      'claude-sonnet-4-5': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
-      'claude-haiku-4-5': { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 },
+      'claude-sonnet-5': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, cacheWrite1h: 6 },
+      'claude-sonnet-4-6': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, cacheWrite1h: 6 },
+      'claude-sonnet-4-5': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, cacheWrite1h: 6 },
+      'claude-haiku-4-5': { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25, cacheWrite1h: 2 },
+      // Deprecated / retired tiers, kept so BACKFILL of an old transcript prices
+      // rather than showing "—". A dated snapshot id (claude-opus-4-1-20250805)
+      // resolves here via pricing.js's base-id fallback, which is also why the
+      // retired Haiku 3.5 is keyed by its base id — it never had a dotless alias.
+      'claude-opus-4-1': { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75, cacheWrite1h: 30 },
+      'claude-opus-4-0': { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75, cacheWrite1h: 30 },
+      'claude-sonnet-4-0': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, cacheWrite1h: 6 },
+      'claude-3-5-haiku': { input: 0.8, output: 4, cacheRead: 0.08, cacheWrite: 1, cacheWrite1h: 1.6 },
     },
   },
   idleShutdownHours: 0,
@@ -82,6 +101,22 @@ const PRE_V1_DEFAULT_RATES = {
   'claude-opus-4-8': { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 },
 };
 deepFreeze(PRE_V1_DEFAULT_RATES);
+
+// Rate keys that FIRST shipped as defaults in configVersion 2. A persisted
+// `rates` map REPLACES the defaults (see validateConfig), so a user who saved
+// Settings before these models existed would price them as "—" forever. Adding
+// them back is safe precisely because they were never in an earlier shipped
+// default: their absence cannot be a deliberate Settings removal (unlike
+// claude-opus-4-8, which is why the v0->v1 step never re-adds a missing key).
+const RATE_MODELS_ADDED_IN_V2 = [
+  'claude-opus-5',
+  'claude-mythos-5',
+  'claude-opus-4-1',
+  'claude-opus-4-0',
+  'claude-sonnet-4-0',
+  'claude-3-5-haiku',
+];
+deepFreeze(RATE_MODELS_ADDED_IN_V2);
 
 // ---- small helpers -----------------------------------------------------
 
@@ -127,22 +162,35 @@ function clampMin(n, min) {
   return n < min ? min : n;
 }
 
+// The four classes a rate must define, and the optional ones it may. An optional
+// class that is absent (or unparseable) is OMITTED from the result rather than
+// defaulted, so pricing.js applies its documented fallback (cacheWrite1h ->
+// cacheWrite) instead of a silent 0 — a 0 would price 1-hour cache writes free.
+const REQUIRED_RATE_KEYS = ['input', 'output', 'cacheRead', 'cacheWrite'];
+const OPTIONAL_RATE_KEYS = ['cacheWrite1h'];
+
 function validateRate(r) {
   if (!isPlainObject(r)) return null;
   const out = {};
-  for (const k of ['input', 'output', 'cacheRead', 'cacheWrite']) {
+  for (const k of REQUIRED_RATE_KEYS) {
     const n = toNum(r[k]);
     if (n === null) return null;
     out[k] = clampMin(n, 0); // negative money rates are nonsensical
+  }
+  for (const k of OPTIONAL_RATE_KEYS) {
+    const n = toNum(r[k]);
+    if (n !== null) out[k] = clampMin(n, 0);
   }
   return out;
 }
 
 // Deep-equality for a rate entry, tolerant of numeric strings (a hand-edited
-// config may quote numbers), comparing only the four token classes.
+// config may quote numbers), comparing only the four REQUIRED token classes —
+// migrations use this to recognize an untouched shipped default, and a rate
+// predating an optional class must still match the default it came from.
 function ratesEqual(a, b) {
   if (!isPlainObject(a) || !isPlainObject(b)) return false;
-  for (const k of ['input', 'output', 'cacheRead', 'cacheWrite']) {
+  for (const k of REQUIRED_RATE_KEYS) {
     if (toNum(a[k]) !== toNum(b[k])) return false;
   }
   return true;
@@ -338,6 +386,30 @@ function migrateRawConfig(raw) {
       if (current && isPlainObject(saved) && ratesEqual(saved, PRE_V1_DEFAULT_RATES[model]) && !ratesEqual(saved, current)) {
         out.cost.rates[model] = clone(current);
       }
+    }
+  }
+  // v1 -> v2: add rate entries for models that first shipped as defaults in v2
+  // (see RATE_MODELS_ADDED_IN_V2 for why re-adding these can't undo a delete).
+  // An entry the user already has — at any value — is left untouched.
+  if (from < 2 && isPlainObject(out.cost) && isPlainObject(out.cost.rates)) {
+    for (const model of RATE_MODELS_ADDED_IN_V2) {
+      const current = DEFAULT_CONFIG.cost.rates[model];
+      if (current && !(model in out.cost.rates)) out.cost.rates[model] = clone(current);
+    }
+  }
+  // v2 -> v3: fill in the new cacheWrite1h (1-hour cache-write) rate — but ONLY on
+  // an entry whose four required classes still equal the current shipped default,
+  // i.e. one the user never edited. A CUSTOMIZED rate is left alone on purpose: its
+  // cacheWrite then governs both TTLs via pricing's fallback, which is exactly what
+  // that rate meant when it was saved. Injecting 2x-input there would silently
+  // re-price someone's deliberate number.
+  if (from < 3 && isPlainObject(out.cost) && isPlainObject(out.cost.rates)) {
+    for (const model of Object.keys(out.cost.rates)) {
+      const current = DEFAULT_CONFIG.cost.rates[model];
+      const saved = out.cost.rates[model];
+      if (!current || current.cacheWrite1h == null) continue; // no default 1h rate to apply
+      if (!isPlainObject(saved) || saved.cacheWrite1h != null) continue; // absent only
+      if (ratesEqual(saved, current)) saved.cacheWrite1h = current.cacheWrite1h;
     }
   }
   out.configVersion = CONFIG_VERSION;

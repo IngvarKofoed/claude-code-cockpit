@@ -37,6 +37,7 @@ test('parseUsageLine: flat usage shape maps every field', () => {
     output: 20,
     cacheRead: 3,
     cacheWrite: 5,
+    cacheWrite1h: 0, // no cache_creation sub-object -> all cache writes are 5m
   });
 });
 
@@ -100,6 +101,7 @@ test('parseUsageLine: missing token fields default to 0, missing model -> null',
     output: 0,
     cacheRead: 0,
     cacheWrite: 0,
+    cacheWrite1h: 0,
   });
 });
 
@@ -128,7 +130,7 @@ test('readUsage: parses mixed transcript, skipping malformed and no-usage lines'
   const r = readUsage(file);
   assert.strictEqual(r.ok, true);
   assert.strictEqual(r.messages.length, 2);
-  assert.deepStrictEqual(r.totals, { input: 300, output: 130, cacheRead: 5, cacheWrite: 10 });
+  assert.deepStrictEqual(r.totals, { input: 300, output: 130, cacheRead: 5, cacheWrite: 10, cacheWrite1h: 0 });
   assert.strictEqual(r.byModel['claude-sonnet-5'].input, 100);
   assert.strictEqual(r.byModel['claude-sonnet-5'].cacheWrite, 10);
   assert.strictEqual(r.byModel['claude-opus-4-8'].input, 200);
@@ -175,7 +177,7 @@ test('readUsage: missing file -> ok:false with empty totals', () => {
   assert.strictEqual(r.ok, false);
   assert.deepStrictEqual(r.messages, []);
   assert.deepStrictEqual(r.byModel, {});
-  assert.deepStrictEqual(r.totals, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+  assert.deepStrictEqual(r.totals, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0 });
 });
 
 test('readUsage: empty / whitespace-only file -> ok:false', () => {
