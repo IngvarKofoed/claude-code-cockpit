@@ -597,6 +597,43 @@ body {
   gap: 4px;
   min-width: 0;
 }
+
+/* Context-window meter, on its own line under the card head. A thin recessive track with a
+   status-coloured fill (usageColor) plus an always-present percentage — the number carries the
+   state, the colour only reinforces it. Thinner (4px) than the ribbon's usage bars: those are
+   the page's headline figures, this is one line on a dense card. The whole row is omitted when
+   the session has no reading, so it costs nothing on a card without one. */
+.card__ctx {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.card__ctx--stale { opacity: 0.55; } /* stopped reporting -> the fill is frozen, not current */
+.card__ctx-track {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.card__ctx-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  min-width: 2px;
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+.card__ctx-label {
+  flex: none;
+  font-size: 11px;
+  color: var(--ink-2); /* a text token, never the fill colour */
+  font-variant-numeric: tabular-nums;
+}
 .branch {
   display: inline-flex;
   align-items: center;

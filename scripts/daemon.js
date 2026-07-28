@@ -2204,9 +2204,26 @@ function handleInternalEvent(req, res) {
   });
 }
 
-// Statusline forwarder push of the account-wide rate-limit numbers. One global
-// snapshot, last write wins (rate limits are account-wide, so every session's
-// payload reports the same numbers). Privacy: only rate_limits is stored.
+// Hang a push's context_window on the session that sent it, returning whether the gauge's
+// numbers moved (so the caller can decide on a broadcast).
+//
+// Deliberately independent of the rate-limit path below, because the two have different
+// SCOPES: rate limits are account-wide, so a push from a non-current subscription is stale
+// and dropped — but a context window belongs to one session and is always true for it. It
+// therefore survives both that drop and a body carrying no rate_limits at all (an API-key
+// session, which never has them, still gets a working gauge).
+function applyContextPush(body) {
+  const ctx = usageLib.normalizeContextWindow(body && body.context_window);
+  if (!ctx) return false;
+  const sessionId = usageLib.pushSessionId(body);
+  if (!sessionId) return false; // unattributable -> no session to hang it on
+  return aggregate.setSessionContext(state.sessions[sessionId], ctx, Date.now());
+}
+
+// Statusline forwarder push of the account-wide rate-limit numbers plus the pushing
+// session's own context-window fill. The rate limits are one global snapshot, last write
+// wins (they're account-wide, so every session's payload reports the same numbers); the
+// context window is per-session. Privacy: only rate_limits + context_window are stored.
 // Normalization lives in the pure usage.js module (unit-tested there).
 function handleInternalUsage(req, res) {
   readBody(req, (raw) => {
@@ -2217,8 +2234,14 @@ function handleInternalUsage(req, res) {
     } catch (_e) {
       return; // unparseable -> drop, no update
     }
+    // Per-session context gauge first, so it is unaffected by the rate-limit drops below.
+    const ctxChanged = applyContextPush(body);
     const windows = usageLib.normalizeUsage(body);
-    if (!windows) return; // structurally malformed -> drop, never a partial update
+    if (!windows) {
+      // No rate_limits (or malformed) -> no bar update, but a context-only push still counts.
+      if (ctxChanged) markDirty();
+      return;
+    }
     // De-pollute the bar across a subscription switch: after a switch the OLD subscription's
     // sessions keep running and their lagging statusline pushes carry the OLD account's
     // rate-limit numbers, which last-write-wins would let clobber the NEW subscription's bar.
@@ -2269,6 +2292,9 @@ function handleInternalUsage(req, res) {
       } catch (_e) {
         /* diagnostic only */
       }
+      // The BAR update is dropped, but this session's context gauge was already applied
+      // above and is still valid — its fill doesn't depend on which subscription is current.
+      if (ctxChanged) markDirty();
       return; // stale non-current push -> drop
     }
     // The forwarder posts on every statusline render (frequently). Broadcast ONLY when the
@@ -2287,7 +2313,7 @@ function handleInternalUsage(req, res) {
       windows.fiveHour ? windows.fiveHour.usedPct : null,
       windows.sevenDay ? windows.sevenDay.usedPct : null
     );
-    if (changed) markDirty();
+    if (changed || ctxChanged) markDirty();
   });
 }
 

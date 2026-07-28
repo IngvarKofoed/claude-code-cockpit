@@ -26,19 +26,54 @@ function normalizeUsageWindow(w) {
   return { usedPct, resetsAt };
 }
 
+// Normalize the statusline's `context_window` ({ used_percentage, total_input_tokens,
+// total_output_tokens }) into { usedPct, tokens }, or null when there is no usable
+// percentage. usedPct is coerced to a finite number clamped to [0,100] (else the whole
+// window is null — the gauge shows nothing rather than a wrong 0%). `tokens` sums the
+// two counts, keeping whichever are finite; when NEITHER is it stays null (unknown, not
+// zero) so the label degrades to "—" instead of claiming an empty context.
+//
+// Unlike a rate-limit window this carries no resets_at: a context window doesn't expire
+// on a clock, it is replaced when the session compacts.
+function normalizeContextWindow(cw) {
+  if (!cw || typeof cw !== 'object') return null;
+  const pct = Number(cw.used_percentage);
+  if (!Number.isFinite(pct)) return null;
+  const usedPct = pct < 0 ? 0 : pct > 100 ? 100 : pct;
+  const inTok = Number(cw.total_input_tokens);
+  const outTok = Number(cw.total_output_tokens);
+  const hasIn = Number.isFinite(inTok);
+  const hasOut = Number.isFinite(outTok);
+  const tokens = hasIn || hasOut ? (hasIn ? inTok : 0) + (hasOut ? outTok : 0) : null;
+  return { usedPct, tokens };
+}
+
+// The pushing session's id, validated to a non-empty string or null. It rides on every
+// push so the daemon can attribute it — to drop a rate-limit push that isn't on the
+// current subscription, and to hang the context window on the right session. A
+// missing/garbage id is null, which makes both paths fail open.
+function pushSessionId(body) {
+  if (!body || typeof body !== 'object') return null;
+  return typeof body.session_id === 'string' && body.session_id !== '' ? body.session_id : null;
+}
+
 // Map a POST /internal/usage body to the two stored windows, or null to signal DROP
 // (no update). A body that isn't an object, or carries no rate_limits object, is
 // dropped rather than partially applied. Each window is normalized independently; one
 // absent from the payload becomes null.
+//
+// This governs the RATE-LIMIT bars only. A body carrying just a context_window (an
+// API-key session, which never has rate_limits) is null here and still valid for the
+// context path — the daemon reads that separately, before this drop.
 function normalizeUsage(body) {
   if (!body || typeof body !== 'object') return null;
   const rl = body.rate_limits;
   if (!rl || typeof rl !== 'object') return null;
-  // session_id rides on the push so the daemon can look up the pushing session's
-  // subscription and drop a push that isn't on the current one. Validated to a
-  // non-empty string or null (a missing/garbage id is null → the drop fails open).
-  const sessionId = typeof body.session_id === 'string' && body.session_id !== '' ? body.session_id : null;
-  return { fiveHour: normalizeUsageWindow(rl.five_hour), sevenDay: normalizeUsageWindow(rl.seven_day), sessionId };
+  return {
+    fiveHour: normalizeUsageWindow(rl.five_hour),
+    sevenDay: normalizeUsageWindow(rl.seven_day),
+    sessionId: pushSessionId(body),
+  };
 }
 
 function sameWindow(x, y) {
@@ -83,4 +118,12 @@ function subLabel(sub, cfg) {
   return applyPattern(base, pattern);
 }
 
-module.exports = { normalizeUsage, normalizeUsageWindow, sameUsageWindows, applyPattern, subLabel };
+module.exports = {
+  normalizeUsage,
+  normalizeUsageWindow,
+  normalizeContextWindow,
+  pushSessionId,
+  sameUsageWindows,
+  applyPattern,
+  subLabel,
+};

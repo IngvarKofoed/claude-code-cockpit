@@ -17,7 +17,7 @@ const App = {
   histRange: "7d",
   histData: null, // last /api/history payload — the pivot re-slices this with no refetch
   histBuilt: false, // History view scaffolding (family cards + pivot toolbar) built once
-  liveSort: "status", // "status" (server waiting-first) | "name" (alpha); set from localStorage in init
+  liveSort: "status", // "status" (server waiting-first) | "name" (alpha) | "context" (fullest first); set from localStorage in init
   theme: "dark", // "dark" (default) | "light"; per-browser localStorage pref, set in init
   liveShow: { title: true, branch: true, path: true }, // which Live-card location lines to show; per-browser localStorage pref, set in init
   repoRows: [], // normalized rows currently shown in the per-repo table
@@ -474,6 +474,37 @@ function chip(text, mono) {
   return `<span class="chip ${mono ? "chip--mono" : ""}">${esc(text)}</span>`;
 }
 
+// Context-window fill for one session: a METER, not a chart — one value read against a
+// threshold. The colour is the shared usage ramp (usageColor: green < 50, amber >= 50,
+// red >= 80) and never carries the meaning alone — the percentage is always spelled out
+// beside it, so the state survives colour-blindness and a greyscale print.
+//
+// Omitted entirely when there is no reading (the statusline forwarder isn't installed, or
+// hasn't pushed yet), so a session without one costs no card height rather than showing an
+// empty track. A reading older than USAGE_STALE_MS dims: the session stopped reporting, so
+// the fill is frozen at whatever it last was rather than current.
+function contextGaugeHTML(s) {
+  const c = s.context;
+  if (!c || typeof c.usedPct !== "number") return "";
+  const pct = Math.max(0, Math.min(100, c.usedPct));
+  const age = Number.isFinite(c.updatedAt) ? Date.now() - c.updatedAt : null;
+  const stale = age != null && age > USAGE_STALE_MS;
+  const tok = c.tokens == null ? null : fmtTokens(c.tokens);
+  const title =
+    `Context window ${pct.toFixed(1)}% full` +
+    (tok ? ` — ${tok} tokens in context` : "") +
+    (stale ? ` (last reported ${fmtAge(age)} ago)` : "") +
+    ". Claude Code compacts the session as this approaches 100%.";
+  return (
+    `<div class="card__ctx${stale ? " card__ctx--stale" : ""}" title="${esc(title)}">` +
+    `<div class="card__ctx-track">` +
+    `<div class="card__ctx-fill" style="width:${pct.toFixed(1)}%;background:${usageColor(pct)}"></div>` +
+    `</div>` +
+    `<span class="card__ctx-label">ctx ${Math.round(pct)}%</span>` +
+    `</div>`
+  );
+}
+
 function cardHTML(s) {
   const status = displayStatus(s); // display overlay: a global pause shows "Paused" + freezes the timer
   const waiting = status === "waiting";
@@ -600,6 +631,7 @@ function cardHTML(s) {
         ${s.focusable ? `<button class="focus-btn" type="button" data-focus-session="${esc(s.sessionId)}" title="Bring this session's terminal window to the front" aria-label="Focus terminal">${TERMINAL_SVG}</button>` : ""}
         <span class="badge">${esc(STATUS_LABEL[status] || status)}</span>
       </div>
+      ${contextGaugeHTML(s)}
       ${title}${where}
       <div class="card__activity"><span class="spark"></span><span>${esc(activityText(s))}</span></div>
       <div class="telemetry">
@@ -1178,6 +1210,9 @@ function renderLive() {
   // "status" renders the server order (already waiting-first via compareCards);
   // "name" re-sorts a COPY alphabetically for stable positions (repoName, then
   // cwd, then sessionId as tie-breakers) — waiting is not floated up in this mode.
+  // "context" floats the session nearest compaction to the top; sessions with no
+  // reading (no statusline forwarder) sink below every session that has one rather
+  // than sorting as 0%, which would claim an empty context they never reported.
   let ordered = sessions;
   if (App.liveSort === "name") {
     ordered = sessions.slice().sort((a, b) => {
@@ -1185,6 +1220,16 @@ function renderLive() {
       if (byName) return byName;
       const byCwd = String(a.cwd || "").localeCompare(String(b.cwd || ""));
       if (byCwd) return byCwd;
+      return String(a.sessionId || "").localeCompare(String(b.sessionId || ""));
+    });
+  } else if (App.liveSort === "context") {
+    ordered = sessions.slice().sort((a, b) => {
+      const pa = a.context && typeof a.context.usedPct === "number" ? a.context.usedPct : null;
+      const pb = b.context && typeof b.context.usedPct === "number" ? b.context.usedPct : null;
+      if (pa == null && pb == null) return String(a.sessionId || "").localeCompare(String(b.sessionId || ""));
+      if (pa == null) return 1; // unknown sinks
+      if (pb == null) return -1;
+      if (pb !== pa) return pb - pa; // fullest first
       return String(a.sessionId || "").localeCompare(String(b.sessionId || ""));
     });
   }
@@ -1246,9 +1291,12 @@ async function copyPath(path) {
 
 // Live card sort order — a per-browser preference (localStorage), NOT daemon config, so it
 // never goes through PUT /api/config. Set from the Settings > Dashboard control. "status" keeps
-// the server's waiting-first order; "name" sorts alphabetically for stable positions.
+// the server's waiting-first order; "name" sorts alphabetically for stable positions;
+// "context" puts the session nearest compaction first. An unknown value falls back to "status".
+const LIVE_SORTS = ["status", "name", "context"];
+
 function setLiveSort(value) {
-  App.liveSort = value === "name" ? "name" : "status";
+  App.liveSort = LIVE_SORTS.includes(value) ? value : "status";
   persistPref("cockpit.liveSort", App.liveSort);
   renderLive();
 }
@@ -2230,6 +2278,7 @@ function settingsHTML(cfg) {
         `<select class="select" id="set-liveSort">
            <option value="status" ${App.liveSort === "status" ? "selected" : ""}>Status (waiting first)</option>
            <option value="name" ${App.liveSort === "name" ? "selected" : ""}>Repository name</option>
+           <option value="context" ${App.liveSort === "context" ? "selected" : ""}>Context % (fullest first)</option>
          </select>`
       ) +
       fieldRow(
@@ -2602,7 +2651,7 @@ function init() {
   // Per-browser Live sort preference (unknown value → "status"); the Settings > Dashboard
   // control reflects and updates it (see setLiveSort).
   const ls = loadPref("cockpit.liveSort");
-  if (ls === "name" || ls === "status") App.liveSort = ls;
+  if (LIVE_SORTS.includes(ls)) App.liveSort = ls;
 
   const th = loadPref("cockpit.theme");
   App.theme = th === "light" ? "light" : "dark";

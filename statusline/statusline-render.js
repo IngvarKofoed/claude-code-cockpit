@@ -7,16 +7,20 @@
 // The leading paused segment only appears when the pause-gate control file
 // (scripts/pause.js) is set AND the feature is opted in (pauseGateEnabled).
 //
-// Then, best-effort and AFTER the line is printed, it POSTs ONLY the payload's
-// `rate_limits` to the daemon's `/internal/usage`, which lights up the Live
-// page's session-5h and weekly usage bars. Forwarding never delays the printed
-// line (print first) and never crashes the bar (all errors swallowed).
+// Then, best-effort and AFTER the line is printed, it POSTs the payload's
+// `rate_limits` and `context_window` to the daemon's `/internal/usage`, which lights
+// up the Live page's session-5h and weekly usage bars and each card's context gauge.
+// Forwarding never delays the printed line (print first) and never crashes the bar
+// (all errors swallowed).
 //
-// PRIVACY: only `rate_limits` and `session_id` are forwarded — session_id lets the
-// daemon attribute the push to a session (drop a stale non-current-subscription push);
-// it is local metadata the user opted into by installing the statusline, and is already
-// the cockpit's primary key everywhere. The cwd/cost/model the payload also carries are
-// still stripped. Nothing is stored locally by this script.
+// PRIVACY: only `rate_limits`, `context_window` and `session_id` are forwarded —
+// session_id lets the daemon attribute the push to a session (drop a stale
+// non-current-subscription push, and hang the context window on the right card); it is
+// local metadata the user opted into by installing the statusline, and is already the
+// cockpit's primary key everywhere. `context_window` is forwarded as a THREE-FIELD
+// projection (percentage + the two token counts), not the whole object, so an added
+// upstream field can't start leaking by default. The cwd/cost/model the payload also
+// carries are still stripped. Nothing is stored locally by this script.
 //
 // Invoked directly as the statusLine command (`node <root>/statusline-render.js`);
 // requires resolve against __dirname, so the working directory is irrelevant.
@@ -196,10 +200,12 @@ function postUsage(data, done) {
     done();
   };
   try {
-    const rateLimits = data && data.rate_limits;
-    // Nothing to forward (API-key sessions never carry rate_limits) — skip the
-    // request entirely rather than POST an empty body the daemon would drop.
-    if (!paths || !rateLimits || typeof rateLimits !== "object") return complete();
+    const rateLimits = data && data.rate_limits && typeof data.rate_limits === "object" ? data.rate_limits : null;
+    const cw = data && data.context_window && typeof data.context_window === "object" ? data.context_window : null;
+    // Nothing to forward — skip the request entirely rather than POST a body the daemon
+    // would drop. EITHER part is enough: an API-key session never carries rate_limits but
+    // still has a context window, so requiring both would cost it the gauge.
+    if (!paths || (!rateLimits && !cw)) return complete();
     const port = parseInt(fs.readFileSync(paths.portPath(), "utf8").trim(), 10);
     if (!port) return complete();
     let token = "";
@@ -208,10 +214,24 @@ function postUsage(data, done) {
     } catch (_e) {
       token = "";
     }
-    // Forward rate_limits + session_id (the daemon attributes the push to a session);
-    // cwd/cost/model and everything else are stripped. An absent session_id is simply
-    // omitted by JSON.stringify — the daemon fails open (accepts the push) in that case.
-    const body = JSON.stringify({ rate_limits: rateLimits, session_id: data.session_id });
+    // Forward rate_limits + context_window + session_id (the daemon attributes the push to a
+    // session); cwd/cost/model and everything else are stripped. An absent session_id — or an
+    // absent half of the payload — is simply omitted by JSON.stringify; the daemon fails open
+    // on the id and treats each half independently.
+    //
+    // context_window is projected to the three fields the gauge needs rather than forwarded
+    // whole, so the forwarded set stays a deliberate allowlist as the upstream payload grows.
+    const body = JSON.stringify({
+      rate_limits: rateLimits || undefined,
+      context_window: cw
+        ? {
+            used_percentage: cw.used_percentage,
+            total_input_tokens: cw.total_input_tokens,
+            total_output_tokens: cw.total_output_tokens,
+          }
+        : undefined,
+      session_id: data.session_id,
+    });
     const headers = {
       "content-type": "application/json",
       "content-length": Buffer.byteLength(body),
