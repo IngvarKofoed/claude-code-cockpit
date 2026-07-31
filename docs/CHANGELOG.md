@@ -1197,7 +1197,14 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      partial read. Kept off the rail and badge: both are wholly spent on status, where a coloured
      dot would read as a status light.
 
-150. Released v0.44.0, carrying entry 149. Bumped per entry 103 — the plugin cache is keyed by
-     version and `ensure.js` only replaces a running daemon when `/health` reports a DIFFERENT one,
-     so a UI-only change still needs the bump to reach anyone. `marketplace.json` stays at 0.2.0,
-     unmaintained since that release, so it is deliberately left alone.
+150. Released v0.44.0, carrying entries 149 and 151. Bumped per entry 103 — the plugin cache is
+     keyed by version and `ensure.js` only replaces a running daemon when `/health` reports a
+     DIFFERENT one, so a UI-only change still needs the bump to reach anyone. `marketplace.json`
+     stays at 0.2.0, unmaintained since that release, so it is deliberately left alone.
+
+151. The colour dot has its own Settings > Dashboard switch ("Show session colour"), default ON —
+     a per-browser `App.liveShow.color` localStorage pref like the other Live-card toggles, never
+     daemon config, so it neither PUTs nor pops a "Settings saved" toast. No handler change was
+     needed: the switch listener already derives the key from its `set-show-<key>` element id.
+     The dot still lives INSIDE the name line, so turning the session name off removes the dot with
+     it — stated in the switch's own description rather than left as a surprise.
