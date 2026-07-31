@@ -783,10 +783,10 @@ function syncPauseUI() {
 // ---- Live usage bars (session 5h + weekly, from the statusline) -------------
 // Anthropic's real rate-limit usage, forwarded by the cockpit statusline and served on
 // /api/state as `usage`. Two bars — the session (5h) and weekly (7d) windows — both carrying
-// the same pace cue (governed by the `usagePace` setting): a tick (on-pace mark), a delta
-// (how far off an even burn), and a "time left" ETA that projects the burn rate to exhaustion.
-// `usedPct` only changes when a new snapshot arrives; the reset countdown and the pace tick/delta/
-// ETA advance every second via the shared tick() loop (elapsed-time only moves, the % holds).
+// the same pace cue (governed by the `usagePace` setting): a tick (where an even burn would be by
+// now), a burn-rate multiplier, and a projected-exhaustion clause on the reset line.
+// `usedPct` only changes when a new snapshot arrives; the reset countdown, tick, multiplier and
+// projection advance every second via the shared tick() loop (elapsed-time moves, the % holds).
 // Never fabricates a 0 — see states.
 
 const FIVE_HOUR_MS = 5 * 3600 * 1000;
@@ -891,8 +891,11 @@ function paceTolerance(windowMs) {
   return Math.max(PACE_ONPACE_FLOOR_MS, windowMs * PACE_ONPACE_FRAC);
 }
 
-// Compact magnitude for the pace delta: the fill-vs-tick gap rescaled to time (see applyDelta).
-// Minute resolution, no seconds — "2d 4h" / "1h 13m" / "24m". Same tiering as fmtResetIn above.
+// Compact duration for the pace readouts: minute resolution, no seconds — "2d 4h" / "1h 13m" /
+// "24m". Same tiering as fmtResetIn above. Now used only by applyLimit's shortfall tooltip; it
+// previously also fed the signed pace delta ("▲ 6% · 18m"), which was REMOVED as redundant —
+// three renderings of one relationship (points gap, the same gap as time, and the ratio) read as
+// three facts. The tick still shows that gap geometrically; the multiplier carries the rate.
 function fmtPaceGap(ms) {
   const t = splitDuration(ms);
   if (t.d) return `${t.d}d ${t.h}h`;
@@ -900,49 +903,21 @@ function fmtPaceGap(ms) {
   return `${t.m}m`;
 }
 
-// Signed pace gap: the horizontal fill-vs-tick gap shown as BOTH a percentage and time —
-// "▲ 6% · 18m". The % is the gap in percentage points (usedPct − elapsedFrac×100); the time is
-// that same gap × windowMs (how much sooner/later than an even burn you hit this usage level).
-// Direction is carried by the ▲/▼ arrow + the colour alone — over pace reads as caution (amber),
-// under as calm (green), within the per-window on-pace band as neutral "on pace"; the old trailing
-// "ahead"/"behind" word was dropped as redundant (it survives only in the hover title). `gapMs` is
-// signed (+ ahead, − behind); `windowMs` scales both the band and the % (pct = |gapMs|/windowMs).
-// Written into the chip at render and on tick.
-function applyDelta(el, gapMs, windowMs) {
-  el.classList.remove("usage-bar__delta--over", "usage-bar__delta--under", "usage-bar__delta--on");
-  const pct = Math.round((Math.abs(gapMs) / windowMs) * 100);
-  const tol = paceTolerance(windowMs);
-  const v = gapMs >= tol ? "over" : gapMs <= -tol ? "under" : "on";
-  if (v === "over") {
-    el.classList.add("usage-bar__delta--over");
-    el.textContent = "▲ " + pct + "% · " + fmtPaceGap(gapMs);
-    el.title = pct + "% ahead of an even burn rate";
-  } else if (v === "under") {
-    el.classList.add("usage-bar__delta--under");
-    el.textContent = "▼ " + pct + "% · " + fmtPaceGap(-gapMs);
-    el.title = pct + "% behind an even burn rate";
-  } else {
-    el.classList.add("usage-bar__delta--on");
-    el.textContent = "on pace";
-    el.title = "usage is tracking the clock";
-  }
-}
-
 // Burn-rate multiplier — current velocity as a multiple of the even ("normal") rate that would
 // land on exactly 100% at reset: m = usedFrac / elapsedFrac, so 1.0× is on pace, 2.5× is 2.5× that
-// rate. Rides after the pace delta in the foot, where it once displaced a "time-left" ETA (the "≈2h
-// left" projection): a rate reads as inherently variable, so an early swing looks like "going fast
-// now" rather than the ETA's alarming, jumpy-early "you'll run out in 2d" against a small lead.
-// That projection is BACK — as `applyLimit`, on the reset line and behind a much later gate — so
-// the two now split the job: this says how fast, that says when. Answering "when" is not its role.
+// rate. Now the foot's ONLY readout: it once rode after a signed pace delta ("▲ 6% · 18m"), itself
+// having displaced a "time-left" ETA. Both are gone from here — the delta as redundant with this
+// number and the tick, the ETA to `applyLimit` on the reset line — so the two survivors split the
+// job cleanly: this says how fast, that says when. Answering "when" is not this readout's role.
 //
 // Coloured by the SAME rounded value it displays (over → amber, under → green, on → muted), so the
 // number and its colour can never contradict — a shown "1.0×" is always the muted on-pace colour,
-// "1.1×"+ always over, "0.9×"− always under. This is a RATIO verdict, deliberately NOT the delta's
-// additive time-gap verdict: near a window's start a small absolute gap is a large ratio, so the
-// multiplier can read over/under while the delta still reads on-pace — the ratio is the intended
-// earlier signal there. (Colouring by the gap instead would paint a rounded "1.0×" amber/green
-// mid-window, or a far-from-1× ratio muted early on — the number fighting its own colour.)
+// "1.1×"+ always over, "0.9×"− always under. This is a RATIO verdict, deliberately NOT the additive
+// time-gap verdict `applyLimit` gates on, so the two can differ at the margin: a rounded "1.0×" can
+// sit beside a shown projection (51% used at 50% elapsed is 1.02× but a real ~6h shortfall). That is
+// precision, not contradiction — and re-gating the projection on this rounded ratio would hide a
+// true shortfall whenever it rounded down. (Colouring by the gap instead would paint a rounded
+// "1.0×" amber/green mid-window, or a far-from-1× ratio muted early on — a number fighting itself.)
 //
 // Blank in a jumpy-early guard (window's first 1%, or under 1% used) so a tiny elapsed denominator
 // can't flash an absurd "40×". At the cap (pct ≥ 100) it shows "at limit" and remains the sole
@@ -999,13 +974,13 @@ const LIMIT_SETTLED_FRAC = 0.1;
 //
 // timeLeft = ((1 − usedFrac) / usedFrac) × elapsed — a linear velocity projection.
 //
-// Shown ONLY when the same signed gap + tolerance band the delta uses reads "over" pace, which
-// does three things at once: it can never contradict the delta sitting beside it; it is strictly
-// stronger than "the projection lands before the reset" (those are algebraically the same
-// condition — timeLeft < timeToReset ⟺ elapsedFrac < usedFrac — so the band subsumes it); and it
-// means under-pace renders NOTHING rather than the old "won't run out" text. Blank at the cap too:
-// entry 54 made the multiplier's "at limit" the sole exhausted-state cue, and a "limit in 0s"
-// beside it would just be noise. On a stale bar it drifts with the delta (entry 46: not re-frozen).
+// Shown ONLY when the signed fill-vs-tick gap clears the per-window on-pace band — the same test
+// the removed pace delta used, kept because it is strictly stronger than "the projection lands
+// before the reset" (those are algebraically the same condition — timeLeft < timeToReset ⟺
+// elapsedFrac < usedFrac — so the band subsumes it) and because it makes under-pace render NOTHING
+// rather than the old "won't run out" text. Blank at the cap too: the multiplier's "at limit" is the
+// exhausted-state cue, and a "limit in 0s" beside it would just be noise. On a stale bar this keeps
+// drifting rather than freezing (entry 46), with the age note carrying the staleness.
 function applyLimit(el, usedPct, resetsAt, windowMs, now, withDate) {
   const pct = clamp(num(usedPct), 0, 100);
   const ef = elapsedFrac(resetsAt, windowMs, now);
@@ -1035,7 +1010,7 @@ function usageShellHTML(kind, state, label, note) {
   );
 }
 
-// One usage bar. `pace` (both|tick|delta|off) enables the pace cue (tick + delta) on the bar.
+// One usage bar. `pace` (both|tick|delta|off) enables the tick and/or the readouts (see below).
 // `withDate` appends a dated reset moment (weekly) vs. a time-only one (5h) to the countdown.
 function usageBarHTML(kind, w, windowMs, label, now, updatedAt, pace, withDate) {
   const state = usageWindowState(w, now, updatedAt);
@@ -1046,26 +1021,24 @@ function usageBarHTML(kind, w, windowMs, label, now, updatedAt, pace, withDate) 
   const pct = clamp(num(w.usedPct), 0, 100);
   const hasReset = Number.isFinite(w.resetsAt) && w.resetsAt > 0;
   // Pace cue on any bar with a real fill + reset (live OR stale). On a stale bar usedPct is frozen
-  // but elapsed keeps advancing, so the delta naturally walks down toward/under 0 as the window
-  // elapses until reset — intended, and flagged as old by the age note (not hidden).
+  // but elapsed keeps advancing, so the readouts naturally walk down as the window elapses until
+  // reset — intended, and flagged as old by the age note (not hidden).
+  //
+  // `showReadout` covers the burn-rate multiplier AND the projected-limit clause — the two cues the
+  // `usagePace` setting's non-tick half now governs. The setting keeps its original VALUES
+  // ("both"/"tick"/"delta"/"off") so a persisted config stays valid with no migration, which is why
+  // "delta" survives as a stored value for a delta that no longer exists.
   const showTick = hasReset && (pace === "both" || pace === "tick");
-  const showDelta = hasReset && (pace === "both" || pace === "delta");
+  const showReadout = hasReset && (pace === "both" || pace === "delta");
   const ef = hasReset ? elapsedFrac(w.resetsAt, windowMs, now) : 0;
   const tickHTML = showTick ? `<div class="usage-bar__tick" style="left:${(ef * 100).toFixed(2)}%"></div>` : "";
-  // The exhaustion projection rides on the reset line as a second clause (filled by applyLimit,
-  // like the delta/multiplier, so render and tick share one implementation). Gated on `showDelta`:
-  // it is a pace cue, so the `usagePace` setting governs it exactly as it governs the delta.
+  // The exhaustion projection rides on the reset line as a second clause; like the multiplier it is
+  // left empty here and filled by its apply* fn, so render and tick share one implementation.
   const footInfo =
     (hasReset ? `<span class="usage-bar__reset">${esc(fmtResetLine(w.resetsAt, now, withDate))}</span>` : "") +
-    (hasReset && showDelta ? `<span class="usage-bar__limit"></span>` : "") +
+    (showReadout ? `<span class="usage-bar__limit"></span>` : "") +
     (state === "stale" ? `<span class="usage-bar__age">updated ${esc(fmtAge(now - updatedAt))} ago</span>` : "");
-  // The delta chip + the burn-rate multiplier are filled by applyDelta/applyMult so render + tick
-  // share one implementation. The multiplier rides after the delta (it replaced the time-left ETA
-  // that used to sit here); both are gated on `showDelta` so "off"/tick-only modes stay clean.
-  let deltaHTML = "";
-  if (showDelta) {
-    deltaHTML = `<span class="usage-bar__delta"></span><span class="usage-bar__mult"></span>`;
-  }
+  const multHTML = showReadout ? `<span class="usage-bar__mult"></span>` : "";
   const bar =
     `<div class="usage-bar" data-kind="${kind}" data-state="${state}">` +
     `<div class="usage-bar__head">` +
@@ -1076,7 +1049,7 @@ function usageBarHTML(kind, w, windowMs, label, now, updatedAt, pace, withDate) 
     `<div class="usage-bar__fill" style="width:${pct}%;background:${usageColor(pct)}"></div>` +
     tickHTML +
     `</div>` +
-    `<div class="usage-bar__foot"><span class="usage-bar__foot-info">${footInfo}</span>${deltaHTML}</div>` +
+    `<div class="usage-bar__foot"><span class="usage-bar__foot-info">${footInfo}</span>${multHTML}</div>` +
     `</div>`;
   return bar;
 }
@@ -1129,7 +1102,6 @@ function bindUsage() {
         limit: elBar.querySelector(".usage-bar__limit"),
         age: elBar.querySelector(".usage-bar__age"),
         tick: elBar.querySelector(".usage-bar__tick"),
-        delta: elBar.querySelector(".usage-bar__delta"),
         mult: elBar.querySelector(".usage-bar__mult"),
       },
     });
@@ -1151,7 +1123,7 @@ function renderUsage() {
   bindUsage();
 }
 
-// Advance the live-moving parts (reset countdown, "updated Xm ago", 5h tick + delta) in place;
+// Advance the live-moving parts (reset countdown, "updated Xm ago", tick, readouts) in place;
 // the % / fill only change on a new snapshot.
 function advanceUsageBars(now) {
   const r = App.usageRender;
@@ -1163,16 +1135,15 @@ function advanceUsageBars(now) {
     if (b.els.reset && hasReset) b.els.reset.textContent = fmtResetLine(w.resetsAt, now, b.withDate);
     if (b.els.age) b.els.age.textContent = "updated " + fmtAge(now - r.updatedAt) + " ago";
     // Advance the pace cue whenever the bar shows one (live OR stale). On a stale bar usedPct is
-    // frozen but elapsed advances, so the delta walks down over time until reset — intended.
-    if (hasReset && (b.els.tick || b.els.delta || b.els.mult || b.els.limit)) {
+    // frozen but elapsed advances, so the readouts walk down over time until reset — intended.
+    if (hasReset && (b.els.tick || b.els.mult || b.els.limit)) {
       const ef = elapsedFrac(w.resetsAt, b.windowMs, now);
+      // The tick marks where an even burn would have reached by now, so the fill-vs-tick gap is the
+      // pace signal geometrically — which is why the numeric delta that restated it was dropped.
       if (b.els.tick) b.els.tick.style.left = (ef * 100).toFixed(2) + "%";
-      // Same gap the tick shows (fill − tick), rescaled from a fraction of the window to time;
-      // windowMs also scales the on-pace band so the 7d bar isn't judged against a 5h tolerance.
-      if (b.els.delta) applyDelta(b.els.delta, (clamp(num(w.usedPct), 0, 100) / 100 - ef) * b.windowMs, b.windowMs);
-      // Burn-rate multiplier riding after the delta (see applyMult).
+      // Burn-rate multiplier — the foot's only readout (see applyMult).
       if (b.els.mult) applyMult(b.els.mult, w.usedPct, w.resetsAt, b.windowMs, now);
-      // Projected exhaustion, on the reset line rather than after the delta (see applyLimit).
+      // Projected exhaustion, as a clause on the reset line (see applyLimit).
       if (b.els.limit) applyLimit(b.els.limit, w.usedPct, w.resetsAt, b.windowMs, now, b.withDate);
     }
   }
@@ -1273,7 +1244,7 @@ function renderLiveRibbon() {
   // The usage block is a full-width row that flows below the tiles inside the ribbon grid.
   $("liveRibbon").innerHTML = tiles.join("") + usageBlockHTML(estNow());
   bindUsage();
-  advanceUsageBars(estNow()); // fill the delta chips (empty in the shell) + paint now
+  advanceUsageBars(estNow()); // fill the readouts (rendered empty in the shell) + paint now
 }
 
 function renderLive() {
@@ -2387,11 +2358,11 @@ function settingsHTML(cfg) {
       ) +
       fieldRow(
         "Usage pace cue",
-        "Tick and/or over-under delta on the session (5h) and weekly usage bars",
+        "On-pace tick and/or the readouts (burn-rate multiplier + projected limit) on the session (5h) and weekly usage bars",
         `<select class="select" id="set-usagePace">
-           <option value="both" ${pace === "both" ? "selected" : ""}>Tick + delta</option>
+           <option value="both" ${pace === "both" ? "selected" : ""}>Tick + readouts</option>
            <option value="tick" ${pace === "tick" ? "selected" : ""}>Tick only</option>
-           <option value="delta" ${pace === "delta" ? "selected" : ""}>Delta only</option>
+           <option value="delta" ${pace === "delta" ? "selected" : ""}>Readouts only</option>
            <option value="off" ${pace === "off" ? "selected" : ""}>Off</option>
          </select>`
       ) +

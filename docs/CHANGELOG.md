@@ -1236,3 +1236,26 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      so a UI-only change still needs the bump to reach anyone. Numbers 149–151 double-booked again,
      against PR #5's; resolved per entry 146 — the side already on origin kept them, this side moved
      up to 152–155. `marketplace.json` stays at 0.2.0, unmaintained, so it is left alone.
+
+157. The usage bars' signed pace delta ("▲ 46% · 3d 4h") is GONE; the burn-rate multiplier is now the
+     foot's only readout. All three numbers came from the same two inputs — a gap in points, that same
+     gap as time, and the ratio — so one relationship read as three facts. The tick already shows that
+     gap geometrically, which is what makes the numeric restatement redundant rather than just crowded.
+     Requested after the author found his own three-value line hard to read.
+
+158. Consequences, all load-bearing: the multiplier inherits the `margin-left: auto` that right-aligned
+     the group, and LOSES its leading "· " (that joined it to the delta; alone it would dangle off
+     "2.0×"). `usagePace` keeps its stored values so nothing migrates — "delta" now means "readouts",
+     relabelled in Settings as "Tick + readouts" / "Readouts only". `applyDelta` is deleted;
+     `fmtPaceGap` survives for applyLimit's shortfall tooltip.
+
+159. With the delta gone the projected-limit clause has no additive companion, so it can now sit beside
+     a rounded "1.0×" (51% used at 50% elapsed is 1.02× but a real ~6h shortfall). Left as is: that is
+     precision, not contradiction, and re-gating the projection on the rounded ratio would hide a true
+     shortfall whenever it rounded down.
+
+160. Released v0.46.0, carrying entries 157–159. Bumped per entry 103 — the plugin cache is keyed by
+     version and `ensure.js` only replaces a running daemon when `/health` reports a DIFFERENT one, so
+     a UI-only change still needs the bump to reach anyone. Two releases in a row now (v0.45.0 was
+     entry 156), which is the cost of that rule: a follow-up UI tweak cannot ride along on the
+     previous version. `marketplace.json` stays at 0.2.0, unmaintained, so it is left alone.
