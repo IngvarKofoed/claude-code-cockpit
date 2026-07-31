@@ -1188,3 +1188,16 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      one, so a UI-only change still needs the bump to reach anyone. Fittingly, this release is
      the first whose own arrival is visible in the topbar. `marketplace.json` stays at 0.2.0,
      unmaintained since that release, so it is deliberately left alone.
+
+149. Live cards show the session's `/color` as a dot before the name's tag glyph, so a card can be
+     matched to the terminal window it belongs to. Fed by the transcript's `agent-color` lines (last
+     wins; `default` or an unmapped name clears it) — no new state, hook or event, since
+     `transcript.js` already scanned every line for `custom-title`. Assigned UNCONDITIONALLY unlike
+     `title`, so a reset can clear it; every caller already gated on `usage.ok`, so null isn't a
+     partial read. Kept off the rail and badge: both are wholly spent on status, where a coloured
+     dot would read as a status light.
+
+150. Released v0.44.0, carrying entry 149. Bumped per entry 103 — the plugin cache is keyed by
+     version and `ensure.js` only replaces a running daemon when `/health` reports a DIFFERENT one,
+     so a UI-only change still needs the bump to reach anyone. `marketplace.json` stays at 0.2.0,
+     unmaintained since that release, so it is deliberately left alone.

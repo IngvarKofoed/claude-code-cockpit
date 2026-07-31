@@ -627,8 +627,19 @@ function cardHTML(s) {
   // in the column-flex `.card__where`) rather than sharing one row, and each is omitted when
   // its toggle is off or its value is absent; the wrapper is dropped when neither shows.
   const show = App.liveShow;
+  // The session's /color, as a filled dot ahead of the tag glyph — the one thing on a card
+  // that ties it to a specific terminal window, which is what /color exists for. Kept OFF
+  // the rail and badge: those are wholly spent on status, and a second meaning there would
+  // read as a status light. transcript.js is the whitelist (its SESSION_COLORS), so a value
+  // arriving here is already one styles.css maps; an unmapped one falls back to the name
+  // line's own ink rather than vanishing. Rides the "Show session name" toggle, since it
+  // lives on that line.
+  const dot =
+    typeof s.color === "string" && s.color
+      ? `<span class="card__dot" data-color="${esc(s.color)}" title="Session colour: ${esc(s.color)}"></span>`
+      : "";
   const title = show.title
-    ? `<div class="card__title"${s.title ? ` title="${esc(s.title)}"` : ""}>${TITLE_SVG}<span>${s.title ? esc(s.title) : ""}</span></div>`
+    ? `<div class="card__title"${s.title ? ` title="${esc(s.title)}"` : ""}>${dot}${TITLE_SVG}<span>${s.title ? esc(s.title) : ""}</span></div>`
     : "";
   const whereParts = [];
   if (show.branch && s.branch)

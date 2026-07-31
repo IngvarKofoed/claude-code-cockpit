@@ -255,3 +255,71 @@ test('readUsage: blank / malformed custom-title falls back to the ai-title', () 
   ]);
   assert.strictEqual(readUsage(file).title, 'AI guess');
 });
+
+// --- session colour (/color -> `agent-color` lines) --------------------------
+// Claude Code's /color appends {type:'agent-color', agentColor:'<name>'} to the
+// transcript, and `default` when reset. Only the eight names the CLI accepts
+// resolve to a colour; every other value reads as "no colour" (see transcript.js).
+
+test('readUsage: agent-color line becomes the session colour', () => {
+  const file = writeFixture([
+    JSON.stringify({ type: 'agent-color', agentColor: 'pink' }),
+    JSON.stringify({ usage: { input_tokens: 1 } }),
+  ]);
+  const r = readUsage(file);
+  assert.strictEqual(r.color, 'pink');
+  assert.strictEqual(r.totals.input, 1); // usage still parsed alongside the colour
+});
+
+test('readUsage: every colour name the /color command accepts is recognised', () => {
+  for (const name of ['red', 'blue', 'green', 'yellow', 'purple', 'orange', 'pink', 'cyan']) {
+    const file = writeFixture([JSON.stringify({ type: 'agent-color', agentColor: name })]);
+    assert.strictEqual(readUsage(file).color, name);
+  }
+});
+
+test('readUsage: last agent-color wins across repeated /color calls', () => {
+  const file = writeFixture([
+    JSON.stringify({ type: 'agent-color', agentColor: 'blue' }),
+    JSON.stringify({ type: 'agent-color', agentColor: 'cyan' }),
+  ]);
+  assert.strictEqual(readUsage(file).color, 'cyan');
+});
+
+test('readUsage: no agent-color line at all -> color null', () => {
+  const file = writeFixture([JSON.stringify({ usage: { input_tokens: 1 } })]);
+  assert.strictEqual(readUsage(file).color, null);
+});
+
+test('readUsage: agent-color "default" clears a colour set earlier', () => {
+  const file = writeFixture([
+    JSON.stringify({ type: 'agent-color', agentColor: 'pink' }),
+    JSON.stringify({ type: 'agent-color', agentColor: 'default' }), // /color default
+  ]);
+  assert.strictEqual(readUsage(file).color, null);
+});
+
+// An unrecognised name must not leave the STALE colour showing: the dot exists to
+// say which terminal this card is, so a wrong colour misleads worse than none.
+test('readUsage: unrecognised colour name clears rather than keeping the previous one', () => {
+  const file = writeFixture([
+    JSON.stringify({ type: 'agent-color', agentColor: 'pink' }),
+    JSON.stringify({ type: 'agent-color', agentColor: 'chartreuse' }), // a colour we don't map
+  ]);
+  assert.strictEqual(readUsage(file).color, null);
+});
+
+test('readUsage: blank / malformed agent-color line leaves the colour intact', () => {
+  const file = writeFixture([
+    JSON.stringify({ type: 'agent-color', agentColor: 'green' }),
+    JSON.stringify({ type: 'agent-color' }), // no agentColor -> ignored, not a reset
+    JSON.stringify({ type: 'agent-color', agentColor: '   ' }), // blank -> ignored
+  ]);
+  assert.strictEqual(readUsage(file).color, 'green');
+});
+
+test('readUsage: unreadable transcript reports color null alongside ok:false', () => {
+  const r = readUsage(path.join(os.tmpdir(), 'cockpit-does-not-exist-color.jsonl'));
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.color, null);
+});
