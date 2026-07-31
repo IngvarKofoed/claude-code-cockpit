@@ -1208,3 +1208,31 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      needed: the switch listener already derives the key from its `set-show-<key>` element id.
      The dot still lives INSIDE the name line, so turning the session name off removes the dot with
      it — stated in the switch's own description rather than left as a surprise.
+
+152. Both Live usage bars gained a projected-exhaustion clause ON the reset line: "resets in 3d 20h
+     · Tue 4 Aug, 14:00 | limit in ~8h 25m · Sat 1 Aug, 02:10". This REVIVES the time-left ETA that
+     entry 54 removed — the multiplier says how fast you are burning but never when you run out,
+     which is the actionable fact deep into a window (90% of a week with 3d still to go). The two
+     now split the job, rate vs. deadline, so neither is redundant with the other.
+
+153. That clause renders ONLY when the delta's own signed gap + tolerance band reads over pace, so
+     the two cues on a bar can never contradict each other. That test is also algebraically "the
+     projection lands before the reset" (timeLeft < timeToReset ⟺ elapsedFrac < usedFrac), only
+     stricter — so under pace it renders nothing at all, replacing entry 53's "won't run out" text,
+     and at the cap nothing, leaving the multiplier's "at limit" the sole exhausted-state cue.
+
+154. Entry 54's jumpy-early objection to the ETA is answered by a much later gate: 10% of the window
+     elapsed (30min into a 5h, ~17h into a week), where one turn can no longer swing the projection
+     by a day. Entry 53 guarded only ~1% elapsed, which is why it read as alarming nonsense early on.
+
+155. The two clauses are divided by "|", not the "·" the reset clause uses between its own countdown
+     and absolute time — reusing "·" made the whole line read as one undifferentiated four-part run.
+     Its spacing is a MARGIN, not a trailing space in `content`: the pipe inherits the foot's 8px
+     flex column-gap on its left, so a ~3px text space on the right sat it visibly off-centre.
+     The delimiter belongs to the clause element, so `:empty` drops it and it can never dangle.
+
+156. Released v0.45.0, carrying entries 152–155. Bumped per entry 103 — the plugin cache is keyed by
+     version and `ensure.js` only replaces a running daemon when `/health` reports a DIFFERENT one,
+     so a UI-only change still needs the bump to reach anyone. Numbers 149–151 double-booked again,
+     against PR #5's; resolved per entry 146 — the side already on origin kept them, this side moved
+     up to 152–155. `marketplace.json` stays at 0.2.0, unmaintained, so it is left alone.

@@ -452,8 +452,30 @@ body {
   font-size: 12px;
   color: var(--ink-muted);
 }
-.usage-bar__foot-info { display: inline-flex; gap: 8px; align-items: baseline; }
+/* Wraps so the projected-limit clause below can drop to its own line on a narrow bar rather than
+   overflowing the track's width. */
+.usage-bar__foot-info { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
 .usage-bar__reset { font-variant-numeric: tabular-nums; }
+/* Projected exhaustion — a second clause ON the reset line (see applyLimit). Delimited by a "|",
+   NOT the "·" the reset line uses between its own countdown and absolute time: reusing "·" would
+   make the two clauses read as one undifferentiated four-part run. Muted like the multiplier's
+   separator, so the delimiter never competes with the values it divides. Amber because this only
+   ever renders when over pace — the colour carries the verdict, as it does on the delta. The
+   delimiter belongs to this element, so :empty drops it too and never leaves a dangling pipe. */
+.usage-bar__limit {
+  color: var(--st-waiting);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+/* Spacing is a MARGIN, not a trailing space in `content`: the pipe's left side gets the 8px flex
+   column-gap of .usage-bar__foot-info, so a ~3px text space on its right made the delimiter sit
+   visibly off-centre between the two clauses. 8px matches that gap exactly. */
+.usage-bar__limit::before {
+  content: "|";
+  margin-right: 8px;
+  color: var(--ink-muted);
+}
+.usage-bar__limit:empty { display: none; }
 .usage-bar__age { color: var(--ink-2); font-style: italic; }
 .usage-bar__note { color: var(--ink-muted); }
 .usage-bar__delta {

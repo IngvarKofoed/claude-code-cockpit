@@ -873,6 +873,14 @@ function fmtResetLine(resetsAt, now, withDate) {
   return `resets in ${fmtResetIn(resetsAt - now)} · ${fmtResetAt(resetsAt, now, withDate)}`;
 }
 
+// The projected-exhaustion clause, deliberately shaped like fmtResetLine so the two sit on one
+// line and compare directly ("resets in 3d 20h · Tue 4 Aug, 14:00 | limit in ~9h 24m · Fri 1 Aug,
+// 02:00"). Same countdown tiering and the same absolute formatter (so the 5h bar gets fmtResetAt's
+// cross-midnight weekday prefix here too); the "~" marks it a projection, not a known instant.
+function fmtLimitLine(limitAt, now, withDate) {
+  return `limit in ~${fmtResetIn(limitAt - now)} · ${fmtResetAt(limitAt, now, withDate)}`;
+}
+
 // On-pace dead zone: a RELATIVE band (~0.5% of the window, matching the old integer-percentage
 // rounding), floored at 60s so the minute-resolution figure never shows "0m". Relative is the
 // point — a fixed 60s is ~0.01% of the 7d window, so the weekly bar would essentially never read
@@ -922,9 +930,11 @@ function applyDelta(el, gapMs, windowMs) {
 
 // Burn-rate multiplier — current velocity as a multiple of the even ("normal") rate that would
 // land on exactly 100% at reset: m = usedFrac / elapsedFrac, so 1.0× is on pace, 2.5× is 2.5× that
-// rate. Rides after the pace delta in the foot — it REPLACED the "time-left" ETA there (the "≈2h
+// rate. Rides after the pace delta in the foot, where it once displaced a "time-left" ETA (the "≈2h
 // left" projection): a rate reads as inherently variable, so an early swing looks like "going fast
 // now" rather than the ETA's alarming, jumpy-early "you'll run out in 2d" against a small lead.
+// That projection is BACK — as `applyLimit`, on the reset line and behind a much later gate — so
+// the two now split the job: this says how fast, that says when. Answering "when" is not its role.
 //
 // Coloured by the SAME rounded value it displays (over → amber, under → green, on → muted), so the
 // number and its colour can never contradict — a shown "1.0×" is always the muted on-pace colour,
@@ -935,10 +945,10 @@ function applyDelta(el, gapMs, windowMs) {
 // mid-window, or a far-from-1× ratio muted early on — the number fighting its own colour.)
 //
 // Blank in a jumpy-early guard (window's first 1%, or under 1% used) so a tiny elapsed denominator
-// can't flash an absurd "40×". At the cap (pct ≥ 100) it shows "at limit" — with the ETA gone, the
-// multiplier is now the sole carrier of the exhausted-state cue (a finite ratio would misread as
-// headroom). On a stale bar usedPct is frozen but elapsed grows, so m drifts down over time —
-// intended, and flagged old by the age note (like the delta).
+// can't flash an absurd "40×". At the cap (pct ≥ 100) it shows "at limit" and remains the sole
+// carrier of the exhausted-state cue — `applyLimit` deliberately blanks there rather than adding a
+// "limit in 0s" beside it (a finite ratio would misread as headroom). On a stale bar usedPct is
+// frozen but elapsed grows, so m drifts down over time — intended, and flagged old by the age note.
 function applyMult(el, usedPct, resetsAt, windowMs, now) {
   el.classList.remove(
     "usage-bar__mult--over",
@@ -975,6 +985,44 @@ function applyMult(el, usedPct, resetsAt, windowMs, now) {
   }
 }
 
+// A window must be this far elapsed before the exhaustion projection is shown at all. The
+// projection divides by the used fraction, so early in a window one turn can swing it by a day —
+// this is the "jumpy-early" guard that sank the ETA the FIRST time it shipped (it then guarded only
+// ~1% elapsed, far too loose). 10% is 30min into a 5h window, ~17h into a week.
+const LIMIT_SETTLED_FRAC = 0.1;
+
+// Projected exhaustion — when the current burn rate hits 100%, as a clause after the reset line:
+// "limit in ~9h 24m · Fri 1 Aug, 02:00". This is the ETA entry 54 removed in favour of the
+// burn-rate multiplier, brought back for the case it was removed for being bad at: the multiplier
+// says how fast you are going, never when you run out, which is the actionable fact deep into a
+// window (89% of a week with 3d left).
+//
+// timeLeft = ((1 − usedFrac) / usedFrac) × elapsed — a linear velocity projection.
+//
+// Shown ONLY when the same signed gap + tolerance band the delta uses reads "over" pace, which
+// does three things at once: it can never contradict the delta sitting beside it; it is strictly
+// stronger than "the projection lands before the reset" (those are algebraically the same
+// condition — timeLeft < timeToReset ⟺ elapsedFrac < usedFrac — so the band subsumes it); and it
+// means under-pace renders NOTHING rather than the old "won't run out" text. Blank at the cap too:
+// entry 54 made the multiplier's "at limit" the sole exhausted-state cue, and a "limit in 0s"
+// beside it would just be noise. On a stale bar it drifts with the delta (entry 46: not re-frozen).
+function applyLimit(el, usedPct, resetsAt, windowMs, now, withDate) {
+  const pct = clamp(num(usedPct), 0, 100);
+  const ef = elapsedFrac(resetsAt, windowMs, now);
+  const gapMs = (pct / 100 - ef) * windowMs;
+  if (pct < 1 || pct >= 100 || ef < LIMIT_SETTLED_FRAC || gapMs < paceTolerance(windowMs)) {
+    el.textContent = "";
+    el.removeAttribute("title");
+    return;
+  }
+  const leftMs = ((1 - pct / 100) / (pct / 100)) * (ef * windowMs);
+  el.textContent = fmtLimitLine(now + leftMs, now, withDate);
+  el.title =
+    "at the current burn rate you hit 100% about " +
+    fmtPaceGap(resetsAt - now - leftMs) +
+    " before this window resets";
+}
+
 // Empty-state shell (nodata / reset): label + inert track + a note, with NO percentage or
 // fill — the honest "no confidently-wrong bar" rule (never a fabricated 0 or a stale high %).
 function usageShellHTML(kind, state, label, note) {
@@ -1004,8 +1052,12 @@ function usageBarHTML(kind, w, windowMs, label, now, updatedAt, pace, withDate) 
   const showDelta = hasReset && (pace === "both" || pace === "delta");
   const ef = hasReset ? elapsedFrac(w.resetsAt, windowMs, now) : 0;
   const tickHTML = showTick ? `<div class="usage-bar__tick" style="left:${(ef * 100).toFixed(2)}%"></div>` : "";
+  // The exhaustion projection rides on the reset line as a second clause (filled by applyLimit,
+  // like the delta/multiplier, so render and tick share one implementation). Gated on `showDelta`:
+  // it is a pace cue, so the `usagePace` setting governs it exactly as it governs the delta.
   const footInfo =
     (hasReset ? `<span class="usage-bar__reset">${esc(fmtResetLine(w.resetsAt, now, withDate))}</span>` : "") +
+    (hasReset && showDelta ? `<span class="usage-bar__limit"></span>` : "") +
     (state === "stale" ? `<span class="usage-bar__age">updated ${esc(fmtAge(now - updatedAt))} ago</span>` : "");
   // The delta chip + the burn-rate multiplier are filled by applyDelta/applyMult so render + tick
   // share one implementation. The multiplier rides after the delta (it replaced the time-left ETA
@@ -1074,6 +1126,7 @@ function bindUsage() {
       state: elBar.dataset.state,
       els: {
         reset: elBar.querySelector(".usage-bar__reset"),
+        limit: elBar.querySelector(".usage-bar__limit"),
         age: elBar.querySelector(".usage-bar__age"),
         tick: elBar.querySelector(".usage-bar__tick"),
         delta: elBar.querySelector(".usage-bar__delta"),
@@ -1111,14 +1164,16 @@ function advanceUsageBars(now) {
     if (b.els.age) b.els.age.textContent = "updated " + fmtAge(now - r.updatedAt) + " ago";
     // Advance the pace cue whenever the bar shows one (live OR stale). On a stale bar usedPct is
     // frozen but elapsed advances, so the delta walks down over time until reset — intended.
-    if (hasReset && (b.els.tick || b.els.delta || b.els.mult)) {
+    if (hasReset && (b.els.tick || b.els.delta || b.els.mult || b.els.limit)) {
       const ef = elapsedFrac(w.resetsAt, b.windowMs, now);
       if (b.els.tick) b.els.tick.style.left = (ef * 100).toFixed(2) + "%";
       // Same gap the tick shows (fill − tick), rescaled from a fraction of the window to time;
       // windowMs also scales the on-pace band so the 7d bar isn't judged against a 5h tolerance.
       if (b.els.delta) applyDelta(b.els.delta, (clamp(num(w.usedPct), 0, 100) / 100 - ef) * b.windowMs, b.windowMs);
-      // Burn-rate multiplier riding after the delta (see applyMult) — replaced the time-left ETA.
+      // Burn-rate multiplier riding after the delta (see applyMult).
       if (b.els.mult) applyMult(b.els.mult, w.usedPct, w.resetsAt, b.windowMs, now);
+      // Projected exhaustion, on the reset line rather than after the delta (see applyLimit).
+      if (b.els.limit) applyLimit(b.els.limit, w.usedPct, w.resetsAt, b.windowMs, now, b.withDate);
     }
   }
 }
