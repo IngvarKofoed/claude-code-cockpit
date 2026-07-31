@@ -23,6 +23,13 @@ function emptyTokens() {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0 };
 }
 
+// The colour names Claude Code's /color accepts. `/color default` (and its reset
+// aliases) records the literal 'default' instead, so anything outside this list —
+// a reset, or a colour a later Claude Code adds — resolves to "no colour" rather
+// than leaving a stale dot on the card. The dashboard maps these names to CSS, so
+// the list also keeps an unexpected transcript value out of a style lookup.
+const SESSION_COLORS = ['red', 'blue', 'green', 'yellow', 'purple', 'orange', 'pink', 'cyan'];
+
 // Split cache-creation tokens by TTL. `cache_creation_input_tokens` is the total;
 // the `cache_creation` sub-object breaks it into 5m/1h. Verified against real
 // transcripts: total === 5m + 1h exactly. Version-tolerant per this module's
@@ -97,7 +104,15 @@ function readUsage(transcriptPath) {
     content = fs.readFileSync(transcriptPath, 'utf8');
   } catch (_err) {
     // missing / unreadable -> ok:false
-    return { messages: [], byModel: {}, totals: emptyTokens(), cwd: null, title: null, ok: false };
+    return {
+      messages: [],
+      byModel: {},
+      totals: emptyTokens(),
+      cwd: null,
+      title: null,
+      color: null,
+      ok: false,
+    };
   }
   return readUsageContent(content);
 }
@@ -111,7 +126,15 @@ function readUsageContent(content) {
   // `cwd` is the session's working directory, captured from the first entry that
   // carries it — used by backfill to resolve which repo a whole transcript belongs
   // to (transcript filenames only carry the session id, not the cwd).
-  const result = { messages: [], byModel: {}, totals: emptyTokens(), cwd: null, title: null, ok: false };
+  const result = {
+    messages: [],
+    byModel: {},
+    totals: emptyTokens(),
+    cwd: null,
+    title: null,
+    color: null,
+    ok: false,
+  };
 
   if (!content || !content.trim()) return result; // empty -> ok:false
   result.ok = true;
@@ -122,6 +145,10 @@ function readUsageContent(content) {
   // /rename). The user's name always wins — see the resolve below the loop.
   let aiTitle = null;
   let customTitle = null;
+  // The session colour the user picked with /color. Unlike the two names there is
+  // only one source, so the LAST line simply wins — including the 'default' a reset
+  // writes, which is why this holds the raw value and is validated after the loop.
+  let agentColor = null;
 
   const lines = content.split('\n');
   const seen = new Set();
@@ -149,6 +176,14 @@ function readUsageContent(content) {
       obj.customTitle.trim() !== ''
     ) {
       customTitle = obj.customTitle;
+    } else if (
+      obj.type === 'agent-color' &&
+      typeof obj.agentColor === 'string' &&
+      obj.agentColor.trim() !== ''
+    ) {
+      // Blank/absent is a malformed line, not a reset — ignoring it keeps the colour
+      // the user actually chose. A real reset arrives as the literal 'default'.
+      agentColor = obj.agentColor;
     }
 
     const parsed = parseUsageLine(obj);
@@ -175,6 +210,11 @@ function readUsageContent(content) {
   // custom name whenever there is one, and leave title:null when neither source
   // appeared (the Sessions list renders that as "Untitled session").
   result.title = customTitle != null ? customTitle : aiTitle;
+
+  // Only a name the dashboard can actually render becomes a colour; 'default' and
+  // anything unrecognised leave it null, so the card shows no dot instead of a
+  // stale or unmappable one.
+  result.color = SESSION_COLORS.includes(agentColor) ? agentColor : null;
 
   return result;
 }

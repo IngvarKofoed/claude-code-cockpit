@@ -19,7 +19,7 @@ const App = {
   histBuilt: false, // History view scaffolding (family cards + pivot toolbar) built once
   liveSort: "status", // "status" (server waiting-first) | "name" (alpha) | "context" (fullest first); set from localStorage in init
   theme: "dark", // "dark" (default) | "light"; per-browser localStorage pref, set in init
-  liveShow: { title: true, branch: true, path: true, ctx: true }, // which optional Live-card rows to show (3 location lines + the context gauge); per-browser localStorage pref, set in init
+  liveShow: { title: true, branch: true, path: true, ctx: true, color: true }, // which optional Live-card rows to show (3 location lines + the context gauge + the /color dot); per-browser localStorage pref, set in init
   repoRows: [], // normalized rows currently shown in the per-repo table
   repoSort: { key: "activeMs", dir: -1 }, // dir: 1 asc, -1 desc
   sessionsPage: 0, // current 0-based page of the Sessions view
@@ -627,8 +627,20 @@ function cardHTML(s) {
   // in the column-flex `.card__where`) rather than sharing one row, and each is omitted when
   // its toggle is off or its value is absent; the wrapper is dropped when neither shows.
   const show = App.liveShow;
+  // The session's /color, as a filled dot ahead of the tag glyph — the one thing on a card
+  // that ties it to a specific terminal window, which is what /color exists for. Kept OFF
+  // the rail and badge: those are wholly spent on status, and a second meaning there would
+  // read as a status light. transcript.js is the whitelist (its SESSION_COLORS), so a value
+  // arriving here is already one styles.css maps; an unmapped one falls back to the name
+  // line's own ink rather than vanishing. Has its OWN `show.color` toggle, but still lives
+  // inside the name line — so turning the session name off removes the dot with it, which
+  // the Settings description says rather than leaving it a surprise.
+  const dot =
+    show.color && typeof s.color === "string" && s.color
+      ? `<span class="card__dot" data-color="${esc(s.color)}" title="Session colour: ${esc(s.color)}"></span>`
+      : "";
   const title = show.title
-    ? `<div class="card__title"${s.title ? ` title="${esc(s.title)}"` : ""}>${TITLE_SVG}<span>${s.title ? esc(s.title) : ""}</span></div>`
+    ? `<div class="card__title"${s.title ? ` title="${esc(s.title)}"` : ""}>${dot}${TITLE_SVG}<span>${s.title ? esc(s.title) : ""}</span></div>`
     : "";
   const whereParts = [];
   if (show.branch && s.branch)
@@ -2297,6 +2309,11 @@ function settingsHTML(cfg) {
     fieldRow("Light theme", "Use the light color scheme (this browser only)", sw("set-theme", App.theme === "light")) +
       fieldRow("In-browser sounds", "Play Web Audio cues in this tab", sw("set-browserSounds", cfg.browserSounds)) +
       fieldRow("Show session name", "Session name line on each live card (this browser only)", sw("set-show-title", App.liveShow.title)) +
+      fieldRow(
+        "Show session colour",
+        "The /color dot beside the session name — needs Show session name on (this browser only)",
+        sw("set-show-color", App.liveShow.color)
+      ) +
       fieldRow("Show branch", "Git branch line on each live card (this browser only)", sw("set-show-branch", App.liveShow.branch)) +
       fieldRow("Show folder path", "Working-directory path line on each live card (this browser only)", sw("set-show-path", App.liveShow.path)) +
       fieldRow(
@@ -2711,6 +2728,7 @@ function init() {
         branch: v.branch !== false,
         path: v.path !== false,
         ctx: v.ctx !== false,
+        color: v.color !== false,
       };
     }
   } catch (_e) {

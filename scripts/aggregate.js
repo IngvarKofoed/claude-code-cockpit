@@ -114,6 +114,11 @@ function newSession(event) {
     // (or transcript unreadable). Display only: a DERIVED or deliberately user-typed
     // name, never the verbatim last prompt (the privacy boundary).
     title: null,
+    // The prompt-bar colour the user picked with /color, so a card can be matched to the
+    // terminal it belongs to — one of transcript.js's SESSION_COLORS, or null when unset
+    // or reset. Daemon-filled from readUsage alongside `title`; unlike the name it CAN go
+    // back to null, because /color default is a real reset the dot has to follow.
+    color: null,
     // Context-window fill for this session: { usedPct, tokens, updatedAt } from the
     // statusline forwarder's push (see setSessionContext), or null until one arrives —
     // it needs the installed statusline, so a session without it simply has no gauge.

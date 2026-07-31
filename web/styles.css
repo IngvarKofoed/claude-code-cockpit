@@ -27,6 +27,20 @@
   --st-ended: #566173;
   --st-paused: #8b7bff; /* global pause-gate freeze — indigo/violet, distinct from every other status hue */
 
+  /* Session colours — the eight names /color accepts, for the name-line dot. Deliberately
+     NOT the status tokens above: the two appear on the same card and must not be confusable,
+     so these are shifted off the semaphore hues (red is pinker than --st-error, green cooler
+     than --st-running) and kept mutually distinguishable at 7px, which is the only size they
+     ever render at. */
+  --sc-red: #ef5f57;
+  --sc-blue: #4f9bf0;
+  --sc-green: #3fc98a;
+  --sc-yellow: #f2c744;
+  --sc-purple: #a98bff;
+  --sc-orange: #f59245;
+  --sc-pink: #f06ec2;
+  --sc-cyan: #3fc7d4;
+
   /* Chart tokens (validated dark categorical/sequential set) */
   --series-1: #3987e5;
   --series-2: #199e70;
@@ -77,6 +91,16 @@
   --st-error: #d03b3b;
   --st-ended: #7a8598;
   --st-paused: #5b4cc7;
+  /* Session-colour dots darkened for a legible 7px circle on white — yellow and cyan most
+     of all, since their dark-theme values wash out completely against --surface-1: #ffffff. */
+  --sc-red: #cf3b34;
+  --sc-blue: #2a6fd0;
+  --sc-green: #14875a;
+  --sc-yellow: #9a7400;
+  --sc-purple: #6a4fd0;
+  --sc-orange: #c2620f;
+  --sc-pink: #c53a92;
+  --sc-cyan: #0f7f8c;
   /* Chart categorical — dataviz-validated LIGHT steps of the same six hues. */
   --series-1: #2a78d6;
   --series-2: #1baf7a;
@@ -608,6 +632,26 @@ body {
 }
 #cards .card__title svg { width: 13px; height: 13px; flex: none; opacity: 0.8; }
 #cards .card__title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The session's /color dot, ahead of the tag glyph. Scoped tighter than the generic
+   `.card__title span` rule above so the shared ellipsis/shrink treatment meant for the
+   NAME can't squash it: `flex: none` keeps it a circle when a long name pushes the row.
+   `currentColor` is the fallback, so a colour styles.css doesn't map yet shows as a muted
+   dot in the name line's own ink rather than an invisible 7px gap. */
+#cards .card__title .card__dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+}
+#cards .card__title .card__dot[data-color="red"] { background: var(--sc-red); }
+#cards .card__title .card__dot[data-color="blue"] { background: var(--sc-blue); }
+#cards .card__title .card__dot[data-color="green"] { background: var(--sc-green); }
+#cards .card__title .card__dot[data-color="yellow"] { background: var(--sc-yellow); }
+#cards .card__title .card__dot[data-color="purple"] { background: var(--sc-purple); }
+#cards .card__title .card__dot[data-color="orange"] { background: var(--sc-orange); }
+#cards .card__title .card__dot[data-color="pink"] { background: var(--sc-pink); }
+#cards .card__title .card__dot[data-color="cyan"] { background: var(--sc-cyan); }
 /* Branch and folder path are STACKED, each on its own line (was one shared row) — a
    column flex, left-aligned, with a tight internal gap so the two read as one location
    group. Either line is omitted upstream when its toggle is off / its value is absent. */

@@ -1574,6 +1574,11 @@ function updateSessionTokens(sid, usage) {
   // Only overwrite when present, so a transient read before the name line flushes can't
   // clear a name we already have.
   if (usage.title != null && String(usage.title).trim() !== '') session.title = usage.title;
+  // The session colour (/color) is assigned UNCONDITIONALLY, unlike the name above: a
+  // `/color default` reset has to be able to clear the dot, and null can't be a partial
+  // read here because the parser rescans the whole transcript and every caller of this
+  // function already gated on `usage.ok`.
+  session.color = usage.color != null ? usage.color : null;
   // The Windows Terminal tab is matched by this title, so the focus target follows it
   // (including across a /rename, which is exactly when the tab name changes too).
   syncFocusTitle(session);

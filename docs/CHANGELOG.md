@@ -1188,3 +1188,23 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      one, so a UI-only change still needs the bump to reach anyone. Fittingly, this release is
      the first whose own arrival is visible in the topbar. `marketplace.json` stays at 0.2.0,
      unmaintained since that release, so it is deliberately left alone.
+
+149. Live cards show the session's `/color` as a dot before the name's tag glyph, so a card can be
+     matched to the terminal window it belongs to. Fed by the transcript's `agent-color` lines (last
+     wins; `default` or an unmapped name clears it) — no new state, hook or event, since
+     `transcript.js` already scanned every line for `custom-title`. Assigned UNCONDITIONALLY unlike
+     `title`, so a reset can clear it; every caller already gated on `usage.ok`, so null isn't a
+     partial read. Kept off the rail and badge: both are wholly spent on status, where a coloured
+     dot would read as a status light.
+
+150. Released v0.44.0, carrying entries 149 and 151. Bumped per entry 103 — the plugin cache is
+     keyed by version and `ensure.js` only replaces a running daemon when `/health` reports a
+     DIFFERENT one, so a UI-only change still needs the bump to reach anyone. `marketplace.json`
+     stays at 0.2.0, unmaintained since that release, so it is deliberately left alone.
+
+151. The colour dot has its own Settings > Dashboard switch ("Show session colour"), default ON —
+     a per-browser `App.liveShow.color` localStorage pref like the other Live-card toggles, never
+     daemon config, so it neither PUTs nor pops a "Settings saved" toast. No handler change was
+     needed: the switch listener already derives the key from its `set-show-<key>` element id.
+     The dot still lives INSIDE the name line, so turning the session name off removes the dot with
+     it — stated in the switch's own description rather than left as a surprise.
