@@ -7,8 +7,13 @@ const {
   normalizeContextWindow,
   pushSessionId,
   sameUsageWindows,
+  appendUsageSample,
+  pruneUsageSamples,
+  usageSampleSlice,
   applyPattern,
   subLabel,
+  USAGE_MAX_LOOKBACK_MS,
+  USAGE_MAX_SAMPLES,
 } = require('./usage');
 
 test('normalizeUsageWindow converts resets_at seconds -> ms and keeps usedPct', () => {
@@ -213,4 +218,120 @@ test('subLabel: missing/blank pattern is identity (returns the raw base name)', 
 
 test('subLabel: a null subscription labels as "Personal"', () => {
   assert.strictEqual(subLabel(null, { subscriptionLabelPattern: '\\(([^)]+)\\)' }), 'Personal');
+});
+
+// ---- weekly percentage sample buffer ----------------------------------------
+
+const H = 3600 * 1000;
+const T0 = 1785000000000; // fixed clock; these helpers must never read the wall clock
+
+// Append a series of [hoursAgo, pct] readings for one subscription, newest last.
+function buildSamples(readings, sub = 's1', now = T0) {
+  let out = [];
+  for (const [hoursAgo, pct] of readings) {
+    out = appendUsageSample(out, { t: now - hoursAgo * H, pct, sub }, now);
+  }
+  return out;
+}
+
+test('appendUsageSample: records a change and ignores an unchanged repeat', () => {
+  let s = appendUsageSample([], { t: T0 - 2 * H, pct: 90, sub: 'a' }, T0);
+  assert.strictEqual(s.length, 1);
+  const same = appendUsageSample(s, { t: T0 - H, pct: 90, sub: 'a' }, T0);
+  assert.strictEqual(same, s, 'an unchanged percentage returns the input array untouched');
+  s = appendUsageSample(s, { t: T0, pct: 91, sub: 'a' }, T0);
+  assert.deepStrictEqual(s.map((x) => x.pct), [90, 91]);
+});
+
+test('appendUsageSample: drops garbage entries rather than storing them', () => {
+  const s = [{ t: T0, pct: 5, sub: 'a' }];
+  assert.strictEqual(appendUsageSample(s, { t: NaN, pct: 6, sub: 'a' }, T0), s);
+  assert.strictEqual(appendUsageSample(s, { t: T0, pct: 'x', sub: 'a' }, T0), s);
+  assert.strictEqual(appendUsageSample(s, null, T0), s);
+});
+
+test('appendUsageSample: subscriptions are independent, and undefined buckets as null', () => {
+  let s = appendUsageSample([], { t: T0 - 2 * H, pct: 90, sub: 'a' }, T0);
+  s = appendUsageSample(s, { t: T0 - H, pct: 12, sub: 'b' }, T0);
+  // 90 is subscription a's last value, not b's — b must still record its own 90.
+  s = appendUsageSample(s, { t: T0, pct: 90, sub: 'b' }, T0);
+  assert.deepStrictEqual(s.map((x) => [x.sub, x.pct]), [['a', 90], ['b', 12], ['b', 90]]);
+  const withNull = appendUsageSample(s, { t: T0, pct: 3 }, T0);
+  assert.strictEqual(withNull[withNull.length - 1].sub, null, 'a missing sub normalizes to null');
+});
+
+test('appendUsageSample: a steep drop discards that subscription history (window reset)', () => {
+  let s = buildSamples([[6, 88], [4, 92], [2, 95]]);
+  s = appendUsageSample(s, { t: T0, pct: 2, sub: 's1' }, T0);
+  assert.deepStrictEqual(s.map((x) => x.pct), [2], 'pre-reset samples would anchor a false delta');
+});
+
+test('appendUsageSample: a small decrease is kept (a rolling window ages usage out)', () => {
+  const s = buildSamples([[6, 88], [4, 92], [2, 91]]);
+  assert.deepStrictEqual(s.map((x) => x.pct), [88, 92, 91]);
+});
+
+test('appendUsageSample: a steep drop spares OTHER subscriptions', () => {
+  let s = buildSamples([[6, 88], [4, 92]], 'a');
+  s = appendUsageSample(s, { t: T0 - 3 * H, pct: 40, sub: 'b' }, T0);
+  s = appendUsageSample(s, { t: T0, pct: 1, sub: 'a' }, T0);
+  assert.deepStrictEqual(s.map((x) => [x.sub, x.pct]), [['b', 40], ['a', 1]]);
+});
+
+test('pruneUsageSamples: keeps the newest out-of-horizon sample per subscription as an anchor', () => {
+  const old = T0 - (USAGE_MAX_LOOKBACK_MS + 20 * H);
+  const s = pruneUsageSamples(
+    [
+      { t: old - H, pct: 10, sub: 'a' },
+      { t: old, pct: 11, sub: 'a' },
+      { t: old, pct: 50, sub: 'b' },
+      { t: T0 - H, pct: 12, sub: 'a' },
+    ],
+    T0
+  );
+  // The oldest 'a' is dropped; the newest out-of-horizon one survives for BOTH subs, so a
+  // long flat stretch can still be measured instead of reading "measuring..." forever.
+  assert.deepStrictEqual(s.map((x) => [x.sub, x.pct]), [['a', 11], ['b', 50], ['a', 12]]);
+});
+
+test('pruneUsageSamples: caps a runaway buffer, keeping the newest', () => {
+  const many = [];
+  for (let i = 0; i < USAGE_MAX_SAMPLES + 50; i++) many.push({ t: T0 - (USAGE_MAX_SAMPLES - i) * 1000, pct: i, sub: 'a' });
+  const s = pruneUsageSamples(many, T0);
+  assert.strictEqual(s.length, USAGE_MAX_SAMPLES);
+  assert.strictEqual(s[s.length - 1].pct, USAGE_MAX_SAMPLES + 49);
+});
+
+test('usageSampleSlice: returns the in-window samples plus one anchor outside it', () => {
+  const s = buildSamples([[20, 70], [8, 80], [4, 86], [1, 90]]);
+  const slice = usageSampleSlice(s, 's1', T0, 6 * H);
+  // 8h-ago is the anchor (newest at or before the 6h cutoff); 20h-ago is not carried.
+  assert.deepStrictEqual(slice.map((x) => x.pct), [80, 86, 90]);
+});
+
+test('usageSampleSlice: no sample old enough yields no anchor (the "measuring" state)', () => {
+  const s = buildSamples([[2, 86], [1, 90]]);
+  const slice = usageSampleSlice(s, 's1', T0, 6 * H);
+  assert.deepStrictEqual(slice.map((x) => x.pct), [86, 90]);
+  assert.ok(!slice.some((x) => x.t <= T0 - 6 * H), 'nothing at or before the cutoff — the client reads this as unmeasurable');
+});
+
+test('usageSampleSlice: filters to one subscription, so a switch cannot cross-contaminate', () => {
+  let s = buildSamples([[8, 80], [1, 90]], 'a');
+  s = appendUsageSample(s, { t: T0 - 7 * H, pct: 30, sub: 'b' }, T0);
+  s = appendUsageSample(s, { t: T0 - 2 * H, pct: 33, sub: 'b' }, T0);
+  assert.deepStrictEqual(usageSampleSlice(s, 'a', T0, 6 * H).map((x) => x.pct), [80, 90]);
+  assert.deepStrictEqual(usageSampleSlice(s, 'b', T0, 6 * H).map((x) => x.pct), [30, 33]);
+});
+
+test('usageSampleSlice: a null subscription is its own bucket, not a wildcard', () => {
+  let s = appendUsageSample([], { t: T0 - 8 * H, pct: 40, sub: null }, T0);
+  s = appendUsageSample(s, { t: T0 - H, pct: 44, sub: 'a' }, T0);
+  assert.deepStrictEqual(usageSampleSlice(s, null, T0, 6 * H).map((x) => x.pct), [40]);
+});
+
+test('usageSampleSlice: no lookback (whole-window basis) ships nothing', () => {
+  const s = buildSamples([[8, 80], [1, 90]]);
+  assert.deepStrictEqual(usageSampleSlice(s, 's1', T0, 0), []);
+  assert.deepStrictEqual(usageSampleSlice(null, 's1', T0, 6 * H), []);
 });

@@ -486,7 +486,7 @@ function chip(text, mono) {
 }
 
 // Context-window fill for one session: a METER, not a chart — one value read against a
-// threshold. The colour is the shared usage ramp (usageColor: green < 50, amber >= 50,
+// threshold. The colour is the shared usage ramp (usageColor: accent blue < 65, amber >= 65,
 // red >= 80) and never carries the meaning alone — the percentage is always spelled out
 // beside it, so the state survives colour-blindness and a greyscale print.
 //
@@ -804,12 +804,16 @@ function elapsedFrac(resetsAt, windowMs, now) {
   return clamp01((now - (resetsAt - windowMs)) / windowMs);
 }
 
-// Fill colour by the statusline convention: green < 65, amber < 80, red >= 80. The amber line
-// sits at 65 (not the midpoint) so the warning band is the last third of the window rather than
-// half of it — at 50% of a 5h window or a context you are usually still fine.
-// statusline/statusline-render.js:threshColor implements the same ramp; keep the two in step.
+// Fill colour for every meter on the page: accent blue < 65, amber < 80, red >= 80. The amber
+// line sits at 65 (not the midpoint) so the warning band is the last third of the window rather
+// than half of it — at 50% of a 5h window or a context you are usually still fine.
+// The safe band is the instrument ACCENT, not --st-running: these meters sit among per-session
+// status rails and badges, where a green fill read as "this session is working" at a glance.
+// Blue is the page's neutral "here is a level" hue, so only the amber/red warning bands carry
+// urgency. statusline/statusline-render.js:threshColor keeps the same THRESHOLDS (its own hues
+// are terminal colours, unrelated to these tokens); keep the two lines in step.
 function usageColor(pct) {
-  return pct >= 80 ? "var(--st-error)" : pct >= 65 ? "var(--st-waiting)" : "var(--st-running)";
+  return pct >= 80 ? "var(--st-error)" : pct >= 65 ? "var(--st-waiting)" : "var(--accent)";
 }
 
 // The active config's pace mode, defaulting unknown/missing to "both".
@@ -903,6 +907,201 @@ function fmtPaceGap(ms) {
   return `${t.m}m`;
 }
 
+// ---- sliding-lookback burn rate (weekly bar only) --------------------------
+// Points of movement a sliding lookback needs before it will publish a rate. Anthropic
+// reports used_percentage as an INTEGER, so a delta carries ±1 point of quantization error
+// whatever the span — below 2 points the relative error exceeds 50%, which is worse than
+// saying nothing. Under that, the readouts state the bound they can prove instead.
+const MIN_RATE_POINTS = 2;
+
+// The spans the Settings dropdown offers, 0 = the whole window. Mirrors config.js's
+// USAGE_WEEKLY_LOOKBACK_HOURS, which validates the same set server-side.
+const WEEKLY_LOOKBACK_OPTIONS = [0, 2, 3, 6, 12, 24];
+
+// The configured sliding span in ms, or 0 for the whole window (the default, and today's
+// behaviour). Only the weekly bar consults it; the 5h bar always passes 0.
+function usageWeeklyLookbackMs() {
+  const h = App.cfg ? num(App.cfg.usageWeeklyLookbackHours) : 0;
+  return h > 0 ? h * 3600 * 1000 : 0;
+}
+
+// Least data a rate may be computed from, however long the configured span is. A FIXED
+// floor rather than a fraction of the span: the point is to start reading soon after a
+// subscription switch or a fresh daemon, and a fraction would make exactly the long spans
+// — the ones you pick when you want a number at all — the slowest to come back. The
+// thinness of a 30-minute reading under a 24h span is carried on screen instead, by the
+// span suffix the readout wears while the window is still filling.
+const MIN_SPAN_MS = 30 * 60 * 1000;
+
+// A span for display. Whole hours render bare ("3h") so a fully-covered window reads as the
+// setting itself; a partial one needs sub-hour and fractional forms ("45m", "1.2h").
+function fmtSpan(ms) {
+  const min = ms / 60000;
+  if (min < 60) return Math.round(min) + "m";
+  const h = ms / 3600000;
+  return (Number.isInteger(h) ? h : h.toFixed(1)) + "h";
+}
+
+// Burn rate over the last `lookbackMs`, in percentage POINTS PER MS — or null plus the
+// reason it can't be measured. Anchored on the newest sample at or before now − lookbackMs,
+// which the daemon ships alongside the in-window ones precisely so this can advance every
+// second between frames (see usage.js:usageSampleSlice).
+function slidingRate(w, pct, now, lookbackMs) {
+  const cutoff = now - lookbackMs;
+  let anchor = null; // newest at or before the cutoff -> the window is fully covered
+  let oldest = null; // earliest we hold at all -> the window is still filling
+  for (const s of Array.isArray(w.samples) ? w.samples : []) {
+    if (!s || !Number.isFinite(s.t) || !Number.isFinite(s.pct)) continue;
+    if (s.t <= cutoff && (!anchor || s.t > anchor.t)) anchor = s;
+    if (!oldest || s.t < oldest.t) oldest = s;
+  }
+  // With an anchor the span IS the lookback: change-only sampling means "no sample between
+  // the anchor and the cutoff" really means the value was flat there, so the delta is
+  // exactly the in-window rise. Without one we fall back to the oldest reading we hold and
+  // measure over the time it actually covers — dividing a partial window's delta by the
+  // nominal lookback would understate the burn by however much the window is short.
+  const base = anchor || oldest;
+  if (!base) return { rate: null, why: "measuring" };
+  const spanMs = anchor ? lookbackMs : now - oldest.t;
+  if (spanMs < MIN_SPAN_MS) return { rate: null, why: "measuring" };
+  const partial = !anchor;
+  const delta = pct - base.pct;
+  // A NEGATIVE delta is not "too little movement" — the percentage fell, which a rolling
+  // seven-day window does as old usage ages out. Reporting it as "< 2%/Nh" would state
+  // something false about a several-point move, so it reads as unmeasurable instead. Kept
+  // distinct from "measuring" (which renders the same text) only so the tooltip can say
+  // which of the two happened — there IS a reading here, the usage just went down.
+  // Both no-rate states below carry the span actually observed, not the setting — saying
+  // "fallen over the last 3h" off 1.5h of data is the same overclaim as "< 2%/3h" would be.
+  if (delta < 0) return { rate: null, why: "declining", spanMs, partial };
+  if (delta < MIN_RATE_POINTS) return { rate: null, why: "coarse", spanMs, partial };
+  return { rate: delta / spanMs, why: null, spanMs, partial };
+}
+
+// Points per ms that the budget you have LEFT sustains until the reset. This is the
+// denominator the sliding multiplier is measured against, so 1.0× means "exactly on track
+// to finish this window at 100%" — and since m > 1 ⟺ the projection lands before the reset,
+// the multiplier and the limit clause agree by construction. Deliberately NOT applied to
+// the 5h bar or to "Week", which keep the whole-window reference untouched.
+//
+// That equivalence holds for the RAW ratio, not the rounded one on screen: a true 1.02×
+// displays as "1.0×" (muted, on-pace) beside an amber "limit in ~3h", because applyLimit
+// gates on the unrounded shortfall. That is entry 159's accepted trade — precision, not
+// contradiction — and it survives here rather than being eliminated by the reframing. The
+// alternative, gating the clause on the rounded ratio, hides a real multi-hour shortfall
+// whenever it rounds down, which entry 159 already rejected for the un-reframed bars.
+function affordableRate(pct, resetsAt, now) {
+  const left = resetsAt - now;
+  return left > 0 ? (100 - pct) / left : null;
+}
+
+// The multiplier value, rounded exactly as it will be RENDERED, so the colour verdict and
+// the number can never disagree (entry 54). One decimal below 10× keeps the on-pace case
+// reading "1.0×"; above that whole numbers, and beyond 99× the extra digits say nothing a
+// ">99×" doesn't — the reading is qualitatively "far too fast" either way.
+function roundMult(m) {
+  if (m >= 100) return 100;
+  return m < 10 ? parseFloat(m.toFixed(1)) : Math.round(m);
+}
+
+function fmtMult(rounded) {
+  return rounded >= 100 ? ">99×" : rounded + "×";
+}
+
+// The sliding half of applyMult. Unlike the whole-window path it always says SOMETHING:
+// an empty slot where a number belongs reads as broken, and the two ways a rate can be
+// unmeasurable are worth telling apart — one resolves itself, the other is a real (if
+// imprecise) statement that you are barely burning.
+function applyMultSliding(el, w, now, lookbackMs) {
+  const pct = clamp(num(w.usedPct), 0, 100);
+  if (pct >= 100) {
+    el.classList.add("usage-bar__mult--limit");
+    el.textContent = "at limit";
+    el.title = "budget exhausted for this window";
+    return;
+  }
+  const res = slidingRate(w, pct, now, lookbackMs);
+  const { rate, why, partial } = res;
+  // Every message names the span actually measured, which is the configured one only once
+  // the window has filled — otherwise "< 2%/6h" would claim six hours of evidence we don't
+  // have. The no-reading states have no span at all, so they fall back to the setting.
+  const span = fmtSpan(res.spanMs != null ? res.spanMs : lookbackMs);
+  if (rate == null) {
+    el.classList.add("usage-bar__mult--none");
+    if (why === "measuring" || why === "declining") {
+      // One visible state for both, per the spec's own table — they are equally "no rate to
+      // show". The tooltip splits them because the causes are opposite: one is waiting for
+      // history, the other has history showing the percentage go down.
+      el.textContent = "measuring…";
+      el.title =
+        why === "declining"
+          ? "usage has fallen over the last " + span + " — no burn rate to project"
+          : "no reading yet that reaches back " + span + " — collecting (a fresh daemon, or a recent subscription switch)";
+    } else {
+      // States the bound the data actually proves. NOT "no recent burn", which would
+      // overclaim: a delta of 1 could be anything up to 1.9 real points, and that close to
+      // the cap is a meaningful share of what's left.
+      el.textContent = "< " + MIN_RATE_POINTS + "%/" + span;
+      el.title =
+        "under " + MIN_RATE_POINTS + " points of the weekly budget in the last " + span +
+        " — too little movement to rate (the percentage arrives as a whole number)";
+    }
+    return;
+  }
+  const afford = affordableRate(pct, w.resetsAt, now);
+  if (afford == null || !(afford > 0)) {
+    el.textContent = "";
+    el.removeAttribute("title");
+    return;
+  }
+  const r = roundMult(rate / afford);
+  el.textContent = fmtMult(r);
+  // While the window is still filling, the number wears the span it was actually measured
+  // over ("2.4× · 1.2h"). It is an exception marker, not a permanent label: it disappears of
+  // its own accord once the buffer spans the setting, so a bare multiplier always means the
+  // full configured window. Appended as a child rather than folded into the text so it can
+  // be styled down — the reading is the number, not the span.
+  if (partial) {
+    const suffix = document.createElement("span");
+    suffix.className = "usage-bar__mult-span";
+    suffix.textContent = " · " + span;
+    el.appendChild(suffix);
+  }
+  const verdict = r > 1 ? "over" : r < 1 ? "under" : "on";
+  el.classList.add("usage-bar__mult--" + verdict);
+  const over = partial ? " (a " + fmtSpan(lookbackMs) + " window, still filling)" : "";
+  el.title =
+    (verdict === "on"
+      ? "burning about what your remaining budget sustains until the reset, measured over the last " + span
+      : "burning " + fmtMult(r) + " what your remaining budget sustains until the reset, measured over the last " + span) + over;
+}
+
+// The sliding half of applyLimit. Same clause and format; the rate is the recent one, and
+// the LIMIT_SETTLED_FRAC guard is dropped because it exists for a jumpy elapsed denominator
+// that no longer appears here — the MIN_RATE_POINTS gate does that job instead.
+function applyLimitSliding(el, w, windowMs, now, lookbackMs, withDate) {
+  const pct = clamp(num(w.usedPct), 0, 100);
+  const { rate, spanMs } = slidingRate(w, pct, now, lookbackMs);
+  if (pct >= 100 || rate == null || !(rate > 0)) {
+    el.textContent = "";
+    el.removeAttribute("title");
+    return;
+  }
+  const leftMs = (100 - pct) / rate;
+  const shortfall = w.resetsAt - now - leftMs;
+  // The same anti-flicker band the whole-window path uses, expressed directly as the
+  // shortfall — so a rate hovering at exactly 1.0× doesn't blink the clause on and off.
+  if (!(shortfall >= paceTolerance(windowMs))) {
+    el.textContent = "";
+    el.removeAttribute("title");
+    return;
+  }
+  el.textContent = fmtLimitLine(now + leftMs, now, withDate);
+  el.title =
+    "at the burn rate of the last " + fmtSpan(spanMs) + " you hit 100% about " +
+    fmtPaceGap(shortfall) + " before this window resets";
+}
+
 // Burn-rate multiplier — current velocity as a multiple of the even ("normal") rate that would
 // land on exactly 100% at reset: m = usedFrac / elapsedFrac, so 1.0× is on pace, 2.5× is 2.5× that
 // rate. Now the foot's ONLY readout: it once rode after a signed pace delta ("▲ 6% · 18m"), itself
@@ -924,15 +1123,19 @@ function fmtPaceGap(ms) {
 // carrier of the exhausted-state cue — `applyLimit` deliberately blanks there rather than adding a
 // "limit in 0s" beside it (a finite ratio would misread as headroom). On a stale bar usedPct is
 // frozen but elapsed grows, so m drifts down over time — intended, and flagged old by the age note.
-function applyMult(el, usedPct, resetsAt, windowMs, now) {
+function applyMult(el, w, windowMs, now, lookbackMs) {
   el.classList.remove(
     "usage-bar__mult--over",
     "usage-bar__mult--under",
     "usage-bar__mult--on",
     "usage-bar__mult--limit",
+    "usage-bar__mult--none",
   );
-  const pct = clamp(num(usedPct), 0, 100);
-  const ef = elapsedFrac(resetsAt, windowMs, now);
+  // A configured lookback takes the sliding path; everything below is the original
+  // whole-window basis, left intact so the 5h bar and "Week" are untouched by this feature.
+  if (lookbackMs) return applyMultSliding(el, w, now, lookbackMs);
+  const pct = clamp(num(w.usedPct), 0, 100);
+  const ef = elapsedFrac(w.resetsAt, windowMs, now);
   if (pct < 1 || ef <= 0.01) {
     el.textContent = "";
     el.removeAttribute("title");
@@ -981,9 +1184,10 @@ const LIMIT_SETTLED_FRAC = 0.1;
 // rather than the old "won't run out" text. Blank at the cap too: the multiplier's "at limit" is the
 // exhausted-state cue, and a "limit in 0s" beside it would just be noise. On a stale bar this keeps
 // drifting rather than freezing (entry 46), with the age note carrying the staleness.
-function applyLimit(el, usedPct, resetsAt, windowMs, now, withDate) {
-  const pct = clamp(num(usedPct), 0, 100);
-  const ef = elapsedFrac(resetsAt, windowMs, now);
+function applyLimit(el, w, windowMs, now, lookbackMs, withDate) {
+  if (lookbackMs) return applyLimitSliding(el, w, windowMs, now, lookbackMs, withDate);
+  const pct = clamp(num(w.usedPct), 0, 100);
+  const ef = elapsedFrac(w.resetsAt, windowMs, now);
   const gapMs = (pct / 100 - ef) * windowMs;
   if (pct < 1 || pct >= 100 || ef < LIMIT_SETTLED_FRAC || gapMs < paceTolerance(windowMs)) {
     el.textContent = "";
@@ -994,7 +1198,7 @@ function applyLimit(el, usedPct, resetsAt, windowMs, now, withDate) {
   el.textContent = fmtLimitLine(now + leftMs, now, withDate);
   el.title =
     "at the current burn rate you hit 100% about " +
-    fmtPaceGap(resetsAt - now - leftMs) +
+    fmtPaceGap(w.resetsAt - now - leftMs) +
     " before this window resets";
 }
 
@@ -1083,9 +1287,12 @@ function bindUsage() {
     App.usageRender = null;
     return;
   }
+  // Only the weekly bar can take a sliding lookback (the 5h one is pinned to 0): a 2h span
+  // is 40% of a 5h window, close enough to its whole-window average not to be worth a
+  // second sample buffer.
   const defs = [
-    { kind: "fiveHour", win: u.fiveHour, windowMs: FIVE_HOUR_MS, withDate: false },
-    { kind: "sevenDay", win: u.sevenDay, windowMs: SEVEN_DAY_MS, withDate: true },
+    { kind: "fiveHour", win: u.fiveHour, windowMs: FIVE_HOUR_MS, withDate: false, lookbackMs: 0 },
+    { kind: "sevenDay", win: u.sevenDay, windowMs: SEVEN_DAY_MS, withDate: true, lookbackMs: usageWeeklyLookbackMs() },
   ];
   const bars = [];
   for (const d of defs) {
@@ -1096,6 +1303,7 @@ function bindUsage() {
       win: d.win,
       windowMs: d.windowMs,
       withDate: d.withDate,
+      lookbackMs: d.lookbackMs,
       state: elBar.dataset.state,
       els: {
         reset: elBar.querySelector(".usage-bar__reset"),
@@ -1142,9 +1350,9 @@ function advanceUsageBars(now) {
       // pace signal geometrically — which is why the numeric delta that restated it was dropped.
       if (b.els.tick) b.els.tick.style.left = (ef * 100).toFixed(2) + "%";
       // Burn-rate multiplier — the foot's only readout (see applyMult).
-      if (b.els.mult) applyMult(b.els.mult, w.usedPct, w.resetsAt, b.windowMs, now);
+      if (b.els.mult) applyMult(b.els.mult, w, b.windowMs, now, b.lookbackMs);
       // Projected exhaustion, as a clause on the reset line (see applyLimit).
-      if (b.els.limit) applyLimit(b.els.limit, w.usedPct, w.resetsAt, b.windowMs, now, b.withDate);
+      if (b.els.limit) applyLimit(b.els.limit, w, b.windowMs, now, b.lookbackMs, b.withDate);
     }
   }
 }
@@ -2317,6 +2525,11 @@ function settingsHTML(cfg) {
   const ev = cfg.events || {};
   const cost = cfg.cost || {};
   const pace = ["both", "tick", "delta", "off"].includes(cfg.usagePace) ? cfg.usagePace : "both";
+  // Mirrors config.js's USAGE_WEEKLY_LOOKBACK_HOURS — an unrecognized stored value falls
+  // back to 0 (whole window) so the select always has a selected option.
+  const weeklyLookback = WEEKLY_LOOKBACK_OPTIONS.includes(num(cfg.usageWeeklyLookbackHours))
+    ? num(cfg.usageWeeklyLookbackHours)
+    : 0;
   const notifications = section(
     "Notifications",
     "OS notifications are emitted by the daemon, so they work whether or not this dashboard is open.",
@@ -2364,6 +2577,16 @@ function settingsHTML(cfg) {
            <option value="tick" ${pace === "tick" ? "selected" : ""}>Tick only</option>
            <option value="delta" ${pace === "delta" ? "selected" : ""}>Readouts only</option>
            <option value="off" ${pace === "off" ? "selected" : ""}>Off</option>
+         </select>`
+      ) +
+      fieldRow(
+        "Weekly burn rate",
+        "What the weekly bar's multiplier and projected limit measure over. A shorter span tracks how hard you are going now; a longer one is steadier and blanks less often",
+        `<select class="select" id="set-usageWeeklyLookbackHours">
+           ${WEEKLY_LOOKBACK_OPTIONS.map(
+             (h) =>
+               `<option value="${h}" ${weeklyLookback === h ? "selected" : ""}>${h === 0 ? "Week (since reset)" : "Last " + h + " hours"}</option>`
+           ).join("")}
          </select>`
       ) +
       fieldRow(
@@ -2496,6 +2719,7 @@ function readSettingsForm() {
     browserSounds: cb("set-browserSounds"),
     activityDetail: $("set-activityDetail").value,
     usagePace: $("set-usagePace").value,
+    usageWeeklyLookbackHours: nv("set-usageWeeklyLookbackHours", 0),
     pauseGateEnabled: cb("set-pauseGateEnabled"),
     autoPauseFiveHourPct: nv("set-autoPauseFiveHourPct", 0),
     autoPauseWeeklyPct: nv("set-autoPauseWeeklyPct", 0),

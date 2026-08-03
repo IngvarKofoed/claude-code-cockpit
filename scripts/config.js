@@ -14,6 +14,13 @@ const paths = require('./paths');
 // already persisted the old value, and add the matching migration below.
 const CONFIG_VERSION = 3;
 
+// The spans the weekly bar's burn-rate readouts may measure over (0 = the whole window).
+// validateConfig is the authority. The Settings dropdown MIRRORS this list rather than
+// sharing it (web/app.js:WEEKLY_LOOKBACK_OPTIONS) — the dashboard is a buildless browser
+// module and cannot require a CommonJS file, and no endpoint serves the schema — so adding
+// a span here does not reach the UI on its own. Change both.
+const USAGE_WEEKLY_LOOKBACK_HOURS = [0, 2, 3, 6, 12, 24];
+
 const DEFAULT_CONFIG = {
   configVersion: CONFIG_VERSION,
   port: 4319,
@@ -22,6 +29,13 @@ const DEFAULT_CONFIG = {
   browserSounds: true,
   activityDetail: 'tool', // 'tool' | 'args'
   usagePace: 'both', // 'both' | 'tick' | 'delta' | 'off' — Live usage-bar pace cue
+  // Span the WEEKLY usage bar's burn-rate readouts measure over, in hours. 0 = the whole
+  // window (average since it opened) — today's behaviour and the default, so an upgrade
+  // changes nothing until the dropdown is touched. A positive value switches that bar's
+  // multiplier and projected-limit clause to a sliding lookback, which excludes the sleep
+  // and idle hours a seven-day average is dominated by. Off-is-zero matches the
+  // autoPauseWeeklyPct / idleShutdownHours idiom rather than adding a second on/off field.
+  usageWeeklyLookbackHours: 0,
   // Regex SOURCE string applied to a subscription's raw name to extract a clean
   // display label (see usage.subLabel/applyPattern). Default pulls the first
   // parenthesized group's contents, so "FOSS Analytical (Lyra)" renders as "Lyra";
@@ -270,6 +284,21 @@ function validateConfig(input) {
     }
   }
 
+  // Only the spans the Settings dropdown offers; anything else is rejected rather than
+  // clamped, so a hand-edited config can't quietly become a span the UI can't display.
+  if ('usageWeeklyLookbackHours' in input) {
+    // A numeric string coerces, like `port` — but null / '' / a boolean must NOT: Number()
+    // maps all three to 0, which would silently read as a deliberate "whole window" rather
+    // than the malformed value it is.
+    const raw = input.usageWeeklyLookbackHours;
+    const h = typeof raw === 'number' || (typeof raw === 'string' && raw.trim() !== '') ? Number(raw) : NaN;
+    if (USAGE_WEEKLY_LOOKBACK_HOURS.includes(h)) {
+      cfg.usageWeeklyLookbackHours = h;
+    } else {
+      errors.push('usageWeeklyLookbackHours must be one of ' + USAGE_WEEKLY_LOOKBACK_HOURS.join(', '));
+    }
+  }
+
   // Must compile as a RegExp; a value that doesn't is rejected (leaving the on-disk
   // config untouched, per the validate discipline) so a bad pattern can never be
   // persisted. '' is allowed and means identity (extraction off).
@@ -474,6 +503,7 @@ function writeConfig(input) {
 module.exports = {
   DEFAULT_CONFIG,
   CONFIG_VERSION,
+  USAGE_WEEKLY_LOOKBACK_HOURS,
   readConfig,
   writeConfig,
   validateConfig,

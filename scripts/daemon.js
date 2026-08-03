@@ -112,6 +112,12 @@ const sessionActiveDayCache = new Map(); // dateStr (PAST day only) -> Map<sid, 
 let sessionActiveTotalsCache = null; // { at, map: Map<sid, {activeMs,chats,tools,agents}> } short-TTL sum across days (includes the live current day)
 let repoTotalsCache = null; // memoized all-time per-repo totals for /api/state; invalidated on any token/rollup/cost-config change (see repoTotalsAllTime)
 let subscriptionTotalsCache = null; // sibling of repoTotalsCache: memoized all-time per-SUBSCRIPTION totals for /api/state. Rebuilt from the SAME aggregate inside repoTotalsAllTime and gated on repoTotalsCache's validity, so it invalidates in lockstep (nulling repoTotalsCache invalidates both) without editing every invalidation site.
+// Short history of the WEEKLY rate-limit percentage ({ t, pct, sub }), appended whenever a
+// statusline push moves it. Feeds the weekly bar's sliding burn-rate readouts, which the
+// single overwritten `rateLimitUsage` snapshot below cannot: a rate needs two points in
+// time. Retention/slicing rules live in the pure usage.js helpers; this file is the sole
+// writer. Persisted in the snapshot so a restart doesn't cost a lookback of history.
+let usageSamples = [];
 let rateLimitUsage = null; // latest GLOBAL rate-limit snapshot from the statusline forwarder (POST /internal/usage); null until one arrives. Named distinctly from the many function-local `usage` vars in this file so a dropped `let` can't silently clobber it. Served on buildStatePayload().usage.
 
 // Global pause-gate tracker (session-less: the control file is the sole ENFORCEMENT ruler;
@@ -425,6 +431,15 @@ function loadSnapshot() {
   // Restore the last-known usage snapshot so a restart keeps the bars until the
   // next statusline tick. Tolerate an absent key (older snapshot) -> stays null.
   if (snap.usage && typeof snap.usage === 'object') rateLimitUsage = snap.usage;
+  // Restore the weekly percentage history, pruned against the current clock so a daemon
+  // that was down for days doesn't resurrect a stale anchor. Absent (older snapshot) ->
+  // empty, and the weekly bar reads "measuring..." until enough samples accumulate.
+  if (Array.isArray(snap.usageSamples)) {
+    usageSamples = usageLib.pruneUsageSamples(
+      snap.usageSamples.filter((s) => s && Number.isFinite(s.t) && Number.isFinite(s.pct)),
+      Date.now()
+    );
+  }
   // Restore the pause span accumulator + baseline (an open span keeps its real start across
   // the restart / day rollover). Tolerate an absent key (older snapshot) -> defaults, and
   // main() then falls back to folding today's log. main() reconcile()s against the file after.
@@ -1730,6 +1745,24 @@ function subscriptionTotalsAllTime() {
   return subscriptionTotalsCache;
 }
 
+// The rate-limit snapshot as served, with the weekly window's sample slice attached when a
+// sliding lookback is configured. With the default 0 (whole window) the field is omitted
+// entirely, so a user who never enables it pays nothing. Filtering a buffer of at most a few
+// hundred entries is negligible on the SSE broadcast path — unlike /api/storage, which is
+// kept off it because it walks the filesystem.
+function usagePayload(now) {
+  if (!rateLimitUsage) return null;
+  const hours = num(cfg.usageWeeklyLookbackHours);
+  if (!(hours > 0) || !rateLimitUsage.sevenDay) return rateLimitUsage;
+  const samples = usageLib.usageSampleSlice(
+    usageSamples,
+    rateLimitUsage.subscription != null ? rateLimitUsage.subscription : null,
+    now,
+    hours * 3600 * 1000
+  );
+  return { ...rateLimitUsage, sevenDay: { ...rateLimitUsage.sevenDay, samples } };
+}
+
 function buildStatePayload() {
   const now = Date.now();
   return {
@@ -1748,7 +1781,7 @@ function buildStatePayload() {
     // SSE hot path exactly like repoTotals (see subscriptionTotalsAllTime).
     subscriptionTotals: subscriptionTotalsAllTime(),
     config: cfg,
-    usage: rateLimitUsage, // latest global rate-limit snapshot (or null) for the Live usage bars
+    usage: usagePayload(now), // latest global rate-limit snapshot (or null) for the Live usage bars
     // Global pause-gate state (O(1) tracker read — safe on the SSE hot path). The client
     // renders a per-session "paused" display from paused.active; pausedMs is closed spans only
     // (the client adds the live open slice: now − since). `active` is gated on pauseGateEnabled
@@ -2339,7 +2372,26 @@ function handleInternalUsage(req, res) {
     const changed = !rateLimitUsage || !usageLib.sameUsageWindows(rateLimitUsage, windows);
     // Tag the accepted snapshot with the subscription it belongs to (the pushing session's if
     // known, else the current one) so the bar can be attributed. sameUsageWindows ignores this.
-    rateLimitUsage = { ...windows, subscription: pushSub != null ? pushSub : curSub, updatedAt: Date.now() };
+    const acceptedSub = pushSub != null ? pushSub : curSub;
+    const nowMs = Date.now();
+    rateLimitUsage = { ...windows, subscription: acceptedSub, updatedAt: nowMs };
+    // Record the WEEKLY percentage for the sliding burn-rate readouts. Gated on the weekly
+    // window specifically, not on `changed` above — that is true when EITHER window moved,
+    // so a 5h-only push would otherwise append a duplicate weekly sample. appendUsageSample
+    // is change-only itself, so an unchanged weekly percentage is a no-op either way.
+    // Tagged with the PUSHING session's own subscription, NOT acceptedSub's curSub fallback.
+    // That fallback is right for the displayed snapshot, which self-corrects on the next push —
+    // but a sample is persisted and read back up to a full lookback later, so attributing an
+    // unknown-subscription push to whichever subscription happens to be current would leak a
+    // foreign account's percentage into that subscription's history for hours. Unknown lands
+    // in the null bucket instead, where only an equally unattributed reading can see it.
+    if (windows.sevenDay) {
+      usageSamples = usageLib.appendUsageSample(
+        usageSamples,
+        { t: nowMs, pct: windows.sevenDay.usedPct, sub: pushSub },
+        nowMs
+      );
+    }
     // Usage auto-pilot: evaluate the 5h and weekly windows against their auto-pause thresholds.
     // Runs on every push (not only `changed`) so each rising-edge memory (prevPct) tracks the
     // latest value; it self-gates on pauseGateEnabled + a per-window threshold > 0 and does
@@ -3077,6 +3129,7 @@ function saveSnapshot() {
     extra: Object.fromEntries(extra),
     seenIds: Object.fromEntries([...seenIds].map(([sid, set]) => [sid, [...set]])),
     usage: rateLimitUsage,
+    usageSamples,
     // Persist the pause span accumulator + baseline so an OPEN pause span survives a restart
     // (and a day rollover) without its start being reset — unlike active-time spans, a pause's
     // duration must not reset at midnight. Restored preferentially on boot (see main()).

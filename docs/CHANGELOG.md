@@ -1259,3 +1259,77 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      a UI-only change still needs the bump to reach anyone. Two releases in a row now (v0.45.0 was
      entry 156), which is the cost of that rule: a follow-up UI tweak cannot ride along on the
      previous version. `marketplace.json` stays at 0.2.0, unmaintained, so it is left alone.
+
+161. The WEEKLY usage bar's burn-rate readouts can now measure a sliding lookback instead of
+     averaging since the window opened (v0.47.0) — Settings ▸ Dashboard ▸ "Weekly burn rate":
+     Week (default, unchanged) or the last 2/3/6/12/24 hours. A seven-day average is dominated
+     by the hours you were asleep, so it answers "how have I paced this week" when the useful
+     question deep into a window is "at the rate I'm going now, when do I run out".
+
+162. That needs history the daemon never kept (`rateLimitUsage` is one overwritten snapshot), so
+     it now holds a change-only `usageSamples` buffer of `{t, pct, sub}`, snapshot-persisted and
+     pruned to 24h — except the newest entry PER SUBSCRIPTION beyond that horizon, which is kept
+     as the anchor. Dropping it would strand exactly the case it serves: a flat stretch longer
+     than the horizon would lose the only evidence the value is flat.
+
+163. Samples are subscription-FILTERED, not cleared on a switch. `currentSubscription` flips
+     several times a day in this store, and a delta spanning a flip reads tens of points
+     negative; filtering keeps each subscription's rate alive across a flip back. A drop of ≥10
+     points discards that subscription's history (a window reset, not a rolling window's decline).
+
+164. Under a sliding lookback ONLY, the multiplier's reference becomes what the REMAINING budget
+     sustains — `rate / ((100−used)/timeToReset)` — so 1.0× means "on track to finish at 100%"
+     and `m > 1` is algebraically "the projection lands before the reset" — for the RAW ratio.
+     The displayed multiplier is rounded and the clause is not, so a true 1.02x still shows a
+     muted "1.0x" beside an amber "limit in ~3h": entry 159's accepted trade, not removed here. The 5h bar and Week keep `usedFrac/elapsedFrac` untouched:
+     the cost is that 1.0× means two things depending on the bar, carried by the tooltip.
+
+165. `used_percentage` arrives as an INTEGER, so a delta carries ±1 point whatever the span.
+     Below 2 points of movement the readouts state their bound instead of a number that could be
+     off by half: `< 2%/6h` when there is history, `measuring…` when it doesn't reach back far
+     enough yet. Precision is worst near the cap, where 1 point is a large share of what's left —
+     which is why the projection keeps its "~" and longer spans are more trustworthy.
+
+166. Known limit of the sliding rate, documented not fixed: it divides by the NOMINAL lookback,
+     exact only while the sample buffer is gap-free — which it is by construction while the
+     daemon runs (change-only sampling means "no sample since the anchor" really means flat).
+     A daemon DOWN while the percentage rose attributes the whole gap-sized delta to the
+     lookback, overstating until a post-restart sample crosses the cutoff (≤ one lookback).
+
+167. Two review fixes to the sliding rate. A weekly sample is now tagged with the PUSHING
+     session's own subscription, not the current-subscription fallback the displayed snapshot
+     uses: that fallback self-corrects on the next push, but a sample is read back up to a full
+     lookback later, so an unknown-subscription push would leak a foreign account's percentage
+     into a real subscription's history for hours. Unknown lands in the null bucket.
+
+168. And a NEGATIVE delta now reads "measuring…", not "< 2%/Nh". The percentage falling — which
+     a rolling seven-day window does as old usage ages out — is not "too little movement", so
+     the old wording stated something false about a several-point move. Matches the spec's own
+     state table, which already assigned Δ < 0 to the no-reading state.
+
+169. The sliding rate no longer waits for the FULL span before it will read. It now measures over
+     whatever the buffer covers, once that is at least 30 minutes — a fixed floor, not a fraction:
+     the point is to come back quickly after a subscription switch or a fresh daemon, and a
+     fraction would make the long spans (chosen precisely for a steady number) the slowest to
+     recover. Before this, a 24h span meant 24h of silence after every switch.
+
+170. A partial reading divides by the span it ACTUALLY covers, never the nominal one — otherwise
+     3 points burned in 1.2h, spread across a 3h setting, would understate the rate by more than
+     half. It wears that span inline while the window fills ("3.9× · 1.2h", muted suffix) and
+     drops it once full, so a bare multiplier always means the whole configured window and a thin
+     30-minute reading under a 24h span is visible rather than hidden behind its label.
+     Every no-rate message now names the observed span too ("< 2%/1.2h", "fallen over the last 1.5h").
+
+171. All three dashboard meters — the per-card context gauge and the ribbon's 5h and weekly usage
+     bars — fill ACCENT BLUE below 65% instead of the running-green. On a page of status rails and
+     badges a green bar read as "this session is working" at a glance; blue is the neutral "here is
+     a level" hue, leaving only the unchanged amber/red bands to carry urgency.
+     Changed in `usageColor`'s safe band, so the thresholds stay in one place (entry 143). The
+     statusline's own ramp is untouched — its hues are terminal colours, not these tokens.
+
+172. Released v0.48.0, carrying entry 171 AND the sliding-window burn-rate work of entries 161–170,
+     which never shipped as its own version: 0.47.0 was stamped in the tree but never committed, so
+     the "(v0.47.0)" labels on those entries record their authoring, not what shipped — the same
+     seam entries 141/145 recorded for the last one. The bump is load-bearing per entry 103: the
+     plugin cache is keyed by version and `ensure.js` only replaces a running daemon when `/health`
+     reports a DIFFERENT one. `marketplace.json` stays at 0.2.0, unmaintained, so it is left alone.

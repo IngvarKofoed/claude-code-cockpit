@@ -497,6 +497,21 @@ body {
 .usage-bar__mult--under { color: var(--st-running); }
 .usage-bar__mult--on { color: var(--ink-2); }
 .usage-bar__mult--limit { color: var(--st-error); font-weight: 600; }
+/* "measuring…" / "< 2%/6h" — the sliding lookback has no rate to show yet. Drops the mono
+   face and the 600 weight the numbers carry: this is a note about the data, and bold mono
+   prose in the readout slot reads as an alert rather than an absence. */
+.usage-bar__mult--none {
+  font-family: inherit;
+  font-weight: 400;
+  color: var(--ink-muted);
+}
+/* The span a partial reading was actually measured over ("2.4× · 1.2h"). Styled down from
+   the multiplier it trails: the reading is the number, and this only qualifies it. Present
+   solely while the window is still filling, so a bare multiplier means the full setting. */
+.usage-bar__mult-span {
+  font-weight: 400;
+  color: var(--ink-muted);
+}
 
 @media (prefers-reduced-motion: reduce) {
   .usage-bar__fill { transition: none; }
@@ -672,8 +687,9 @@ body {
 }
 
 /* Context-window meter, on its own line under the card head. A thin recessive track with a
-   status-coloured fill (usageColor) plus an always-present percentage — the number carries the
-   state, the colour only reinforces it. Thinner (4px) than the ribbon's usage bars: those are
+   ramp-coloured fill (usageColor — accent blue until the amber warning band, so a meter among
+   the status rails and badges can't be misread as "working") plus an always-present percentage
+   — the number carries the state, the colour only reinforces it. Thinner (4px) than the ribbon's usage bars: those are
    the page's headline figures, this is one line on a dense card. The whole row is omitted when
    the session has no reading, so it costs nothing on a card without one. */
 .card__ctx {

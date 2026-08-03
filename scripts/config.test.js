@@ -86,6 +86,31 @@ test('validateConfig: invalid usagePace rejected, falls back to default', () => 
   assert.strictEqual(res.config.usagePace, 'both');
 });
 
+test('validateConfig: usageWeeklyLookbackHours accepts the offered spans, defaults to 0', () => {
+  // 0 = the whole window, i.e. the pre-feature behaviour — so an upgrade changes nothing
+  // until the dropdown is touched.
+  assert.strictEqual(DEFAULT_CONFIG.usageWeeklyLookbackHours, 0);
+  for (const h of [0, 2, 3, 6, 12, 24]) {
+    const res = validateConfig({ usageWeeklyLookbackHours: h });
+    assert.strictEqual(res.valid, true, `span ${h} should be accepted`);
+    assert.strictEqual(res.config.usageWeeklyLookbackHours, h);
+  }
+  // A numeric string coerces, matching how `port` is handled.
+  assert.strictEqual(validateConfig({ usageWeeklyLookbackHours: '6' }).config.usageWeeklyLookbackHours, 6);
+});
+
+// null / '' / booleans must NOT coerce: Number() maps all three to 0, which is a real
+// option here (the whole window), so coercing would turn a malformed value into a silent
+// preference rather than an error.
+test('validateConfig: a span the dropdown cannot show is rejected, not clamped', () => {
+  for (const bad of [1, 5, -6, 'x', '', null, true]) {
+    const res = validateConfig({ usageWeeklyLookbackHours: bad });
+    assert.strictEqual(res.valid, false, `span ${bad} should be rejected`);
+    assert.ok(res.errors.some((e) => e.includes('usageWeeklyLookbackHours')));
+    assert.strictEqual(res.config.usageWeeklyLookbackHours, 0);
+  }
+});
+
 test('validateConfig: subscriptionLabelPattern defaults to the parenthesized-group regex', () => {
   assert.strictEqual(DEFAULT_CONFIG.subscriptionLabelPattern, '\\(([^)]+)\\)');
   // The default compiles and extracts the parenthesized part.
