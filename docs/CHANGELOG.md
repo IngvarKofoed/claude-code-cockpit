@@ -1333,3 +1333,48 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      seam entries 141/145 recorded for the last one. The bump is load-bearing per entry 103: the
      plugin cache is keyed by version and `ensure.js` only replaces a running daemon when `/health`
      reports a DIFFERENT one. `marketplace.json` stays at 0.2.0, unmaintained, so it is left alone.
+
+173. Both usage bars gained a TREND ARROW after the multiplier ("2.1× ▲") — the RECENT burn rate vs
+     `affordableRate`, the rate the budget you have LEFT sustains until reset. ▲ = on this pace you
+     hit the limit before the window resets, ▼ = you have room. Spans differ per bar: 30 min on the
+     5h, 6h on the weekly. It leads the projected-limit clause, which reads the whole window and so
+     lags — ▲ with no clause is "the average is fine but you've just stepped up".
+
+174. A DIRECTION, never a magnitude, and that is what makes it work on the weekly bar:
+     `used_percentage` is an INTEGER, so any delta carries ±1 point, and the SIGN survives that
+     where a precise ratio does not. Renders NOTHING — never text in the number's slot — with no
+     usable history, under 2 points of movement, inside a ±15% band, or at the cap. Within-band and
+     can't-measure look identical on purpose: both mean "don't act on this".
+
+175. Baseline is `affordableRate` on BOTH bars, deliberately not each window's own average (the
+     natural "2.1×, and rising" reading). A 7-day average includes every hour you were asleep, so
+     recent-vs-average is pinned ▲ all working day at any span. One baseline also gives the glyph
+     one meaning on both bars, avoiding entry 164's "1.0× means two things depending on the bar".
+
+176. `usageWeeklyLookbackHours` and its sliding multiplier/limit paths are REMOVED (entries 161–170,
+     v0.48.0). They REPLACED the stable readouts, so enabling it swapped a number the user trusted
+     for one that often refused to read — it went unused. Reducing the same computation to a sign
+     keeps what worked. A persisted key falls out as an unknown key to `validateConfig`; no
+     migration, per entry 27's `retentionDays` precedent. Do not re-add the dropdown.
+
+177. The daemon now keeps ONE sample buffer PER WINDOW — `usageSamples` (weekly) plus a new
+     `usageSamples5h`, both snapshot-persisted — because the 5h percentage was never recorded at
+     all. Separate buffers, not one keyed map: retention differs (6h vs 1h, since the 5h series
+     resets every five hours and ticks far more often), and the split keeps the snapshot additive.
+     The steep-drop rule already handles the 5h reset, costing no arrow for its first 30 min.
+
+178. `slidingRate` now returns a SIGNED rate plus the raw `points` delta, dropping the
+     `why: 'declining'|'coarse'` null-states that existed only to render text. A falling weekly
+     percentage is a real ▼ ("old usage ageing out faster than you spend"), not an absence of data.
+     `rate` is still null for the two genuine no-data cases (no base sample, span under 30 min), so
+     callers keep a null check.
+
+179. Derived CLIENT-side, re-computed every second, and the arrow ships as sample slices rather than
+     a server-computed verdict: both the sample window and the affordable-rate denominator move
+     between statusline pushes, so a frozen verdict would stick exactly when a session goes idle and
+     the arrow should be decaying to ▼. Accepted cost: `web/` has no test framework and cannot
+     require the CommonJS `usage.js`, so the ~20 lines of threshold logic are untestable.
+
+180. Released v0.49.0, carrying entries 173–179. Bumped per entry 103 — the plugin cache is keyed by
+     version and `ensure.js` only replaces a running daemon when `/health` reports a DIFFERENT one.
+     `marketplace.json` stays at 0.2.0, unmaintained, so it is left alone.

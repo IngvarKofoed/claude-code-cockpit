@@ -12,8 +12,8 @@ const {
   usageSampleSlice,
   applyPattern,
   subLabel,
-  USAGE_MAX_LOOKBACK_MS,
-  USAGE_MAX_SAMPLES,
+  TREND_SPAN_MS,
+  SAMPLE_RETENTION,
 } = require('./usage');
 
 test('normalizeUsageWindow converts resets_at seconds -> ms and keeps usedPct', () => {
@@ -279,7 +279,7 @@ test('appendUsageSample: a steep drop spares OTHER subscriptions', () => {
 });
 
 test('pruneUsageSamples: keeps the newest out-of-horizon sample per subscription as an anchor', () => {
-  const old = T0 - (USAGE_MAX_LOOKBACK_MS + 20 * H);
+  const old = T0 - (SAMPLE_RETENTION.sevenDay.horizonMs + 20 * H);
   const s = pruneUsageSamples(
     [
       { t: old - H, pct: 10, sub: 'a' },
@@ -287,19 +287,57 @@ test('pruneUsageSamples: keeps the newest out-of-horizon sample per subscription
       { t: old, pct: 50, sub: 'b' },
       { t: T0 - H, pct: 12, sub: 'a' },
     ],
-    T0
+    T0,
+    SAMPLE_RETENTION.sevenDay
   );
   // The oldest 'a' is dropped; the newest out-of-horizon one survives for BOTH subs, so a
-  // long flat stretch can still be measured instead of reading "measuring..." forever.
+  // long flat stretch can still be measured instead of never resolving an anchor.
   assert.deepStrictEqual(s.map((x) => [x.sub, x.pct]), [['a', 11], ['b', 50], ['a', 12]]);
 });
 
 test('pruneUsageSamples: caps a runaway buffer, keeping the newest', () => {
+  const cap = SAMPLE_RETENTION.sevenDay.maxSamples;
   const many = [];
-  for (let i = 0; i < USAGE_MAX_SAMPLES + 50; i++) many.push({ t: T0 - (USAGE_MAX_SAMPLES - i) * 1000, pct: i, sub: 'a' });
-  const s = pruneUsageSamples(many, T0);
-  assert.strictEqual(s.length, USAGE_MAX_SAMPLES);
-  assert.strictEqual(s[s.length - 1].pct, USAGE_MAX_SAMPLES + 49);
+  for (let i = 0; i < cap + 50; i++) many.push({ t: T0 - (cap - i) * 1000, pct: i, sub: 'a' });
+  const s = pruneUsageSamples(many, T0, SAMPLE_RETENTION.sevenDay);
+  assert.strictEqual(s.length, cap);
+  assert.strictEqual(s[s.length - 1].pct, cap + 49);
+});
+
+// The 5h buffer has its own, much shorter horizon: its percentage resets every 5 hours and
+// ticks far more often per day, so sharing the weekly horizon would let it crowd out the
+// weekly history. Same input, two retentions, different survivors.
+test('pruneUsageSamples: retention is per buffer, so the 5h horizon prunes harder', () => {
+  const input = [
+    { t: T0 - 5 * H, pct: 20, sub: 'a' },
+    { t: T0 - 3 * H, pct: 40, sub: 'a' },
+    { t: T0 - 20 * 60 * 1000, pct: 60, sub: 'a' },
+  ];
+  const weekly = pruneUsageSamples(input, T0, SAMPLE_RETENTION.sevenDay);
+  assert.deepStrictEqual(weekly.map((x) => x.pct), [20, 40, 60], 'all inside a 6h horizon');
+  const five = pruneUsageSamples(input, T0, SAMPLE_RETENTION.fiveHour);
+  // 5h and 3h ago are both past the 1h horizon, so only the NEWEST of them survives as the
+  // anchor — the older one is dropped rather than both being kept.
+  assert.deepStrictEqual(five.map((x) => x.pct), [40, 60]);
+});
+
+test('pruneUsageSamples: an omitted retention falls back to the weekly one', () => {
+  const input = [{ t: T0 - 3 * H, pct: 40, sub: 'a' }, { t: T0, pct: 60, sub: 'a' }];
+  assert.deepStrictEqual(
+    pruneUsageSamples(input, T0).map((x) => x.pct),
+    pruneUsageSamples(input, T0, SAMPLE_RETENTION.sevenDay).map((x) => x.pct)
+  );
+});
+
+// The spans the browser mirrors (web/app.js:TREND_SPAN_MS). Pinned so a change here has to be
+// made deliberately on both sides — nothing links the two files.
+test('TREND_SPAN_MS: 30 minutes on the 5h bar, 6 hours on the weekly', () => {
+  assert.strictEqual(TREND_SPAN_MS.fiveHour, 30 * 60 * 1000);
+  assert.strictEqual(TREND_SPAN_MS.sevenDay, 6 * H);
+  // The 5h buffer must retain at least its own span, or a full-span lookback could never
+  // resolve an in-horizon sample to measure from.
+  assert.ok(SAMPLE_RETENTION.fiveHour.horizonMs >= TREND_SPAN_MS.fiveHour);
+  assert.ok(SAMPLE_RETENTION.sevenDay.horizonMs >= TREND_SPAN_MS.sevenDay);
 });
 
 test('usageSampleSlice: returns the in-window samples plus one anchor outside it', () => {

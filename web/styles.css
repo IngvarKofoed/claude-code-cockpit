@@ -497,21 +497,24 @@ body {
 .usage-bar__mult--under { color: var(--st-running); }
 .usage-bar__mult--on { color: var(--ink-2); }
 .usage-bar__mult--limit { color: var(--st-error); font-weight: 600; }
-/* "measuring…" / "< 2%/6h" — the sliding lookback has no rate to show yet. Drops the mono
-   face and the 600 weight the numbers carry: this is a note about the data, and bold mono
-   prose in the readout slot reads as an alert rather than an absence. */
-.usage-bar__mult--none {
-  font-family: inherit;
-  font-weight: 400;
-  color: var(--ink-muted);
+/* Trend arrow — the RECENT burn rate vs what the remaining budget sustains (see applyTrend),
+   trailing the multiplier as "2.1× ▲". The multiplier keeps the `margin-left: auto`, so this
+   rides right-aligned with it; a small left margin separates the pair without a delimiter
+   character (the glyph is not a second value on a list, it qualifies the number it follows).
+   COLOURED rather than muted, using the multiplier's own verdict tokens: the whole point is
+   the case where the two DISAGREE — a muted "1.0×" beside an amber "▲" means the average is
+   still fine while the recent pace is not, and a muted glyph among coloured numbers would be
+   read as decoration. :empty covers every no-glyph path (no history, too little movement,
+   within the band, at the cap). */
+.usage-bar__trend {
+  margin-left: 5px;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--ink-2);
 }
-/* The span a partial reading was actually measured over ("2.4× · 1.2h"). Styled down from
-   the multiplier it trails: the reading is the number, and this only qualifies it. Present
-   solely while the window is still filling, so a bare multiplier means the full setting. */
-.usage-bar__mult-span {
-  font-weight: 400;
-  color: var(--ink-muted);
-}
+.usage-bar__trend:empty { display: none; }
+.usage-bar__trend--up { color: var(--st-waiting); }
+.usage-bar__trend--down { color: var(--st-running); }
 
 @media (prefers-reduced-motion: reduce) {
   .usage-bar__fill { transition: none; }

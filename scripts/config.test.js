@@ -86,29 +86,14 @@ test('validateConfig: invalid usagePace rejected, falls back to default', () => 
   assert.strictEqual(res.config.usagePace, 'both');
 });
 
-test('validateConfig: usageWeeklyLookbackHours accepts the offered spans, defaults to 0', () => {
-  // 0 = the whole window, i.e. the pre-feature behaviour — so an upgrade changes nothing
-  // until the dropdown is touched.
-  assert.strictEqual(DEFAULT_CONFIG.usageWeeklyLookbackHours, 0);
-  for (const h of [0, 2, 3, 6, 12, 24]) {
-    const res = validateConfig({ usageWeeklyLookbackHours: h });
-    assert.strictEqual(res.valid, true, `span ${h} should be accepted`);
-    assert.strictEqual(res.config.usageWeeklyLookbackHours, h);
-  }
-  // A numeric string coerces, matching how `port` is handled.
-  assert.strictEqual(validateConfig({ usageWeeklyLookbackHours: '6' }).config.usageWeeklyLookbackHours, 6);
-});
-
-// null / '' / booleans must NOT coerce: Number() maps all three to 0, which is a real
-// option here (the whole window), so coercing would turn a malformed value into a silent
-// preference rather than an error.
-test('validateConfig: a span the dropdown cannot show is rejected, not clamped', () => {
-  for (const bad of [1, 5, -6, 'x', '', null, true]) {
-    const res = validateConfig({ usageWeeklyLookbackHours: bad });
-    assert.strictEqual(res.valid, false, `span ${bad} should be rejected`);
-    assert.ok(res.errors.some((e) => e.includes('usageWeeklyLookbackHours')));
-    assert.strictEqual(res.config.usageWeeklyLookbackHours, 0);
-  }
+// The trend arrow's spans are hardcoded (usage.js:TREND_SPAN_MS), so the retired
+// usageWeeklyLookbackHours key is no longer part of the schema. A persisted one falls out as
+// an unknown key — asserted here so a re-added validation branch has to be deliberate.
+test('validateConfig: the retired usageWeeklyLookbackHours key is dropped, not rejected', () => {
+  assert.strictEqual('usageWeeklyLookbackHours' in DEFAULT_CONFIG, false);
+  const res = validateConfig({ usageWeeklyLookbackHours: 6 });
+  assert.strictEqual(res.valid, true);
+  assert.strictEqual('usageWeeklyLookbackHours' in res.config, false);
 });
 
 test('validateConfig: subscriptionLabelPattern defaults to the parenthesized-group regex', () => {

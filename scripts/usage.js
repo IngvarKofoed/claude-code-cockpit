@@ -89,17 +89,38 @@ function sameUsageWindows(a, b) {
   return sameWindow(a.fiveHour, b.fiveHour) && sameWindow(a.sevenDay, b.sevenDay);
 }
 
-// ---- weekly percentage sample buffer ---------------------------------------
-// The weekly bar's burn-rate readouts can measure a SLIDING lookback (config
-// usageWeeklyLookbackHours) instead of averaging since the window opened, which needs a
-// short history of the weekly percentage. Nothing else keeps one — rateLimitUsage is a
-// single overwritten snapshot. The daemon owns the buffer (one writer); these functions
-// are pure so the retention and slicing rules are unit-testable, and the browser does the
-// per-second arithmetic on the shipped slice (see web/app.js:burnRate).
+// ---- rate-limit percentage sample buffers -----------------------------------
+// Each usage bar carries a TREND ARROW comparing its recent burn rate against the rate its
+// remaining budget sustains until reset, which needs a short history of that window's
+// percentage. Nothing else keeps one — rateLimitUsage is a single overwritten snapshot. The
+// daemon owns one buffer PER WINDOW (one writer each); these functions are pure so the
+// retention and slicing rules are unit-testable, and the browser does the per-second
+// arithmetic on the shipped slice (see web/app.js:slidingRate / applyTrend).
 
-const USAGE_MAX_LOOKBACK_MS = 24 * 3600 * 1000; // longest span the Settings dropdown offers
-const USAGE_SAMPLE_MARGIN_MS = 10 * 60 * 1000; // slack past the horizon, so the longest lookback still resolves
-const USAGE_MAX_SAMPLES = 500; // runaway guard only: an integer percentage moves <=100x per week
+// The span each bar's arrow measures over. They differ because `used_percentage` arrives as
+// an INTEGER, so a delta carries ±1 point whatever the span — and a 30-minute slice of a 5h
+// window holds ~10 points at even rate while the same slice of a week holds ~0.3. Sized by
+// available signal, deliberately NOT proportional to window length (equal fractions would put
+// the weekly at ~17h, too laggy to lead the projected-limit clause it exists to precede).
+// web/app.js:TREND_SPAN_MS mirrors this — the browser bundle is an ES module and cannot
+// require this CommonJS file, so CHANGE BOTH.
+const TREND_SPAN_MS = {
+  fiveHour: 30 * 60 * 1000,
+  sevenDay: 6 * 3600 * 1000,
+};
+
+// Per-buffer retention. `horizonMs` is how far back samples are kept — the newest entry per
+// subscription BEYOND it still survives as the anchor (see pruneUsageSamples) — and
+// `maxSamples` is a runaway guard only. The 5h buffer keeps a horizon well past its own span
+// (an hour against 30 minutes) purely as slack, and caps far lower: its percentage resets
+// every 5 hours and so ticks many times more often per day than the weekly one, which is why
+// the two cannot share a horizon without the 5h series crowding out the weekly's history.
+const SAMPLE_RETENTION = {
+  fiveHour: { horizonMs: 60 * 60 * 1000, maxSamples: 200 },
+  sevenDay: { horizonMs: TREND_SPAN_MS.sevenDay, maxSamples: 500 },
+};
+
+const USAGE_SAMPLE_MARGIN_MS = 10 * 60 * 1000; // slack past the horizon, so a full-span lookback still resolves
 const USAGE_RESET_DROP_PCT = 10; // a drop this steep is a window reset, not usage aging out
 
 // A sample's subscription, with undefined normalized to null so an API-key / pre-feature
@@ -110,10 +131,11 @@ function sampleSub(s) {
 
 // Drop samples past the retention horizon, keeping — PER SUBSCRIPTION — the newest entry
 // outside it. That entry is the anchor a lookback measures against, and dropping it would
-// break the very case it exists for: a flat stretch (no change for over 24h) would prune
-// away the only evidence the value is flat, stranding the bar on "measuring..." forever.
-function pruneUsageSamples(samples, now) {
-  const cutoff = now - (USAGE_MAX_LOOKBACK_MS + USAGE_SAMPLE_MARGIN_MS);
+// break the very case it exists for: a flat stretch longer than the horizon would prune away
+// the only evidence the value is flat, so the bar could never resolve an anchor again.
+function pruneUsageSamples(samples, now, retention) {
+  const ret = retention || SAMPLE_RETENTION.sevenDay;
+  const cutoff = now - (ret.horizonMs + USAGE_SAMPLE_MARGIN_MS);
   const anchored = new Set();
   const out = [];
   for (let i = samples.length - 1; i >= 0; i--) {
@@ -129,14 +151,14 @@ function pruneUsageSamples(samples, now) {
     }
   }
   out.reverse();
-  return out.length > USAGE_MAX_SAMPLES ? out.slice(out.length - USAGE_MAX_SAMPLES) : out;
+  return out.length > ret.maxSamples ? out.slice(out.length - ret.maxSamples) : out;
 }
 
 // Append one { t, pct, sub } reading, returning the pruned buffer. CHANGE-ONLY: the
 // statusline posts on every render, so an unchanged percentage adds nothing (which is also
 // what keeps the buffer at a few dozen entries). Returns the input array untouched when
 // there is nothing to record, so the caller can cheaply detect a no-op.
-function appendUsageSample(samples, entry, now) {
+function appendUsageSample(samples, entry, now, retention) {
   const list = Array.isArray(samples) ? samples : [];
   if (!entry || !Number.isFinite(entry.t) || !Number.isFinite(entry.pct)) return list;
   const sub = sampleSub(entry);
@@ -154,7 +176,11 @@ function appendUsageSample(samples, entry, now) {
     }
     break;
   }
-  return pruneUsageSamples(next.concat([{ t: entry.t, pct: entry.pct, sub }]), Number.isFinite(now) ? now : entry.t);
+  return pruneUsageSamples(
+    next.concat([{ t: entry.t, pct: entry.pct, sub }]),
+    Number.isFinite(now) ? now : entry.t,
+    retention
+  );
 }
 
 // The slice served to the browser: this subscription's samples inside the lookback, plus
@@ -219,7 +245,7 @@ module.exports = {
   usageSampleSlice,
   applyPattern,
   subLabel,
-  USAGE_MAX_LOOKBACK_MS,
-  USAGE_MAX_SAMPLES,
+  TREND_SPAN_MS,
+  SAMPLE_RETENTION,
   USAGE_RESET_DROP_PCT,
 };
