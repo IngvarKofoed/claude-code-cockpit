@@ -405,6 +405,32 @@ test('background completion: the final SubagentStop settles residual running to 
   assert.strictEqual(s.activeMs, 12000); // whole engaged period counted (incl. the background gaps)
 });
 
+test('a turn resumed after an auto-compact keeps running while it works (no open prompt)', () => {
+  // An auto-compact emits SessionStart mid-turn and never a fresh UserPromptSubmit, so the
+  // resumed turn runs with currentPrompt === null. The residual-running settle must not read
+  // that as background residue and cancel the 'running' each PreToolUse sets — that left the
+  // card on Idle for the rest of the turn while the session worked, froze the engaged clock
+  // (activeMs stopped accruing) and made atRest call a working session safe to close.
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('StopFailure', { ts: '2026-07-02T10:00:05.000Z', stop_reason: 'api_error' }), // nulls currentPrompt
+    ev('SessionStart', { ts: '2026-07-02T10:00:08.000Z', source: 'compact' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:10.000Z', tool_name: 'Bash' }),
+  ]);
+  const s = state.sessions.s1;
+  assert.strictEqual(s.currentPrompt, null); // the compact left no open turn behind
+  assert.strictEqual(s.status, 'running');
+  assert.ok(s.engagedStartedAt); // engaged clock restarted -> activeMs accrues again
+  assert.strictEqual(atRest(s), false); // NOT safe to close
+
+  // ... and the event that really ends the turn still settles it
+  applyEvent(state, ev('Stop', { ts: '2026-07-02T10:00:20.000Z', bg_tasks: 0 }));
+  assert.strictEqual(s.status, 'idle');
+  assert.strictEqual(s.engagedStartedAt, null);
+  assert.strictEqual(atRest(s), true);
+});
+
 test('a permission prompt disengages but settles to waiting, not idle (daemon must not fire finished)', () => {
   const state = run([
     ev('SessionStart'),

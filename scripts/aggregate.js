@@ -237,6 +237,14 @@ function isEngaged(session) {
 // approval emits no PostToolUse to restore `running`.
 const USER_BLOCKING_TOOLS = new Set(['AskUserQuestion']);
 
+// Events that can END a unit of work, and therefore the only ones allowed to settle a
+// residual `running` (see the settle guard at the bottom of applyEvent). Scoping the guard
+// to these is what stops it firing on PreToolUse/PostToolUse, which REPORT work rather than
+// end it: a turn resumed after an auto-compact has no open prompt (a compact emits
+// SessionStart, never a fresh UserPromptSubmit), so on every tool event the guard would
+// immediately undo the `running` that PreToolUse just set.
+const SETTLING_EVENTS = new Set(['Stop', 'StopFailure', 'SubagentStop', 'SessionEnd']);
+
 // "At rest" = this session has come to rest under a pause, so it is safe to close: it is NOT
 // waiting on the user AND (it parked at the gate — gatedSince set, even a `running` session
 // whose next tool is frozen pre-execution — OR it simply isn't working). A `waiting` session
@@ -436,7 +444,20 @@ function applyEvent(state, event) {
   // running), that 'running' is residue: settle to idle so the engaged period actually ends
   // (engagedNow below flips false → disengagedNow true → the daemon fires "finished" here, at
   // real completion). Only touches 'running'; 'waiting'/'error' keep their meaning.
-  if (num(session.bgTasks) === 0 && !session.currentPrompt && session.status === 'running') {
+  //
+  // Gated on SETTLING_EVENTS so only an event that actually ENDS work can settle the residue.
+  // Ungated it also fires on PreToolUse/PostToolUse, which is wrong whenever a turn legitimately
+  // runs with no open prompt — the post-auto-compact case, where the resumed turn has only
+  // SessionStart behind it and currentPrompt stays null for the rest of the turn. There it
+  // cancelled the `running` PreToolUse had just set, on every single tool call: the card read
+  // Idle while the session worked, the engaged clock never restarted (activeMs stopped
+  // accruing), and atRest reported a working session safe to close.
+  if (
+    SETTLING_EVENTS.has(event.event) &&
+    num(session.bgTasks) === 0 &&
+    !session.currentPrompt &&
+    session.status === 'running'
+  ) {
     session.status = 'idle';
   }
 
