@@ -93,6 +93,13 @@ function newSession(event) {
     // v2.1.145+). The reliable "is this session still working after its turn's Stop" signal;
     // drives isEngaged. 0 when nothing is backgrounded (or on older Claude Code that omits it).
     bgTasks: 0,
+    // Same registry, MINUS `type: 'shell'` entries (a run_in_background Bash) — see emit.js.
+    // This, not bgTasks, is what drives engagement: a dev server or watcher shell sits in the
+    // registry for hours without the session doing anything. null means UNKNOWN (an older
+    // emit.js that only sent bg_tasks, or a replay of events predating the field), and the
+    // reader falls back to bgTasks so historical replays keep their existing numbers rather
+    // than silently re-deriving a different past.
+    bgAgents: null,
     // Set by applyEvent to true on exactly the event that ENDS the engaged period (turn done
     // AND no background work left) — the daemon fires "session finished" on this, so a Stop that
     // only handed off to a background workflow doesn't notify and the real completion does.
@@ -220,8 +227,16 @@ function currentSubscription(state) {
 // SubagentStop counter. This is what keeps a background workflow / subagent / run_in_background
 // shell counting after the launching turn's Stop, while ensuring a dropped SubagentStop can no
 // longer strand the session "engaged" forever (the count self-heals on the next carrying event).
+// Background work that counts as the session WORKING: the registry minus run_in_background
+// shells (see emit.js `bg_agents`). Falls back to the full count when bgAgents is unknown —
+// an older emit.js, or a replay of events written before the field existed — so historical
+// numbers stay exactly as they were rather than being silently re-derived.
+function backgroundWork(session) {
+  return session.bgAgents == null ? num(session.bgTasks) : num(session.bgAgents);
+}
+
 function isEngaged(session) {
-  return session.status === 'running' || num(session.bgTasks) > 0;
+  return session.status === 'running' || backgroundWork(session) > 0;
 }
 
 // A tool whose PreToolUse hands control back to the USER and blocks until they respond — currently
@@ -284,6 +299,10 @@ function applyEvent(state, event) {
   // (older Claude Code, or an event that doesn't carry the registry) leaves the last known
   // count intact. This is what settles bgTasks to 0 at real completion so isEngaged flips off.
   if (typeof event.bg_tasks === 'number') session.bgTasks = event.bg_tasks;
+  // The shell-excluded count rides on the same events. Absorbed separately (and only when
+  // present) so an event from an older emit.js carrying just bg_tasks leaves bgAgents unknown
+  // rather than forcing it to 0 — which would read as "no background work" and end the span.
+  if (typeof event.bg_agents === 'number') session.bgAgents = event.bg_agents;
 
   // --- engaged clock: settle the span that just elapsed under the PRE-event state.
   // engagedSince is non-null IFF the session was engaged since that instant, so its
@@ -454,7 +473,7 @@ function applyEvent(state, event) {
   // accruing), and atRest reported a working session safe to close.
   if (
     SETTLING_EVENTS.has(event.event) &&
-    num(session.bgTasks) === 0 &&
+    backgroundWork(session) === 0 &&
     !session.currentPrompt &&
     session.status === 'running'
   ) {
@@ -825,6 +844,7 @@ module.exports = {
   createState,
   applyEvent,
   atRest,
+  backgroundWork,
   snapshot,
   subBaseName,
   currentSubscription,

@@ -386,6 +386,63 @@ test('an event without background_tasks leaves the last known bgTasks intact', (
   assert.strictEqual(state.sessions.s1.bgTasks, 1); // unchanged by an event that didn't carry the registry
 });
 
+test('a background SHELL alone does not keep the session engaged', () => {
+  // run_in_background Bash (a dev server, a watcher) sits in Claude Code's registry for hours.
+  // It is in bg_tasks but not bg_agents, and must not hold the session engaged — that counted
+  // the server's whole lifetime as active time and reported a parked session as not-at-rest.
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('Stop', { ts: '2026-07-02T10:00:10.000Z', bg_tasks: 1, bg_agents: 0 }),
+  ]);
+  const s = state.sessions.s1;
+  assert.strictEqual(s.bgTasks, 1); // still reported, so the card's "in flight" stays honest
+  assert.strictEqual(s.bgAgents, 0);
+  assert.strictEqual(s.status, 'idle');
+  assert.strictEqual(s.engagedStartedAt, null); // clock stopped at the Stop
+  assert.strictEqual(atRest(s), true); // safe to close
+  assert.strictEqual(s.activeMs, 10000); // the turn only — not the shell's lifetime
+
+  // a much later event must not retro-bill the intervening hours
+  applyEvent(state, ev('PreToolUse', { ts: '2026-07-02T14:00:00.000Z', tool_name: 'Bash' }));
+  applyEvent(state, ev('Stop', { ts: '2026-07-02T14:00:04.000Z', bg_tasks: 1, bg_agents: 0 }));
+  assert.strictEqual(s.activeMs, 14000); // 10s turn + 4s turn; the 4h shell gap excluded
+});
+
+test('a workflow agent alongside a background shell still keeps the session engaged', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    // handoff: one workflow agent in flight AND a dev server shell
+    ev('Stop', { ts: '2026-07-02T10:00:05.000Z', bg_tasks: 2, bg_agents: 1 }),
+  ]);
+  const s = state.sessions.s1;
+  assert.strictEqual(s.status, 'idle');
+  assert.ok(s.engagedStartedAt); // the AGENT keeps the timer running
+  assert.strictEqual(atRest(s), false);
+  assert.strictEqual(s.disengagedNow, false); // must not fire "finished" while the agent works
+
+  // the agent finishes; the shell remains — engagement ends anyway
+  applyEvent(state, ev('SubagentStop', { ts: '2026-07-02T10:05:05.000Z', bg_tasks: 1, bg_agents: 0 }));
+  assert.strictEqual(s.bgTasks, 1); // shell still there
+  assert.strictEqual(s.engagedStartedAt, null);
+  assert.strictEqual(atRest(s), true);
+  assert.strictEqual(s.disengagedNow, true); // "finished" fires at the agent's completion
+  assert.strictEqual(s.activeMs, 305000); // 5s turn + 300s of agent work
+});
+
+test('bgAgents absent (older emit.js) falls back to bgTasks, preserving past behaviour', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('Stop', { ts: '2026-07-02T10:00:05.000Z', bg_tasks: 1 }), // no bg_agents field at all
+  ]);
+  const s = state.sessions.s1;
+  assert.strictEqual(s.bgAgents, null); // unknown, NOT coerced to 0
+  assert.ok(s.engagedStartedAt); // falls back to bgTasks -> still engaged, exactly as before
+  assert.strictEqual(atRest(s), false);
+});
+
 test('background completion: the final SubagentStop settles residual running to idle and signals finished', () => {
   const state = run([
     ev('SessionStart'),
