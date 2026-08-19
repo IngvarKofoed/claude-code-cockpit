@@ -173,6 +173,12 @@ function renderLine(data) {
   if (reset) fhSeg += " " + C.white + "↻ " + reset + C.reset;
   seg.push(fhSeg);
 
+  const branch = branchOf(data, startDir);
+  if (branch) seg.push(C.brightBlue + "⎇ " + branch + C.reset);
+
+  const model = (data.model && (data.model.display_name || data.model.id)) || null;
+  if (model) seg.push(C.bold + C.cyan + model + C.reset);
+
   // Tokens currently in the context window (input + output) — the count behind the ctx% bar.
   // The payload carries no cumulative-session token total.
   const tok = cw ? fmtTokens((cw.total_input_tokens || 0) + (cw.total_output_tokens || 0)) : null;
@@ -180,12 +186,6 @@ function renderLine(data) {
 
   const cost = data.cost && typeof data.cost.total_cost_usd === "number" ? data.cost.total_cost_usd : null;
   if (cost != null) seg.push(C.green + "$" + cost.toFixed(3) + C.reset);
-
-  const branch = branchOf(data, startDir);
-  if (branch) seg.push(C.brightBlue + "⎇ " + branch + C.reset);
-
-  const model = (data.model && (data.model.display_name || data.model.id)) || null;
-  if (model) seg.push(C.bold + C.cyan + model + C.reset);
 
   return seg.join(C.dim + " · " + C.reset);
 }

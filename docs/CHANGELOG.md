@@ -1442,3 +1442,10 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      by version and `ensure.js` only replaces a running daemon when `/health` reports a DIFFERENT
      one, so this fix cannot reach a live daemon without it. `marketplace.json` stays at 0.2.0,
      unmaintained, so it is left alone.
+
+193. Statusline segment order is now `cwd · ctx · usage(5h) · branch · model · tokens · cost`
+     — the two money/token readouts moved from the middle to the END, past `model`
+     (revises entry 47's order). The line's left half is now wholly the "where am I and
+     how full am I" instruments, with the accounting figures parked together at the tail.
+     Renderer only; no payload, install, or forwarding change, so no reinstall is needed.
+
