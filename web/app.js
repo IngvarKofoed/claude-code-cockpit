@@ -18,6 +18,7 @@ const App = {
   histData: null, // last /api/history payload — the pivot re-slices this with no refetch
   histBuilt: false, // History view scaffolding (family cards + pivot toolbar) built once
   liveSort: "status", // "status" (server waiting-first) | "name" (alpha) | "context" (fullest first); set from localStorage in init
+  liveTitle: "repo", // what each Live card's head shows; see LIVE_TITLES / cardQualifier. Per-browser localStorage pref, set in init
   theme: "dark", // "dark" (default) | "light"; per-browser localStorage pref, set in init
   liveShow: { title: true, branch: true, path: true, ctx: true, color: true }, // which optional Live-card rows to show (3 location lines + the context gauge + the /color dot); per-browser localStorage pref, set in init
   repoRows: [], // normalized rows currently shown in the per-repo table
@@ -522,6 +523,61 @@ function contextGaugeHTML(s) {
   );
 }
 
+// Branch names that say nothing a card doesn't already say: every session in a repo is
+// usually on one of these, so "cockpit \u00b7 main" is no more distinguishing than "cockpit".
+// The "repo-smart" mode substitutes the session name for them.
+const DEFAULT_BRANCHES = ["main", "master", "trunk", "develop"];
+
+// The card head's SECOND segment for the current App.liveTitle mode — a branch, a session
+// name, or null for "just the repo name" (the default mode, and any mode whose segment is
+// missing). Deliberately shared by cardHTML and renderLive's "name" sort, so the grid can
+// never order cards by something other than what they display (changelog 194).
+// Every mode degrades to the repo name alone rather than rendering a dangling separator: a
+// non-git session and a detached HEAD both carry branch:null (scripts/repo.js), and `title`
+// arrives asynchronously from the transcript, so either segment can be absent at any moment.
+function cardQualifier(s) {
+  const branch = s.branch || null;
+  const title = s.title || null;
+  switch (App.liveTitle) {
+    case "repo-branch":
+      return branch;
+    case "repo-session":
+      return title;
+    case "repo-smart":
+      return branch && !DEFAULT_BRANCHES.includes(branch.toLowerCase()) ? branch : title;
+    default:
+      return null;
+  }
+}
+
+// Compare two optional display labels: present ones sort alphabetically, an absent one sinks
+// below every present one within its group — unknown is not empty, the same rule the context
+// sort follows. Shared by the "name" sort's qualifier and session-name tie-breaks.
+function cmpLabel(a, b) {
+  const x = a ? String(a) : null;
+  const y = b ? String(b) : null;
+  if (x == null && y == null) return 0;
+  if (x == null) return 1;
+  if (y == null) return -1;
+  return x.localeCompare(y);
+}
+
+// The card head's title: the repo name, plus the current mode's qualifier when it has one.
+// Two spans rather than one string so the name can yield width to the qualifier under
+// pressure (styles.css) — the qualifier is the whole reason a mode was picked. The tooltip
+// carries the composed string, so whatever the ellipsis eats is still readable on hover.
+// The separator is a CSS ::before on the qualifier, so it can never dangle on its own.
+function headTitleHTML(s) {
+  const name = s.repoName || "(unknown)";
+  const qual = cardQualifier(s);
+  return (
+    `<span class="card__repo" title="${esc(qual ? name + " \u00b7 " + qual : name)}">` +
+    `<span class="card__repo-name">${esc(name)}</span>` +
+    (qual ? `<span class="card__repo-qual">${esc(qual)}</span>` : "") +
+    `</span>`
+  );
+}
+
 function cardHTML(s) {
   const status = displayStatus(s); // display overlay: a global pause shows "Paused" + freezes the timer
   const waiting = status === "waiting";
@@ -656,7 +712,7 @@ function cardHTML(s) {
     <div class="card__rail"></div>
     <div class="card__body">
       <div class="card__head">
-        <span class="card__repo" title="${esc(s.repoName || "")}">${esc(s.repoName || "(unknown)")}</span>
+        ${headTitleHTML(s)}
         ${s.focusable ? `<button class="focus-btn" type="button" data-focus-session="${esc(s.sessionId)}" title="Bring this session's terminal window to the front" aria-label="Focus terminal">${TERMINAL_SVG}</button>` : ""}
         <span class="badge">${esc(STATUS_LABEL[status] || status)}</span>
       </div>
@@ -1429,13 +1485,15 @@ function renderLive() {
     return;
   }
   // "status" renders the server order (already waiting-first via compareCards);
-  // "name" re-sorts a COPY alphabetically for stable positions (repo, then SESSION
-  // NAME, then sessionId as tie-breakers) — waiting is not floated up in this mode.
-  // Within a repo the session name is what the user reads on the card, so it orders
-  // the group; repoRoot sits between the two so two clones sharing a basename
-  // (~/work/api, ~/oss/api) stay separate groups instead of interleaving under one
-  // apparent name. An UNNAMED session sinks below every named one in its repo rather
-  // than sorting as "" (which would float it to the top) — unknown is not empty.
+  // "name" re-sorts a COPY alphabetically for stable positions (repo, then the card
+  // head's QUALIFIER, then sessionId as tie-breakers) — waiting is not floated up in
+  // this mode. Within a repo the qualifier is what the user reads on the card, so it
+  // orders the group (cardQualifier: a branch, a session name, or — under the default
+  // title mode — nothing, where it falls back to the session name as before); repoRoot
+  // sits between the two so two clones sharing a basename (~/work/api, ~/oss/api) stay
+  // separate groups instead of interleaving under one apparent name. An UNQUALIFIED
+  // session sinks below every qualified one in its repo rather than sorting as ""
+  // (which would float it to the top) — unknown is not empty.
   // "context" floats the session nearest compaction to the top; sessions with no
   // reading (no statusline forwarder) sink below every session that has one rather
   // than sorting as 0%, which would claim an empty context they never reported.
@@ -1446,14 +1504,16 @@ function renderLive() {
       if (byRepo) return byRepo;
       const byRoot = String(a.repoRoot || "").localeCompare(String(b.repoRoot || ""));
       if (byRoot) return byRoot;
-      const ta = a.title ? String(a.title) : null;
-      const tb = b.title ? String(b.title) : null;
-      if (ta == null && tb != null) return 1; // unnamed sinks within its repo
-      if (tb == null && ta != null) return -1;
-      if (ta != null && tb != null) {
-        const byTitle = ta.localeCompare(tb);
-        if (byTitle) return byTitle;
-      }
+      // Order within a repo by whatever the card HEAD shows — the mode's qualifier, falling
+      // back to the session name when it has none (which is every card under the default
+      // mode, so that case stays exactly the previous title tie-break).
+      const byQual = cmpLabel(cardQualifier(a) || a.title, cardQualifier(b) || b.title);
+      if (byQual) return byQual;
+      // Two cards can share a qualifier — two chats on one branch under "Repository · branch",
+      // where the heads read identically — so the session name still orders them, keeping
+      // entry 194's rule (the grid reads in the order the cards do) ahead of the opaque id.
+      const byTitle = cmpLabel(a.title, b.title);
+      if (byTitle) return byTitle;
       return String(a.sessionId || "").localeCompare(String(b.sessionId || ""));
     });
   } else if (App.liveSort === "context") {
@@ -1532,6 +1592,18 @@ const LIVE_SORTS = ["status", "name", "context"];
 function setLiveSort(value) {
   App.liveSort = LIVE_SORTS.includes(value) ? value : "status";
   persistPref("cockpit.liveSort", App.liveSort);
+  renderLive();
+}
+
+// What each Live card's HEAD shows — repo name alone (today's card), or the repo name plus a
+// qualifier that tells two cards of the same repo apart (a worktree's branch, or the session
+// name when several chats share one repo). Per-browser localStorage like the sort above, never
+// daemon config, so it neither PUTs nor pops a "Settings saved" toast. Unknown value -> "repo".
+const LIVE_TITLES = ["repo", "repo-branch", "repo-session", "repo-smart"];
+
+function setLiveTitle(value) {
+  App.liveTitle = LIVE_TITLES.includes(value) ? value : "repo";
+  persistPref("cockpit.liveTitle", App.liveTitle);
   renderLive();
 }
 
@@ -2524,6 +2596,16 @@ function settingsHTML(cfg) {
         sw("set-show-ctx", App.liveShow.ctx)
       ) +
       fieldRow(
+        "Card title",
+        "What each live card's heading shows (this browser only)",
+        `<select class="select" id="set-liveTitle">
+           <option value="repo" ${App.liveTitle === "repo" ? "selected" : ""}>Repository name</option>
+           <option value="repo-branch" ${App.liveTitle === "repo-branch" ? "selected" : ""}>Repository \u00b7 branch</option>
+           <option value="repo-session" ${App.liveTitle === "repo-session" ? "selected" : ""}>Repository \u00b7 session name</option>
+           <option value="repo-smart" ${App.liveTitle === "repo-smart" ? "selected" : ""}>Repository \u00b7 branch (session name on default branches)</option>
+         </select>`
+      ) +
+      fieldRow(
         "Live view sort",
         "Order the live session cards (this browser only)",
         `<select class="select" id="set-liveSort">
@@ -2913,6 +2995,10 @@ function init() {
   const ls = loadPref("cockpit.liveSort");
   if (LIVE_SORTS.includes(ls)) App.liveSort = ls;
 
+  // Per-browser Live-card title mode (unknown/absent value → "repo", today's plain repo head).
+  const lt = loadPref("cockpit.liveTitle");
+  if (LIVE_TITLES.includes(lt)) App.liveTitle = lt;
+
   const th = loadPref("cockpit.theme");
   App.theme = th === "light" ? "light" : "dark";
   applyTheme(); // reconcile the <html> attribute with App.theme (the head bootstrap may have set it)
@@ -2984,6 +3070,11 @@ function init() {
     // locally and never PUT it (a config save would also pop a spurious "Settings saved" toast).
     if (e.target.id === "set-liveSort") {
       setLiveSort(e.target.value);
+      return;
+    }
+    // Ditto the Live card's title mode — per-browser, never daemon config.
+    if (e.target.id === "set-liveTitle") {
+      setLiveTitle(e.target.value);
       return;
     }
     if (e.target.id === "set-theme") {

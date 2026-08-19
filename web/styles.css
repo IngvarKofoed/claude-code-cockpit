@@ -611,12 +611,48 @@ body {
   align-items: center;
   gap: 10px;
 }
+/* The head's title: the repo name plus an optional qualifier — a branch or the session
+   name, per the Card title setting (app.js cardQualifier). Two ellipsizing spans rather
+   than one string so the NAME yields width first: the qualifier is the only thing telling
+   two cards of the same repo apart, while the name is still on the folder-path line and in
+   the head's tooltip. `overflow: hidden` is load-bearing on each span, not cosmetic — it
+   zeroes a flex item's automatic minimum size, which is what keeps a long title from
+   pushing the focus button and status badge off the card. */
 .card__repo {
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+  overflow: hidden;
   font-size: 15px;
   font-weight: 650;
+}
+.card__repo-name,
+.card__repo-qual {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* The name never shrinks; the qualifier absorbs every bit of the squeeze and ellipsizes.
+   Not a ratio: flex spreads a deficit in proportion to each item's basis, so ANY shrink
+   factor on a short name ("flux") eats it down to "fl…" once the qualifier is long enough,
+   and the obvious guard — a min-width floor — pads every short name out to the floor and
+   shoves the separator away from it. Keeping the name whole is also the better read: a repo
+   name is short and is the card's identity, while a session name is long and still
+   distinguishes at its head ("Candidate sink test im…"). */
+.card__repo-name {
+  flex: 0 0 auto;
+}
+.card__repo-qual {
+  flex: 0 1 auto;
+  font-weight: 400;
+  color: var(--ink-2);
+}
+/* Separator as a ::before rather than markup, so it can never dangle without a qualifier. */
+.card__repo-qual::before {
+  content: "\00b7";
+  padding: 0 6px;
+  color: var(--ink-muted);
 }
 .badge {
   margin-left: auto;

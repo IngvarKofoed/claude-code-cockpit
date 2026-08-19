@@ -1455,3 +1455,24 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      sorting as "" and floating to the top (unknown is not empty, per the context sort).
      `repoRoot` sits between repo name and title, so two clones sharing a basename
      (`~/work/api`, `~/oss/api`) stay separate groups instead of interleaving under one name.
+
+195. New per-browser "Card title" setting (Settings ▸ Dashboard) picks each Live card's HEAD:
+     repository name (default, unchanged), repo · branch, repo · session name, or repo · branch
+     with the session name substituted on a long-lived branch (main/master/trunk/develop),
+     where the branch distinguishes nothing. Answers several cards reading one repo name.
+     Pure rendering — repoName/branch/title already ride to the browser, so no daemon change.
+
+196. One `cardQualifier()` produces that second segment, shared by the card head AND the
+     "Repository name" sort, so the grid can never order cards by something other than what
+     they display (entry 194). Cards sharing a qualifier still order by session name before
+     the opaque sessionId. Under the default mode it returns null for every card, leaving that
+     sort as it was; every mode degrades to the bare repo name, never a dangling separator.
+
+197. In the card head the repo NAME never shrinks; the qualifier absorbs the whole squeeze and
+     ellipsizes. Measured: flex spreads a deficit in proportion to basis, so ANY shrink factor
+     on a short name ("flux") eats it to "fl…" once the qualifier is long, and a `min-width`
+     floor pads every short name and shoves the separator away from it. `min(8ch, max-content)`
+     is rejected by Chromium; `calc(100% - 8ch)` collapsed "flux · Spec" to 3px. Don't re-try.
+
+198. ARCHITECTURE.md's Live bullet now documents that card-head qualifier and its four modes,
+     alongside the other per-browser Live-card preferences it already tracks.
