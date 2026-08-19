@@ -1429,18 +1429,31 @@ function renderLive() {
     return;
   }
   // "status" renders the server order (already waiting-first via compareCards);
-  // "name" re-sorts a COPY alphabetically for stable positions (repoName, then
-  // cwd, then sessionId as tie-breakers) — waiting is not floated up in this mode.
+  // "name" re-sorts a COPY alphabetically for stable positions (repo, then SESSION
+  // NAME, then sessionId as tie-breakers) — waiting is not floated up in this mode.
+  // Within a repo the session name is what the user reads on the card, so it orders
+  // the group; repoRoot sits between the two so two clones sharing a basename
+  // (~/work/api, ~/oss/api) stay separate groups instead of interleaving under one
+  // apparent name. An UNNAMED session sinks below every named one in its repo rather
+  // than sorting as "" (which would float it to the top) — unknown is not empty.
   // "context" floats the session nearest compaction to the top; sessions with no
   // reading (no statusline forwarder) sink below every session that has one rather
   // than sorting as 0%, which would claim an empty context they never reported.
   let ordered = sessions;
   if (App.liveSort === "name") {
     ordered = sessions.slice().sort((a, b) => {
-      const byName = String(a.repoName || "").localeCompare(String(b.repoName || ""));
-      if (byName) return byName;
-      const byCwd = String(a.cwd || "").localeCompare(String(b.cwd || ""));
-      if (byCwd) return byCwd;
+      const byRepo = String(a.repoName || "").localeCompare(String(b.repoName || ""));
+      if (byRepo) return byRepo;
+      const byRoot = String(a.repoRoot || "").localeCompare(String(b.repoRoot || ""));
+      if (byRoot) return byRoot;
+      const ta = a.title ? String(a.title) : null;
+      const tb = b.title ? String(b.title) : null;
+      if (ta == null && tb != null) return 1; // unnamed sinks within its repo
+      if (tb == null && ta != null) return -1;
+      if (ta != null && tb != null) {
+        const byTitle = ta.localeCompare(tb);
+        if (byTitle) return byTitle;
+      }
       return String(a.sessionId || "").localeCompare(String(b.sessionId || ""));
     });
   } else if (App.liveSort === "context") {
