@@ -1378,3 +1378,67 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
 180. Released v0.49.0, carrying entries 173–179. Bumped per entry 103 — the plugin cache is keyed by
      version and `ensure.js` only replaces a running daemon when `/health` reports a DIFFERENT one.
      `marketplace.json` stays at 0.2.0, unmaintained, so it is left alone.
+
+181. The usage bars' stale-push guard no longer filters by ACCOUNT LABEL. Claude Code signs in to
+     one global `oauthAccount`, so an account switch moves every running session at once while
+     their SessionStart-captured labels stay behind — and matching the pushing session's captured
+     id against `currentSubscription` discarded exactly the CORRECT readings (216 drops in one
+     day). Spec: docs/specs/2026-08-18-live-account-usage.md.
+
+182. The starvation was not cosmetic: `evalAutoPause` sat after the drop's `return`, so a 95%
+     reading arrived and the gate never armed. It now runs on every push that passes the new
+     guard — the only discarded readings are provably staler than one already evaluated.
+
+183. Replaced by a freshness guard: a push updates the bars iff its reading (a) postdates the
+     last observed account switch and (b) is at least as fresh as the accepted snapshot's.
+     Freshness is the pushing session's `lastActivityAt`, so a running session always beats an
+     idle one re-pushing its frozen payload. Pure + unit-tested as `usage.acceptUsagePush`;
+     both checks fail open on an unknown side, and a fail-open accept stores a null baseline —
+     the guard ratchets OPEN, never shut.
+
+184. `lastActivityAt` is a PROXY, not a receipt: a prompt, a resume, or an `idle_prompt` bumps it
+     with no API response behind it. Accepted both ways — that bump is what rescues a running
+     session seconds after a switch, at the cost of a one-push mislabeling window for a session
+     prompted right after one. Do not re-fix with API-only event filtering.
+
+185. The daemon now reads the LIVE account itself. `emit.js`'s reader moved to a shared
+     `scripts/account.js`; the daemon wraps it in an mtime cache refreshed on a usage push and a
+     Stop-time ingest, NEVER from `buildStatePayload` (no filesystem work on the SSE hot path).
+     `aggregate.currentSubscription` survives only as the fallback for an unreadable file.
+
+186. An observed CHANGE of the organizationUuid stamps `liveAccountSince` — per switch, not per
+     id, so an A→B→A flip-back re-stamps (a per-id memory would file B's numbers under A). Only
+     known→known counts, so a transiently unreadable file is not a switch. A first-ever
+     observation deliberately does NOT stamp: nothing has been observed to change, and stamping
+     would drop every idle session's re-push at the upgrade seam. `{id, since}` is snapshotted.
+
+187. The stamp necessarily postdates the readings it judges (a switch is only observed while
+     handling a push), so the switch-revealing push is itself dropped — its reading may predate
+     the switch. The bars then show a dimmed "account switched — awaiting update" until the next
+     event bumps a session past `since`: seconds for a running session, one turn for an idle
+     fleet. Honest degradation, the same shape as `reset • awaiting update`.
+
+188. A just-closed turn's usage record is now attributed to the account at INGEST time, not the
+     session's captured one — closing entry 66's known limit, whose claimed self-heal only ever
+     covered ended sessions. Earlier-day groups in the same ingest and `/cockpit:backfill` keep
+     the captured attribution: those tokens were spent at times the live read can't vouch for.
+
+189. That is irreversible and knowingly accepted: post-upgrade closed-turn records carry
+     live-at-ingest attribution while pre-upgrade and backfill records keep captured/null in the
+     SAME field with no marker, so the two meanings mix permanently in `bySubscription` history.
+     No migration (a marker field would be schema for no consumer).
+
+190. The Live ribbon's Subscription tile and the trend sample tags now carry the live account id
+     too (superseding entry 167's pushing-session tagging — under one global account the live id
+     IS the account a vouched reading belongs to). With ZERO live sessions the tile still reads
+     "—": the live account refreshes only on a push or an ingest, so an externally switched
+     account would otherwise sit mislabeled on an idle dashboard.
+
+191. Documented non-goal: concurrent sessions on DIFFERENT accounts via per-session
+     `CLAUDE_CONFIG_DIR`. The daemon reads the default `~/.claude.json`; such a push is accepted
+     fail-open, bounded by the sample buffers' ≥10-point steep-drop rule.
+
+192. Released v0.50.0, carrying entries 181–191. Bumped per entry 103 — the plugin cache is keyed
+     by version and `ensure.js` only replaces a running daemon when `/health` reports a DIFFERENT
+     one, so this fix cannot reach a live daemon without it. `marketplace.json` stays at 0.2.0,
+     unmaintained, so it is left alone.

@@ -7,6 +7,7 @@ const {
   normalizeContextWindow,
   pushSessionId,
   sameUsageWindows,
+  acceptUsagePush,
   appendUsageSample,
   pruneUsageSamples,
   usageSampleSlice,
@@ -372,4 +373,65 @@ test('usageSampleSlice: no lookback (whole-window basis) ships nothing', () => {
   const s = buildSamples([[8, 80], [1, 90]]);
   assert.deepStrictEqual(usageSampleSlice(s, 's1', T0, 0), []);
   assert.deepStrictEqual(usageSampleSlice(null, 's1', T0, 6 * H), []);
+});
+
+
+// ---- acceptUsagePush (the rate-limit push guard) ----------------------------
+const SINCE = 1_700_000_000_000;
+
+test('acceptUsagePush: a reading taken after the switch is accepted', () => {
+  assert.deepStrictEqual(acceptUsagePush({ pushFreshness: SINCE + 1000, liveAccountSince: SINCE, acceptedFreshness: null }), {
+    accept: true,
+    reason: null,
+  });
+});
+
+test('acceptUsagePush: a reading taken BEFORE the switch is dropped as pre-switch', () => {
+  const v = acceptUsagePush({ pushFreshness: SINCE - 1, liveAccountSince: SINCE, acceptedFreshness: null });
+  assert.strictEqual(v.accept, false);
+  assert.strictEqual(v.reason, 'pre-switch');
+});
+
+test('acceptUsagePush: a reading exactly AT the switch stamp is accepted (>= , not >)', () => {
+  assert.strictEqual(acceptUsagePush({ pushFreshness: SINCE, liveAccountSince: SINCE }).accept, true);
+});
+
+test('acceptUsagePush: a staler reading than the accepted one cannot drag the bar backwards', () => {
+  const v = acceptUsagePush({ pushFreshness: SINCE, acceptedFreshness: SINCE + 60_000 });
+  assert.strictEqual(v.accept, false);
+  assert.strictEqual(v.reason, 'staler-than-accepted');
+});
+
+test('acceptUsagePush: an equally-fresh reading is accepted, so two running sessions interleave', () => {
+  assert.strictEqual(acceptUsagePush({ pushFreshness: SINCE, acceptedFreshness: SINCE }).accept, true);
+});
+
+test('acceptUsagePush: pre-switch outranks staleness in the reported reason', () => {
+  // Both checks would fail; the caller logs one reason, and the switch is the informative one.
+  const v = acceptUsagePush({ pushFreshness: SINCE - 10, liveAccountSince: SINCE, acceptedFreshness: SINCE + 10 });
+  assert.strictEqual(v.reason, 'pre-switch');
+});
+
+test('acceptUsagePush: an undatable push is accepted (fail-open on an unknown side)', () => {
+  // No session state for the pusher -> no lastActivityAt. Never worse than last-write-wins.
+  for (const f of [undefined, null, NaN, 'nope']) {
+    assert.strictEqual(acceptUsagePush({ pushFreshness: f, liveAccountSince: SINCE, acceptedFreshness: SINCE + 1 }).accept, true);
+  }
+});
+
+test('acceptUsagePush: an unknown switch stamp or accepted freshness disarms only its own check', () => {
+  // No switch observed yet -> check 1 unarmed, check 2 still bites.
+  assert.strictEqual(acceptUsagePush({ pushFreshness: SINCE, acceptedFreshness: SINCE + 1 }).reason, 'staler-than-accepted');
+  // Nothing accepted yet (or accepted fail-open, storing null) -> check 2 passes for everyone.
+  assert.strictEqual(acceptUsagePush({ pushFreshness: SINCE - 1, acceptedFreshness: null }).accept, true);
+});
+
+test('acceptUsagePush: a null stored freshness ratchets the guard OPEN, never shut', () => {
+  // The fail-open accept above records readingFreshness=null; the next push must not be
+  // measured against it (there is nothing to measure), however old that push is.
+  assert.strictEqual(acceptUsagePush({ pushFreshness: 1, acceptedFreshness: null }).accept, true);
+});
+
+test('acceptUsagePush: tolerates a missing options object', () => {
+  assert.strictEqual(acceptUsagePush().accept, true);
 });

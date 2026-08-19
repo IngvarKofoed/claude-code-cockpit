@@ -191,10 +191,12 @@ function subBaseName(sub) {
 
 // The "current" subscription: the `sub` of the LIVE (non-ended) session with the
 // greatest startedAt that has a KNOWN subscription (id present), or null. This is a
-// pure function of session state — no file read — so "which subscription is active"
-// stays event-derived and deterministic (see the spec's Fork 1(a) rejection). The
-// daemon uses it to label the usage bars and to drop a rate-limit push from a session
-// that isn't on the current subscription.
+// pure function of session state — no file read — so it stays event-derived and
+// deterministic. It is now only the FALLBACK for labelling the usage bars and the ribbon
+// tile when the daemon cannot read the live account (~/.claude.json): the account is a
+// single global, so a session's captured sub says what it STARTED under, not what it is
+// billed to now, and a mid-day switch leaves every running session's capture stale.
+// Nothing keys a drop off it any more (see usage.acceptUsagePush).
 function currentSubscription(state) {
   const map = (state && state.sessions) || {};
   let best = null;

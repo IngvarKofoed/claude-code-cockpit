@@ -391,6 +391,7 @@ body {
 /* Expired / absent windows are dimmed (they carry no live fill). A `stale` bar is NOT dimmed —
    it keeps its fill + a live-drifting pace cue, and the "updated Xm ago" note flags it as old. */
 .usage-bar[data-state="reset"],
+.usage-bar[data-state="switched"],
 .usage-bar[data-state="nodata"] { opacity: 0.55; }
 
 .usage-bar__head {

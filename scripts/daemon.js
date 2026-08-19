@@ -28,6 +28,7 @@ const pricing = require('./pricing');
 const notify = require('./notify');
 const repoLib = require('./repo');
 const usageLib = require('./usage');
+const account = require('./account');
 const pause = require('./pause');
 const focusTerminal = require('./focus-terminal');
 
@@ -49,6 +50,7 @@ const REAP_IDLE_FALLBACK_MS = 6 * 3600 * 1000; // reap PID-less sessions after 6
 const LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate daemon.log once it passes ~5MB (keep one .1 backup, ~10MB cap)
 const LOG_ROTATE_MS = 3600 * 1000; // check the log size hourly (plus once at boot)
 const REAP_GRACE_MS = 90 * 1000; // min quiet time before reaping a PID-dead session
+const DIAG_DROP_RELOG_MS = 10 * 60 * 1000; // re-log a sustained usage-push drop at most this often
 // Overall budget for one /api/focus request, across every target it tries. Comfortably
 // above a normal round-trip (~1s) but short enough that a wedged PowerShell still returns
 // a toast rather than leaving the browser hanging on an open fetch.
@@ -142,8 +144,30 @@ let lastWeeklyPct = null; // same, for the 7-day window (each window has its own
 // so a restart mid-pause re-seeds from whatever is still over on the next statusline push.
 let autoPauseOverWindows = new Set();
 let pausePollTimer = null; // the ~2s control-file backstop poll interval (cleared on shutdown)
-let diagLastCurSub; // usage diagnostic: last current-subscription id logged (transition detector); undefined until first push
-let diagLastDrop = null; // usage diagnostic: last DROP line logged (dedup consecutive identical drops)
+let diagLastAccount; // usage diagnostic: last live-account id logged (transition detector); undefined until first read
+let diagLastDrop = null; // usage diagnostic: { key, at } of the last dropped-push line (dedups an episode to ~1 line / DIAG_DROP_RELOG_MS)
+
+// ---- the LIVE account -------------------------------------------------------
+// Claude Code signs in to ONE global account (`~/.claude.json` oauthAccount), so switching it
+// moves every running session at once while their SessionStart-captured labels stay behind.
+// Anything that must describe the account RIGHT NOW — the usage bars, the auto-pilot, and a
+// just-closed turn's attribution — reads this instead of a captured label.
+//
+// `liveAccountValue` is the last parsed account (or null), refreshed by refreshLiveAccount()
+// on a statusline push and on a Stop-time token ingest; `statSync` per call, re-parse only when
+// mtime/size moved. It is NEVER refreshed from buildStatePayload — the SSE hot path reads the
+// cached value only (the /api/storage precedent: no filesystem work per broadcast).
+let liveAccountValue = null; // last parsed account object, or null (unreadable / no oauthAccount)
+let liveAccountStat = null; // { mtimeMs, size } the cached value was parsed from
+let liveAccountId = null; // last KNOWN (non-null) organizationUuid — the switch detector's memory; persisted
+// Epoch ms of the last OBSERVED account switch, or null when none has been observed. Not the
+// file's mtime (~/.claude.json is a general state blob written for unrelated reasons). Two
+// deliberate seams, see the spec: a FIRST-ever observation does not stamp (nothing has been
+// observed to change, and stamping would drop every idle session's re-push at the upgrade
+// seam), and the stamp necessarily POSTDATES the readings it judges (a switch is only observed
+// while handling a push), so the switch-revealing push is itself dropped — its reading may
+// predate the switch. Persisted, so a restart mid-account doesn't re-stamp.
+let liveAccountSince = null;
 
 // "Safe to close" latch + summary (the pause-gate at-rest signal). pauseSafeNotified is a
 // per-pause latch: true = the OS notification will NOT fire; it is armed to false ONLY on a
@@ -227,6 +251,72 @@ function log(msg) {
   } catch (_e) {
     /* logging must never throw */
   }
+}
+
+// The account Claude Code is signed in to RIGHT NOW, re-read from ~/.claude.json when the
+// file changed. Returns the parsed account object or null (missing / unreadable / oversized /
+// garbage file, or no oauthAccount) — fail-open, exactly like the SessionStart capture.
+//
+// Also the switch detector: an observed change of the organizationUuid stamps
+// `liveAccountSince`, which is what lets acceptUsagePush reject readings taken under the
+// PREVIOUS account. Only a known->known change counts, so a transiently unreadable file
+// (A -> null -> A) is not a switch, while A -> null -> B still stamps once B is seen.
+//
+// Called on a statusline push and a Stop-time ingest, never from buildStatePayload.
+function refreshLiveAccount() {
+  let st = null;
+  try {
+    st = fs.statSync(account.claudeConfigPath());
+  } catch (_e) {
+    return liveAccountValue; // unreadable right now -> keep the last known value (fail-open)
+  }
+  if (!liveAccountStat || liveAccountStat.mtimeMs !== st.mtimeMs || liveAccountStat.size !== st.size) {
+    liveAccountStat = { mtimeMs: st.mtimeMs, size: st.size };
+    liveAccountValue = account.readSubscription();
+  }
+  const id = liveAccountValue && liveAccountValue.id != null ? liveAccountValue.id : null;
+  if (id != null) {
+    if (liveAccountId != null && id !== liveAccountId) {
+      liveAccountSince = Date.now();
+      // Push the switch out immediately: the bars must flip to "account switched — awaiting
+      // update" now, not whenever the next unrelated event happens to broadcast. The push that
+      // REVEALED the switch is itself dropped (its reading predates the stamp), and that drop
+      // path deliberately doesn't broadcast — so without this an idle fleet could sit showing
+      // the previous account's numbers under the new account's name for minutes.
+      markDirty();
+      // Metadata only (an account label + a truncated org id), like every other usage
+      // diagnostic — this is the line that explains a bar sitting on "awaiting update".
+      log(`usage: live account -> ${usageLib.subLabel(liveAccountValue, cfg)} [${id.slice(0, 8)}] (was [${liveAccountId.slice(0, 8)}]) — pre-switch readings now dropped`);
+    } else if (id !== diagLastAccount) {
+      log(`usage: live account = ${usageLib.subLabel(liveAccountValue, cfg)} [${id.slice(0, 8)}]`);
+    }
+    diagLastAccount = id;
+    liveAccountId = id;
+  }
+  return liveAccountValue;
+}
+
+// The cached live account WITHOUT touching the filesystem — for the SSE hot path
+// (buildStatePayload / usagePayload). Null until the first refresh, which is why every
+// consumer falls back to the captured-subscription behaviour rather than treating null as
+// "no account".
+function cachedLiveAccount() {
+  return liveAccountValue;
+}
+
+function cachedLiveAccountId() {
+  return liveAccountValue && liveAccountValue.id != null ? liveAccountValue.id : null;
+}
+
+// Is any session still live? Gates the ribbon's account tile: the live account is refreshed
+// only by a push or an ingest, so with nothing running the cached value can go arbitrarily
+// stale and an externally switched account would sit mislabeled on an idle dashboard.
+function hasLiveSession() {
+  for (const sid of Object.keys(state.sessions)) {
+    const s = state.sessions[sid];
+    if (s && s.status !== 'ended') return true;
+  }
+  return false;
 }
 
 // Bound daemon.log's growth: once it passes LOG_MAX_BYTES, rename it to daemon.log.1
@@ -434,6 +524,14 @@ function loadSnapshot() {
   // Restore the last-known usage snapshot so a restart keeps the bars until the
   // next statusline tick. Tolerate an absent key (older snapshot) -> stays null.
   if (snap.usage && typeof snap.usage === 'object') rateLimitUsage = snap.usage;
+  // Restore the observed account + switch stamp. The FILE is deliberately not read here: the
+  // first refreshLiveAccount() (a push or an ingest) compares against this restored id, so a
+  // matching id keeps the persisted `since` and a changed one stamps then — the same outcome
+  // as a boot-time read, without putting a config parse on the boot path.
+  if (snap.liveAccount && typeof snap.liveAccount === 'object') {
+    if (snap.liveAccount.id != null) liveAccountId = snap.liveAccount.id;
+    if (Number.isFinite(snap.liveAccount.since)) liveAccountSince = snap.liveAccount.since;
+  }
   // Restore each percentage history, pruned against the current clock (and its OWN retention)
   // so a daemon that was down for days doesn't resurrect a stale anchor. Absent (older
   // snapshot) -> empty, and that bar simply carries no trend arrow until samples accumulate.
@@ -1483,6 +1581,15 @@ function recordTurn(sid, stopEvent, usage, fresh, seen, allBackfill = false) {
   // real label source (the patterned label stays a read-time transform, never stored).
   const subId = session && session.subscription && session.subscription.id != null ? session.subscription.id : null;
   const subName = session && session.subscription ? aggregate.subBaseName(session.subscription) : null;
+  // …but the JUST-CLOSED turn is attributed to the LIVE account instead, when it is readable.
+  // The account is one global oauthAccount, so a session that has been running since before a
+  // switch is now billed to the new one while its captured label still names the old — and a
+  // turn closing right now is the one moment the live read genuinely vouches for. Earlier-day
+  // groups in the same ingest (a resumed session's backfill) and /internal/backfill keep the
+  // captured attribution: those tokens were spent at times the live account cannot speak for.
+  const live = allBackfill ? null : refreshLiveAccount();
+  const liveId = live && live.id != null ? live.id : null;
+  const liveName = liveId != null ? aggregate.subBaseName(live) : null;
 
   // Mark everything seen up front so a retry / re-read can never re-count it — but
   // ONLY for live sessions. Historical backfill dedups against a local index built
@@ -1532,6 +1639,8 @@ function recordTurn(sid, stopEvent, usage, fresh, seen, allBackfill = false) {
 
   for (const [day, g] of groups) {
     const isTurn = day === turnDay;
+    const recSubId = isTurn && liveId != null ? liveId : subId;
+    const recSubName = isTurn && liveId != null ? liveName : subName;
     // Always a real timestamp (never null) so the record still lands in the hour
     // histogram: the Stop time for today's group, else the group's latest message
     // ts, else noon of that day.
@@ -1546,8 +1655,8 @@ function recordTurn(sid, stopEvent, usage, fresh, seen, allBackfill = false) {
         session_id: sid,
         repo_root: repoRoot,
         repo_name: repoName,
-        subscription: subId, // the ingesting session's captured subscription id (or null)
-        subscriptionName: subName, // raw base name (or null), so a recomputed past day keeps a real label
+        subscription: recSubId, // the live account for the closed turn, else the session's captured id (or null)
+        subscriptionName: recSubName, // raw base name (or null), so a recomputed past day keeps a real label
         byModel: g.byModel,
         // Flat totals alongside byModel (the fallback applyUsageRecord reads for a
         // record that lacks the map). Spread so a new usage class is persisted
@@ -1560,9 +1669,9 @@ function recordTurn(sid, stopEvent, usage, fresh, seen, allBackfill = false) {
     );
     if (day === currentDate) {
       if (isTurn) {
-        aggregate.accumulateTurnByModel(todayRollup, { repoRoot, repoName, sessionId: sid, byModel: g.byModel, ts, subId, subName });
+        aggregate.accumulateTurnByModel(todayRollup, { repoRoot, repoName, sessionId: sid, byModel: g.byModel, ts, subId: recSubId, subName: recSubName });
       } else {
-        aggregate.accumulateTokensByModel(todayRollup, { repoRoot, repoName, sessionId: sid, byModel: g.byModel, ts, subId, subName });
+        aggregate.accumulateTokensByModel(todayRollup, { repoRoot, repoName, sessionId: sid, byModel: g.byModel, ts, subId: recSubId, subName: recSubName });
       }
     }
   }
@@ -1770,6 +1879,15 @@ function usagePayload(now) {
   if (!rateLimitUsage) return null;
   const sub = rateLimitUsage.subscription != null ? rateLimitUsage.subscription : null;
   const out = { ...rateLimitUsage };
+  delete out.readingFreshness; // guard-internal (acceptUsagePush's baseline), never rendered
+  // The switch seam: the snapshot on hand belongs to a DIFFERENT account than the one Claude
+  // Code is signed in to now, so its numbers are not this account's. Ship a `switched` flag and
+  // let the bars degrade to "account switched — awaiting update" rather than showing the old
+  // account's fill under the new account's name. Cleared by the first accepted post-switch push.
+  // Both ids must be known: a null on either side is the fail-open case (unreadable config, or a
+  // snapshot accepted while it was unreadable), where "differs" would be a guess.
+  const liveId = cachedLiveAccountId();
+  if (liveId != null && sub != null && liveId !== sub) out.switched = true;
   if (rateLimitUsage.fiveHour) {
     out.fiveHour = {
       ...rateLimitUsage.fiveHour,
@@ -1792,12 +1910,20 @@ function buildStatePayload() {
     sessions: aggregate.snapshot(state, now).sessions,
     repos: reposSummary(),
     repoTotals: repoTotalsAllTime(),
-    // The active subscription (newest live session's captured sub) → { id, label }, or null
-    // when no live session has a known subscription. label is subLabel (raw name +
-    // subscriptionLabelPattern) applied at build time, so a pattern change re-labels live.
+    // The active account → { id, label }, or null when it is unknown. Read from the cached
+    // LIVE account (the one Claude Code is signed in to), so a mid-day switch relabels every
+    // running session at once instead of pinning the tile to whatever the newest session
+    // captured at its start; `currentSubscription` remains the fallback for an unreadable
+    // config file, so an API-key / pre-feature setup renders exactly as before. With ZERO live
+    // sessions the tile reads "—" regardless: the live account only refreshes on a push or an
+    // ingest, so with nothing running it could sit indefinitely on a value an external switch
+    // has already invalidated. label is subLabel (raw name + subscriptionLabelPattern) applied
+    // at build time, so a pattern change re-labels live.
     subscription: (() => {
       const cur = aggregate.currentSubscription(state);
-      return cur ? { id: cur.id, label: usageLib.subLabel(cur, cfg) } : null;
+      const live = hasLiveSession() ? cachedLiveAccount() : null;
+      const sub = live && live.id != null ? live : cur;
+      return sub ? { id: sub.id, label: usageLib.subLabel(sub, cfg) } : null;
     })(),
     // All-time per-subscription totals (subId -> { label, tokens, cost }); memoized off the
     // SSE hot path exactly like repoTotals (see subscriptionTotalsAllTime).
@@ -2298,10 +2424,10 @@ function handleInternalEvent(req, res) {
 // numbers moved (so the caller can decide on a broadcast).
 //
 // Deliberately independent of the rate-limit path below, because the two have different
-// SCOPES: rate limits are account-wide, so a push from a non-current subscription is stale
-// and dropped — but a context window belongs to one session and is always true for it. It
-// therefore survives both that drop and a body carrying no rate_limits at all (an API-key
-// session, which never has them, still gets a working gauge).
+// SCOPES: rate limits are account-wide and a stale reading of them is dropped — but a context
+// window belongs to one session and is always true for it, however old the account-wide half
+// of the same push may be. It therefore survives both that drop and a body carrying no
+// rate_limits at all (an API-key session, which never has them, still gets a working gauge).
 function applyContextPush(body) {
   const ctx = usageLib.normalizeContextWindow(body && body.context_window);
   if (!ctx) return false;
@@ -2311,10 +2437,12 @@ function applyContextPush(body) {
 }
 
 // Statusline forwarder push of the account-wide rate-limit numbers plus the pushing
-// session's own context-window fill. The rate limits are one global snapshot, last write
-// wins (they're account-wide, so every session's payload reports the same numbers); the
-// context window is per-session. Privacy: only rate_limits + context_window are stored.
-// Normalization lives in the pure usage.js module (unit-tested there).
+// session's own context-window fill. The rate limits are one global snapshot, freshest
+// reading wins (they're account-wide, so every session's payload reports the same numbers,
+// and the only thing that distinguishes them is how old each session's reading is — see the
+// guard below); the context window is per-session. Privacy: only rate_limits +
+// context_window are stored. Normalization and the guard's verdict live in the pure usage.js
+// module (unit-tested there).
 function handleInternalUsage(req, res) {
   readBody(req, (raw) => {
     json(res, { ok: true }); // ack fast; the forwarder is fire-and-forget on a tight budget
@@ -2332,85 +2460,83 @@ function handleInternalUsage(req, res) {
       if (ctxChanged) markDirty();
       return;
     }
-    // De-pollute the bar across a subscription switch: after a switch the OLD subscription's
-    // sessions keep running and their lagging statusline pushes carry the OLD account's
-    // rate-limit numbers, which last-write-wins would let clobber the NEW subscription's bar.
-    // Resolve the pushing session's captured subscription and the CURRENT (newest-live) one;
-    // DROP the push only when BOTH are known and differ. FAIL-OPEN: an unknown either side
-    // (pre-feature / API-key session, a missed SessionStart) accepts the push, so the bar is
-    // never worse than the prior last-write-wins. Dropping also skips auto-pause eval below —
-    // an old subscription's usage must not drive the current one's auto-pilot.
+    // Which push may move the bars. NOT "is this session on the current subscription" — the
+    // account is a single global oauthAccount, so after a switch every live session is billed
+    // to the NEW account while its captured label still names the old one, and label-matching
+    // discarded exactly the correct readings (starving the bars AND the auto-pilot below).
+    // What actually separates a good push from a bad one is WHEN its reading was taken, so the
+    // guard is two freshness checks over the pushing session's `lastActivityAt` — both
+    // fail-open on an unknown side. Verdict logic is the pure usage.acceptUsagePush; this
+    // function only supplies its inputs and obeys it.
+    const acct = refreshLiveAccount();
     const pushSession = windows.sessionId != null ? state.sessions[windows.sessionId] : null;
-    const pushSub = pushSession && pushSession.subscription ? pushSession.subscription.id : null;
-    const cur = aggregate.currentSubscription(state);
-    const curSub = cur ? cur.id : null;
-    // DIAGNOSTIC (metadata only — no message content): record current-subscription transitions and
-    // dropped pushes to daemon.log so a recurrence of the idle-session usage-bar hijack (an idle
-    // session on a secondary subscription winning `currentSubscription`, so the active subscription's
-    // real usage pushes are dropped here and the bar freezes at a stale value) is diagnosable from the
-    // log alone. Near-zero volume: the transition line fires only on a real change; the DROP line is
-    // silent unless a push is actually being discarded (a legit post-switch stale push, or the bug).
-    // Each diagnostic is wrapped so it can NEVER alter the push path (the drop `return` below must
-    // fire regardless of any logging error) — observability must not become a behavior change.
-    if (curSub !== diagLastCurSub) {
-      diagLastCurSub = curSub;
+    const pushFreshness = pushSession ? Date.parse(pushSession.lastActivityAt) : NaN;
+    const verdict = usageLib.acceptUsagePush({
+      pushFreshness,
+      liveAccountSince,
+      acceptedFreshness: rateLimitUsage ? rateLimitUsage.readingFreshness : null,
+    });
+    if (!verdict.accept) {
+      // DIAGNOSTIC (metadata only — no message content): one line per drop EPISODE, so a bar
+      // stuck on stale numbers or an auto-pilot that never armed is diagnosable from the log
+      // alone. Deduped on the reason (a sustained drop re-pushes several times a second) and
+      // re-logged at most every DIAG_DROP_RELOG_MS so a long episode still leaves a trail.
+      // Wrapped so it can NEVER alter the push path — the `return` below must fire regardless.
       try {
-        const liveSummary = Object.keys(state.sessions)
-          .filter((id) => {
-            const s = state.sessions[id];
-            return s && s.status !== 'ended' && s.subscription && s.subscription.id != null;
-          })
-          .map((id) => `${id.slice(0, 8)}:${usageLib.subLabel(state.sessions[id].subscription, cfg)}:${state.sessions[id].status}`)
-          .join(' ');
-        log(`usage: current sub -> ${cur ? usageLib.subLabel(cur, cfg) : 'none'} [${curSub ? curSub.slice(0, 8) : '-'}] | live: ${liveSummary || '(none)'}`);
-      } catch (_e) {
-        /* diagnostic only */
-      }
-    }
-    if (pushSub != null && curSub != null && pushSub !== curSub) {
-      try {
-        // Dedup on the (dropped sub -> current sub) PAIR, not the message text: during a sustained
-        // drop — the very situation this traces — the 5h % ticks up and multiple sessions push, so
-        // keying on those would re-log on nearly every render. Keyed on the pair, a drop episode logs
-        // ONE line; it re-logs only when the pair changes (current shifts, or a different sub is dropped).
-        const dropKey = `${pushSub}>${curSub}`;
-        if (dropKey !== diagLastDrop) {
-          diagLastDrop = dropKey;
+        const nowLog = Date.now();
+        if (!diagLastDrop || diagLastDrop.key !== verdict.reason || nowLog - diagLastDrop.at > DIAG_DROP_RELOG_MS) {
+          diagLastDrop = { key: verdict.reason, at: nowLog };
           const pct = windows.fiveHour && typeof windows.fiveHour.usedPct === 'number' ? Math.round(windows.fiveHour.usedPct) : '?';
-          log(`usage: DROP push ${usageLib.subLabel(pushSession.subscription, cfg)} [${pushSub.slice(0, 8)}] 5h=${pct}% -- current=${cur ? usageLib.subLabel(cur, cfg) : 'none'} (session ${(windows.sessionId || '').slice(0, 8)})`);
+          log(
+            `usage: DROP push (${verdict.reason}) 5h=${pct}% session=${(windows.sessionId || '?').slice(0, 8)} ` +
+              `reading=${Number.isFinite(pushFreshness) ? new Date(pushFreshness).toISOString() : '?'} ` +
+              `since=${liveAccountSince != null ? new Date(liveAccountSince).toISOString() : '-'} ` +
+              `accepted=${rateLimitUsage && rateLimitUsage.readingFreshness != null ? new Date(rateLimitUsage.readingFreshness).toISOString() : '-'}`
+          );
         }
       } catch (_e) {
         /* diagnostic only */
       }
-      // The BAR update is dropped, but this session's context gauge was already applied
-      // above and is still valid — its fill doesn't depend on which subscription is current.
+      // The BAR update is dropped, but this session's context gauge was already applied above
+      // and is still valid — its fill doesn't depend on which account is current.
       if (ctxChanged) markDirty();
-      return; // stale non-current push -> drop
+      return;
     }
+
     // The forwarder posts on every statusline render (frequently). Broadcast ONLY when the
     // numbers actually change — else an unchanged push would rebuild the whole Live card grid
     // several times/sec (wiping text selection mid-turn). updatedAt still advances so a later
     // broadcast carries fresh liveness for the "updated Xm ago" staleness display.
     const changed = !rateLimitUsage || !usageLib.sameUsageWindows(rateLimitUsage, windows);
-    // Tag the accepted snapshot with the subscription it belongs to (the pushing session's if
-    // known, else the current one) so the bar can be attributed. sameUsageWindows ignores this.
-    const acceptedSub = pushSub != null ? pushSub : curSub;
+    // Tag the accepted snapshot with the account it belongs to: the LIVE one, since these are
+    // account-wide numbers and the guard above already established the reading postdates the
+    // last switch. `currentSubscription` (the newest live session's captured sub) survives only
+    // as the fallback for an unreadable config file. sameUsageWindows ignores both fields.
+    const cur = acct && acct.id != null ? null : aggregate.currentSubscription(state);
+    const acceptedSub = acct && acct.id != null ? acct.id : cur ? cur.id : null;
     const nowMs = Date.now();
-    rateLimitUsage = { ...windows, subscription: acceptedSub, updatedAt: nowMs };
+    // `readingFreshness` is the guard's own memory (check 2's baseline) and is stripped from the
+    // payload; `updatedAt` KEEPS its arrival-time meaning, so the "updated Xm ago" note and the
+    // stale state stay a forwarder-liveness signal rather than a reading-age one.
+    rateLimitUsage = {
+      ...windows,
+      subscription: acceptedSub,
+      readingFreshness: Number.isFinite(pushFreshness) ? pushFreshness : null,
+      updatedAt: nowMs,
+    };
     // Record each percentage for its bar's trend arrow. Gated per window rather than on
     // `changed` above — that is true when EITHER window moved, so a 5h-only push would
     // otherwise append a duplicate weekly sample. appendUsageSample is change-only itself,
     // so an unchanged percentage is a no-op either way.
-    // Tagged with the PUSHING session's own subscription, NOT acceptedSub's curSub fallback.
-    // That fallback is right for the displayed snapshot, which self-corrects on the next push —
-    // but a sample is persisted and read back up to a full span later, so attributing an
-    // unknown-subscription push to whichever subscription happens to be current would leak a
-    // foreign account's percentage into that subscription's history for hours. Unknown lands
-    // in the null bucket instead, where only an equally unattributed reading can see it.
+    // Tagged with the SAME value the snapshot got (the live account, else the fallback), so
+    // usageSampleSlice — which filters to the snapshot's sub — can actually see them. This
+    // supersedes tagging by the pushing session's captured sub: under one global account the
+    // live id IS the account a vouched reading belongs to, and a captured tag would file a
+    // post-switch reading under the account the session merely STARTED on.
     if (windows.sevenDay) {
       usageSamples = usageLib.appendUsageSample(
         usageSamples,
-        { t: nowMs, pct: windows.sevenDay.usedPct, sub: pushSub },
+        { t: nowMs, pct: windows.sevenDay.usedPct, sub: acceptedSub },
         nowMs,
         usageLib.SAMPLE_RETENTION.sevenDay
       );
@@ -2421,13 +2547,15 @@ function handleInternalUsage(req, res) {
     if (windows.fiveHour) {
       usageSamples5h = usageLib.appendUsageSample(
         usageSamples5h,
-        { t: nowMs, pct: windows.fiveHour.usedPct, sub: pushSub },
+        { t: nowMs, pct: windows.fiveHour.usedPct, sub: acceptedSub },
         nowMs,
         usageLib.SAMPLE_RETENTION.fiveHour
       );
     }
     // Usage auto-pilot: evaluate the 5h and weekly windows against their auto-pause thresholds.
-    // Runs on every push (not only `changed`) so each rising-edge memory (prevPct) tracks the
+    // Runs on EVERY push that passed the guard — i.e. on every correct reading — so the gate can
+    // no longer be starved by a silent discard ahead of it, which is the failure this whole path
+    // was rewritten for. Not gated on `changed` either, so each rising-edge memory (prevPct) tracks the
     // latest value; it self-gates on pauseGateEnabled + a per-window threshold > 0 and does
     // nothing for a window this push doesn't carry (no statusline / API-key session).
     evalAutoPause(
@@ -3165,6 +3293,11 @@ function saveSnapshot() {
     usage: rateLimitUsage,
     usageSamples,
     usageSamples5h,
+    // The switch detector's memory. Persisted so a restart mid-account does NOT re-stamp
+    // `since` (which would drop every valid reading until each session's next event), while a
+    // switch that happened WHILE the daemon was down is still observed on the first push after
+    // boot — stamping late and conservatively dropping the gap's readings.
+    liveAccount: { id: liveAccountId, since: liveAccountSince },
     // Persist the pause span accumulator + baseline so an OPEN pause span survives a restart
     // (and a day rollover) without its start being reset — unlike active-time spans, a pause's
     // duration must not reset at midnight. Restored preferentially on boot (see main()).

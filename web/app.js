@@ -822,11 +822,14 @@ function usagePaceMode() {
   return p === "tick" || p === "delta" || p === "off" ? p : "both";
 }
 
-// Per-window display state, in precedence order: `reset` (resetsAt already passed — the % is
-// known-stale, overrides age) > `stale` (snapshot older than 10 min) > `live`; a window absent
-// from the snapshot is `nodata`. Rate limits don't move without usage, so only clearly-old
-// snapshots are flagged.
-function usageWindowState(w, now, updatedAt) {
+// Per-window display state, in precedence order: `switched` (the snapshot belongs to a
+// DIFFERENT account than the one Claude Code is signed in to now — its numbers aren't this
+// account's at all, so it outranks every age-based state) > `reset` (resetsAt already passed —
+// the % is known-stale, overrides age) > `stale` (snapshot older than 10 min) > `live`; a
+// window absent from the snapshot is `nodata`. Rate limits don't move without usage, so only
+// clearly-old snapshots are flagged.
+function usageWindowState(w, now, updatedAt, switched) {
+  if (switched) return "switched";
   if (!w) return "nodata";
   const hasReset = Number.isFinite(w.resetsAt) && w.resetsAt > 0;
   if (hasReset && w.resetsAt <= now) return "reset";
@@ -1153,8 +1156,11 @@ function usageShellHTML(kind, state, label, note) {
 
 // One usage bar. `pace` (both|tick|delta|off) enables the tick and/or the readouts (see below).
 // `withDate` appends a dated reset moment (weekly) vs. a time-only one (5h) to the countdown.
-function usageBarHTML(kind, w, windowMs, label, now, updatedAt, pace, withDate) {
-  const state = usageWindowState(w, now, updatedAt);
+function usageBarHTML(kind, w, windowMs, label, now, updatedAt, pace, withDate, switched) {
+  const state = usageWindowState(w, now, updatedAt, switched);
+  // Empty shells rather than a fill: showing the previous account's numbers under the new
+  // account's name would be a confidently-wrong bar, the one thing these states exist to avoid.
+  if (state === "switched") return usageShellHTML(kind, state, label, "account switched — awaiting update");
   if (state === "nodata") return usageShellHTML(kind, state, label, "awaiting data…");
   if (state === "reset") return usageShellHTML(kind, state, label, "reset • awaiting update");
   // live | stale — render the last-known fill + percentage. A stale bar is NOT dimmed; the
@@ -1212,10 +1218,11 @@ function usageBlockHTML(now) {
     );
   const pace = usagePaceMode();
   const updatedAt = num(u.updatedAt);
+  const switched = u.switched === true; // account-wide, so it applies to BOTH bars at once
   return (
     `<div class="usage">` +
-    usageBarHTML("fiveHour", u.fiveHour, FIVE_HOUR_MS, "Session (5h)", now, updatedAt, pace, false) +
-    usageBarHTML("sevenDay", u.sevenDay, SEVEN_DAY_MS, "Week", now, updatedAt, pace, true) +
+    usageBarHTML("fiveHour", u.fiveHour, FIVE_HOUR_MS, "Session (5h)", now, updatedAt, pace, false, switched) +
+    usageBarHTML("sevenDay", u.sevenDay, SEVEN_DAY_MS, "Week", now, updatedAt, pace, true, switched) +
     `</div>`
   );
 }
@@ -1254,7 +1261,10 @@ function bindUsage() {
       },
     });
   }
-  App.usageRender = { updatedAt: num(u.updatedAt), bars };
+  // `switched` rides along so tickUsage compares like for like — without it the per-second
+  // state check would see "live" against a rendered "switched" bar and rebuild the block
+  // every second until the next accepted push.
+  App.usageRender = { updatedAt: num(u.updatedAt), switched: u.switched === true, bars };
 }
 
 // Rebuild only the usage block (leave the tiles), for a purely time-driven state change
@@ -1307,7 +1317,7 @@ function tickUsage(now) {
   const r = App.usageRender;
   if (!r) return;
   for (const b of r.bars) {
-    if (usageWindowState(b.win, now, r.updatedAt) !== b.state) {
+    if (usageWindowState(b.win, now, r.updatedAt, r.switched) !== b.state) {
       renderUsage();
       advanceUsageBars(now); // paint the freshly rebuilt bars immediately
       return;
@@ -1316,11 +1326,12 @@ function tickUsage(now) {
   advanceUsageBars(now);
 }
 
-// The active subscription rendered as a leading ribbon TILE (matching the stat tiles) — it
+// The active account rendered as a leading ribbon TILE (matching the stat tiles) — it
 // identifies whose account the row's totals belong to (server-derived, `App.state.subscription =
-// { id, label } | null`). The tile is ALWAYS rendered so the ribbon's leading column never
-// shifts: with no known subscription (API-key / pre-feature session, or no live session at all)
-// it reads "—" like any other unavailable value, with the reason in its tooltip. The tooltip
+// { id, label } | null`, read from the live ~/.claude.json account so a mid-day switch relabels
+// immediately). The tile is ALWAYS rendered so the ribbon's leading column never shifts: with no
+// known account (API-key / pre-feature setup, or no live session at all) it reads "—" like any
+// other unavailable value, with the reason in its tooltip. The tooltip
 // otherwise carries this subscription's ALL-TIME tokens/cost (`App.state.subscriptionTotals[sub.id]`,
 // a range-free total distinct from the History chart's range-scoped breakdown), falling back to the
 // plain description before totals are available. Its value is a name, not a stat.
@@ -1328,7 +1339,7 @@ function subscriptionTileHTML() {
   const sub = App.state && App.state.subscription;
   if (!sub || !sub.label) {
     const title =
-      "Active subscription — no live session reports one (an API-key session, or one started before subscription capture)";
+      "Active subscription — unknown (no live session, an API-key setup, or the account file could not be read)";
     return (
       `<div class="tile tile--sub" title="${esc(title)}">` +
       `<div class="tile__label">Subscription</div>` +
@@ -1337,7 +1348,7 @@ function subscriptionTileHTML() {
     );
   }
   const totals = App.state && App.state.subscriptionTotals && App.state.subscriptionTotals[sub.id];
-  let title = "Active subscription — the newest live session's account";
+  let title = "Active subscription — the account Claude Code is signed in to";
   if (totals) {
     title += ` · all-time: ${fmtTokens(sumTokens(totals.tokens))} tokens`;
     if (typeof totals.cost === "number" && Number.isFinite(totals.cost)) title += `, ${fmtCost(totals.cost)}`;

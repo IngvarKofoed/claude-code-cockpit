@@ -49,8 +49,8 @@ function normalizeContextWindow(cw) {
 }
 
 // The pushing session's id, validated to a non-empty string or null. It rides on every
-// push so the daemon can attribute it — to drop a rate-limit push that isn't on the
-// current subscription, and to hang the context window on the right session. A
+// push so the daemon can attribute it — to date the reading by that session's last
+// activity (see acceptUsagePush), and to hang the context window on the right session. A
 // missing/garbage id is null, which makes both paths fail open.
 function pushSessionId(body) {
   if (!body || typeof body !== 'object') return null;
@@ -87,6 +87,41 @@ function sameWindow(x, y) {
 function sameUsageWindows(a, b) {
   if (!a || !b) return false;
   return sameWindow(a.fiveHour, b.fiveHour) && sameWindow(a.sevenDay, b.sevenDay);
+}
+
+// ---- the rate-limit push guard ----------------------------------------------
+// Which statusline push may update the global rate-limit snapshot. The account is a single
+// global `oauthAccount`, so EVERY live session reports the same account's numbers — what
+// separates a good push from a bad one is not whose session sent it but WHEN its reading
+// was taken. Two checks, both fail-open:
+//
+//   1. pre-switch — a reading taken before the account switched describes the PREVIOUS
+//      account and must not be filed under the new one.
+//   2. staler-than-accepted — a reading older than the one already on the bar can only
+//      drag it backwards (an idle session re-pushing its frozen payload).
+//
+// `pushFreshness` is the pushing session's `lastActivityAt` — an event-derived PROXY for
+// the reading's age, not a receipt: user-side events (a prompt, a resume, an idle_prompt
+// Notification) advance it with no API response behind them. That cuts both ways and both
+// edges are accepted: the bump is what rescues a running session past a fresh
+// `liveAccountSince` within seconds, and a session prompted right after a switch can
+// re-push its frozen pre-switch payload once before its first real response corrects it.
+//
+// UNKNOWN on either side of a check passes that check (entry 42's rule: never worse than
+// the last-write-wins baseline this replaced). In particular a stored `acceptedFreshness`
+// of null — what a fail-open accept records — makes check 2 pass for every later push:
+// fail-open ratchets open, never shut.
+function acceptUsagePush(o) {
+  const opts = o || {};
+  const fresh = Number.isFinite(opts.pushFreshness) ? opts.pushFreshness : null;
+  if (fresh == null) return { accept: true, reason: null };
+  if (Number.isFinite(opts.liveAccountSince) && fresh < opts.liveAccountSince) {
+    return { accept: false, reason: 'pre-switch' };
+  }
+  if (Number.isFinite(opts.acceptedFreshness) && fresh < opts.acceptedFreshness) {
+    return { accept: false, reason: 'staler-than-accepted' };
+  }
+  return { accept: true, reason: null };
 }
 
 // ---- rate-limit percentage sample buffers -----------------------------------
@@ -240,6 +275,7 @@ module.exports = {
   normalizeContextWindow,
   pushSessionId,
   sameUsageWindows,
+  acceptUsagePush,
   appendUsageSample,
   pruneUsageSamples,
   usageSampleSlice,
