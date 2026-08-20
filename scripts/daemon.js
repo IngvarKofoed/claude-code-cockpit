@@ -160,6 +160,17 @@ let diagLastDrop = null; // usage diagnostic: { key, at } of the last dropped-pu
 let liveAccountValue = null; // last parsed account object, or null (unreadable / no oauthAccount)
 let liveAccountStat = null; // { mtimeMs, size } the cached value was parsed from
 let liveAccountId = null; // last KNOWN (non-null) organizationUuid — the switch detector's memory; persisted
+// The base name that went with `liveAccountId`, kept ONLY so an AccountSwitched event can name
+// the account being LEFT (`fromName`); the daemon has no other use for a past account's name.
+// Persisted beside the id so the first switch after a restart is still self-describing — a
+// pre-upgrade snapshot has no name, so that one switch carries fromName: null.
+let liveAccountName = null;
+// Write-suppressor for the one-shot AccountSwitchTrackingStarted marker (see markSwitchTracking):
+// the DATE of the marker we last wrote, or null. Deliberately NOT authoritative — the marker
+// itself lives in the durable event log and the earliest one across retained days is the answer,
+// so losing this re-appends a later marker that earliest-wins simply ignores. It is the date and
+// not a boolean precisely so the suppression can be checked against the log still holding it.
+let switchTrackingMarkedDate = null;
 // Epoch ms of the last OBSERVED account switch, or null when none has been observed. Not the
 // file's mtime (~/.claude.json is a general state blob written for unrelated reasons). Two
 // deliberate seams, see the spec: a FIRST-ever observation does not stamp (nothing has been
@@ -276,8 +287,10 @@ function refreshLiveAccount() {
   }
   const id = liveAccountValue && liveAccountValue.id != null ? liveAccountValue.id : null;
   if (id != null) {
+    const name = aggregate.subBaseName(liveAccountValue); // the RAW base name; labels are read-time
     if (liveAccountId != null && id !== liveAccountId) {
       liveAccountSince = Date.now();
+      appendAccountSwitched(liveAccountId, liveAccountName, id, name);
       // Push the switch out immediately: the bars must flip to "account switched — awaiting
       // update" now, not whenever the next unrelated event happens to broadcast. The push that
       // REVEALED the switch is itself dropped (its reading predates the stamp), and that drop
@@ -292,8 +305,73 @@ function refreshLiveAccount() {
     }
     diagLastAccount = id;
     liveAccountId = id;
+    liveAccountName = name;
   }
   return liveAccountValue;
+}
+
+// Append ONE session-less AccountSwitched line to today's event log, making an observed switch
+// durable and per-day countable (the rollup's `accountSwitches`, folded by the tail). Mirrors
+// reconcile()'s pause-event append — same shape, same target (`currentDate`, the daemon's own
+// notion of the open day, so the line lands in the file whose offset the tail tracks) — the
+// daemon being a sanctioned low-frequency second writer of the otherwise hook-written log.
+//
+// There is NO direct fold here, unlike reconcile(): a counter has no baseline a transient tail
+// error could strand, and the offset isn't advanced by a failed read, so the line is simply
+// counted on the next tail (TAIL_MS, 500ms). One path also keeps the boot rescan and the live
+// tail arithmetically identical, which is the property the byTool fold's comment protects.
+//
+// Names are the RAW base names (labels are applied at read time, per subscriptionLabelPattern);
+// `fromName` is null when the previous account's name was never observed (a pre-upgrade
+// snapshot). An append failure loses exactly one switch from the count and NOTHING else — it
+// must not abort the caller, whose stamp / drop-guard / broadcast are the load-bearing work.
+function appendAccountSwitched(fromId, fromName, toId, toName) {
+  const rec = {
+    ts: new Date().toISOString(),
+    event: 'AccountSwitched',
+    from: fromId,
+    to: toId,
+    fromName: fromName != null ? fromName : null,
+    toName: toName != null ? toName : null,
+  };
+  try {
+    fs.mkdirSync(paths.eventsDir(), { recursive: true });
+    fs.appendFileSync(paths.eventLogPath(currentDate), JSON.stringify(rec) + '\n');
+  } catch (e) {
+    log('account switch event append failed ' + e);
+  }
+}
+
+// One-shot marker recording WHEN this store began observing account switches, so a day with a
+// genuine 0 is distinguishable from a day the cockpit wasn't watching (the no-wrong-zero rule
+// applied ahead of any reader: every day before the earliest marker is UNKNOWN, not 0).
+// Written on the first boot that has no surviving marker; nothing reads it yet.
+//
+// The suppressor is checked against the LOG, not against a bare "done" flag: `/api/data/cleanup`
+// unlinks whole past-day event logs, so the day-file holding the only marker can be deleted —
+// and a boolean flag would then suppress forever, leaving NO marker anywhere and destroying the
+// very unknown-vs-genuine-0 distinction this exists for. Re-appending instead grows the unknown
+// region back to the next surviving marker, which is the documented degradation. One `fs.existsSync`
+// per boot, and a cleanup during a long-running daemon is only noticed at its next boot.
+function markSwitchTracking() {
+  if (switchTrackingMarkedDate && fs.existsSync(paths.eventLogPath(switchTrackingMarkedDate))) return;
+  try {
+    fs.mkdirSync(paths.eventsDir(), { recursive: true });
+    fs.appendFileSync(
+      paths.eventLogPath(currentDate),
+      JSON.stringify({ ts: new Date().toISOString(), event: 'AccountSwitchTrackingStarted' }) + '\n'
+    );
+    switchTrackingMarkedDate = currentDate;
+    // Persist it NOW rather than waiting for the periodic save, mirroring reconcile()'s append
+    // -> saveSnapshot pairing: a daemon that boots and dies inside SNAPSHOT_MS would otherwise
+    // lose the date and append a second marker next boot. Only ever a cosmetic duplicate
+    // (earliest-marker-wins is the answer), so this is tidiness, not correctness — which is why
+    // it sits here, at the end of boot, where the snapshot is a settled picture.
+    saveSnapshot();
+    log('account-switch tracking marker written');
+  } catch (e) {
+    log('account switch tracking marker append failed ' + e); // retried on the next boot
+  }
 }
 
 // The cached live account WITHOUT touching the filesystem — for the SSE hot path
@@ -531,7 +609,10 @@ function loadSnapshot() {
   if (snap.liveAccount && typeof snap.liveAccount === 'object') {
     if (snap.liveAccount.id != null) liveAccountId = snap.liveAccount.id;
     if (Number.isFinite(snap.liveAccount.since)) liveAccountSince = snap.liveAccount.since;
+    // Absent on a pre-upgrade snapshot -> the first switch after this boot names no `fromName`.
+    if (typeof snap.liveAccount.name === 'string') liveAccountName = snap.liveAccount.name;
   }
+  if (typeof snap.switchTrackingMarkedDate === 'string') switchTrackingMarkedDate = snap.switchTrackingMarkedDate;
   // Restore each percentage history, pruned against the current clock (and its OWN retention)
   // so a daemon that was down for days doesn't resurrect a stale anchor. Absent (older
   // snapshot) -> empty, and that bar simply carries no trend arrow until samples accumulate.
@@ -1455,6 +1536,17 @@ function handleEvent(ev) {
       repoTotalsCache = null;
     }
   }
+  // The day's account switches — the live counterpart of accumulateActiveFromEvents' branch,
+  // so today's figure matches what a restart's rescan re-derives. Session-LESS and repo-less,
+  // hence no session guard and no cache to invalidate (repoTotalsCache and
+  // subscriptionTotalsAllTime are per-repo / per-subscription TOKEN aggregates). No markDirty()
+  // either — handleEvent already broadcasts at its end. Consequence, accepted: the tile's LABEL
+  // flips at the switch instant (refreshLiveAccount marks dirty there) while this count lands up
+  // to one tail later, so the tile can read "Phoenix + 4" for ~500ms; folding optimistically at
+  // the append would double-count against this branch.
+  if (ev.event === 'AccountSwitched') {
+    todayRollup.accountSwitches = num(todayRollup.accountSwitches) + 1;
+  }
 
   switch (ev.event) {
     case 'Stop':
@@ -1925,6 +2017,11 @@ function buildStatePayload() {
       const sub = live && live.id != null ? live : cur;
       return sub ? { id: sub.id, label: usageLib.subLabel(sub, cfg) } : null;
     })(),
+    // How many times the signed-in account changed TODAY (the ribbon tile's "+ N" suffix).
+    // Deliberately NOT nested inside `subscription`, which goes null whenever the account is
+    // unknown or no session is live — the day's switch count is still a true fact then. O(1)
+    // read off today's rollup, so it is safe on the SSE hot path.
+    accountSwitchesToday: num(todayRollup.accountSwitches),
     // All-time per-subscription totals (subId -> { label, tokens, cost }); memoized off the
     // SSE hot path exactly like repoTotals (see subscriptionTotalsAllTime).
     subscriptionTotals: subscriptionTotalsAllTime(),
@@ -3297,7 +3394,11 @@ function saveSnapshot() {
     // `since` (which would drop every valid reading until each session's next event), while a
     // switch that happened WHILE the daemon was down is still observed on the first push after
     // boot — stamping late and conservatively dropping the gap's readings.
-    liveAccount: { id: liveAccountId, since: liveAccountSince },
+    liveAccount: { id: liveAccountId, since: liveAccountSince, name: liveAccountName },
+    // Write-suppressor only — the marker in the event log is the durable record (see
+    // markSwitchTracking), so losing this costs one redundant marker, never the answer. The
+    // DATE, so the next boot can check the marker's day-file still exists before suppressing.
+    switchTrackingMarkedDate,
     // Persist the pause span accumulator + baseline so an OPEN pause span survives a restart
     // (and a day rollover) without its start being reset — unlike active-time spans, a pause's
     // duration must not reset at midnight. Restored preferentially on boot (see main()).
@@ -3546,6 +3647,13 @@ function main() {
   refreshPauseSafe();
   pauseSafeNotified = pauseSafeSummary.allAtRest;
   pauseSafeBooting = false; // boot done: a pause beginning after this may fire the walk-away ping
+
+  // Record when this store began observing account switches, so a future reader can tell a
+  // genuine 0-switch day from a day the cockpit wasn't watching. No-ops while the marked day's
+  // log still exists. LAST in the boot sequence because it persists the snapshot: every earlier
+  // step (dropping ended sessions, catchUpIngest, the pause fold) has settled by now, so that
+  // write is a faithful picture rather than a half-booted one.
+  markSwitchTracking();
 
   startServer(() => {
     log(`daemon up on http://127.0.0.1:${PORT} v${VERSION}${ephemeral ? ' (ephemeral)' : ''}`);

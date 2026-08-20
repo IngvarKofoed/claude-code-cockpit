@@ -1476,3 +1476,27 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
 
 198. ARCHITECTURE.md's Live bullet now documents that card-head qualifier and its four modes,
      alongside the other per-browser Live-card preferences it already tracks.
+
+199. Every observed account switch is now durable: the daemon appends an `AccountSwitched` event,
+     counted into the rollup's new TOP-LEVEL `accountSwitches` (top-level because a switch has no
+     repo — the account is one global). Reuses the sanctioned session-less writer path
+     (Paused/Resumed). No direct fold: the tail counts the line, so a boot rescan and the live
+     path stay arithmetically identical. A FLOOR — an A→B→A flip between two reads is invisible.
+
+200. The Live ribbon's Subscription tile carries a muted `+ N` — today's switch count
+     ("Corvus + 5"), from `/api/state`'s `accountSwitchesToday`. Rendered in the `—` branch too
+     (the count is true when the identity isn't), absent at zero, and colour-NEUTRAL because
+     despite the `+` it is a count, not a signed delta. The name ellipsizes, the count never
+     shrinks. Accepted seam: the label flips at the switch, the count ~500ms later.
+
+201. A one-shot `AccountSwitchTrackingStarted` marker records when this store began watching, so
+     a day before it reads UNKNOWN, never a confident 0 (nothing consumes it yet — a History
+     chart stayed out of scope). The EARLIEST marker in the log is the answer; the snapshot only
+     suppresses re-writing, keyed on the marker's DATE so a boot re-marks once
+     `/api/data/cleanup` unlinks that day — a bare flag would suppress forever, marker gone.
+
+202. That marker is written LAST in the daemon's boot sequence, because it now persists the
+     snapshot immediately (reconcile()'s append→save pairing), so a daemon dying inside the 5s
+     save interval can't append a duplicate next boot. Do NOT move the call earlier: dropping
+     ended sessions, catchUpIngest and the pause fold must all have settled first, or that
+     write captures a half-booted picture.

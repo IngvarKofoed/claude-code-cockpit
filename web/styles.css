@@ -351,13 +351,36 @@ body {
 
 /* The active-subscription tile shows a NAME, not a number: keep it on one line, ellipsize a
    long name so it never overflows the tile, and size it a touch smaller than the numeric stat
-   values so it reads as an identity label rather than a metric. */
+   values so it reads as an identity label rather than a metric. It may carry a second part —
+   today's account-switch count — so the value is a flex ROW: the ellipsis rules moved off this
+   container onto the name span below, because clipping the container's line box would eat the
+   COUNT first (it comes last), which is the opposite of what should give way. */
 .tile--sub .tile__value {
   font-size: 22px;
   font-weight: 600;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* The name absorbs the squeeze: it shrinks and ellipsizes (min-width:0 is what allows a flex
+   item to shrink below its content width at all). */
+.tile--sub .tile__value-name {
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Today's switch count. `flex: none` so it never shrinks — the name is the part you already
+   know, the count is the part that changes. Muted INK, never a delta/status hue: despite the
+   "+" it is a count, not a signed change, so it must not imply a good/bad direction. */
+.tile--sub .tile__value-sub {
+  flex: none;
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--ink-2);
 }
 
 /* ---------- Live usage bars (session 5h + weekly, from the statusline) ---------- */

@@ -539,7 +539,12 @@ function createRollup(dateStr) {
   // hourActive[0..23]: active ms bucketed by local hour-of-day, populated alongside
   // per-repo active in accumulateActiveFromEvents so the History by-hour chart reads
   // it straight off the (cached) rollup instead of re-scanning the event log.
-  return { date: dateStr, repos: {}, hourActive: new Array(24).fill(0) };
+  // accountSwitches: how many times the signed-in account changed on this day. Top-level
+  // rather than per-repo BECAUSE a switch has no repository — the account is a single global
+  // (~/.claude.json's oauthAccount), so filing it under one repo would be a lie and the
+  // ribbon needs one number, not a sum over repos. Counted from the daemon-written
+  // AccountSwitched events below, so it is derived (never trusted from a rollup file).
+  return { date: dateStr, repos: {}, hourActive: new Array(24).fill(0), accountSwitches: 0 };
 }
 
 function ensureRepo(rollup, repoRoot, repoName) {
@@ -753,6 +758,13 @@ function accumulateActiveFromEvents(rollup, events) {
     if (ev && ev.event === 'SubagentStart' && ev.agent_type != null && sess && sess.repoRoot != null) {
       const repo = ensureRepo(rollup, sess.repoRoot, sess.repoName);
       repo.byAgentType[ev.agent_type] = num(repo.byAgentType[ev.agent_type]) + 1;
+    }
+    // The day's account switches (daemon-written AccountSwitched events). Session-LESS, so
+    // unlike every branch above it takes no `sess` / `repoRoot` guard — which is also why it
+    // cannot live inside the active-delta fold. The daemon's live tail mirrors this exact
+    // increment below its replay guard, so a boot rescan and the live path agree.
+    if (ev && ev.event === 'AccountSwitched') {
+      rollup.accountSwitches = num(rollup.accountSwitches) + 1;
     }
   }
   return rollup;

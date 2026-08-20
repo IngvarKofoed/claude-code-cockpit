@@ -1382,6 +1382,23 @@ function tickUsage(now) {
   advanceUsageBars(now);
 }
 
+// Today's account switches, as the muted "+ N" suffix on the Subscription tile below. Deliberately
+// colour-NEUTRAL (an ink token, not an up-is-good/bad delta hue): despite the "+" it is a count, not
+// a signed change against a prior period, so painting it green/amber would assert a direction the
+// number doesn't carry. ABSENT at zero — a permanent "+ 0" spends tile width to say nothing, and
+// its absence is unambiguous. Rendered in BOTH tile branches, including the unknown-account one:
+// the day's count stays true whether or not the identity half is knowable right now.
+function switchSuffix() {
+  const n = num(App.state && App.state.accountSwitchesToday);
+  if (n <= 0) return { html: "", title: "" };
+  return {
+    html: `<span class="tile__value-sub">+ ${n}</span>`,
+    // A floor, not a census: a switch is only seen when the daemon re-reads the account file,
+    // so an A→B→A flip between two reads leaves no trace. Said here rather than nowhere.
+    title: ` · ${n} account switch${n === 1 ? "" : "es"} observed today`,
+  };
+}
+
 // The active account rendered as a leading ribbon TILE (matching the stat tiles) — it
 // identifies whose account the row's totals belong to (server-derived, `App.state.subscription =
 // { id, label } | null`, read from the live ~/.claude.json account so a mid-day switch relabels
@@ -1390,16 +1407,19 @@ function tickUsage(now) {
 // other unavailable value, with the reason in its tooltip. The tooltip
 // otherwise carries this subscription's ALL-TIME tokens/cost (`App.state.subscriptionTotals[sub.id]`,
 // a range-free total distinct from the History chart's range-scoped breakdown), falling back to the
-// plain description before totals are available. Its value is a name, not a stat.
+// plain description before totals are available. Its value is a name, not a stat, and it carries
+// today's switch count as a muted suffix (see switchSuffix above).
 function subscriptionTileHTML() {
   const sub = App.state && App.state.subscription;
+  const sw = switchSuffix();
   if (!sub || !sub.label) {
     const title =
-      "Active subscription — unknown (no live session, an API-key setup, or the account file could not be read)";
+      "Active subscription — unknown (no live session, an API-key setup, or the account file could not be read)" +
+      sw.title;
     return (
       `<div class="tile tile--sub" title="${esc(title)}">` +
       `<div class="tile__label">Subscription</div>` +
-      `<div class="tile__value">—</div>` +
+      `<div class="tile__value"><span class="tile__value-name">—</span>${sw.html}</div>` +
       `</div>`
     );
   }
@@ -1409,10 +1429,13 @@ function subscriptionTileHTML() {
     title += ` · all-time: ${fmtTokens(sumTokens(totals.tokens))} tokens`;
     if (typeof totals.cost === "number" && Number.isFinite(totals.cost)) title += `, ${fmtCost(totals.cost)}`;
   }
+  title += sw.title;
   return (
     `<div class="tile tile--sub" title="${esc(title)}">` +
     `<div class="tile__label">Subscription</div>` +
-    `<div class="tile__value">${esc(sub.label)}</div>` +
+    // The name needs its OWN span: the ellipsis rules live on it (not the container), so a long
+    // account name truncates while the count — the part that changes — survives. See styles.css.
+    `<div class="tile__value"><span class="tile__value-name">${esc(sub.label)}</span>${sw.html}</div>` +
     `</div>`
   );
 }

@@ -800,6 +800,36 @@ test('accumulateActiveFromEvents: bad input is a safe no-op', () => {
   assert.deepStrictEqual(accumulateActiveFromEvents(createRollup('2026-07-02'), 'nope').repos, {});
 });
 
+// --- event-derived account-switch count --------------------------------------
+
+test('createRollup: accountSwitches starts at 0', () => {
+  assert.strictEqual(createRollup('2026-08-19').accountSwitches, 0);
+});
+
+test('accumulateActiveFromEvents: counts AccountSwitched, which carries no session or repo', () => {
+  // The daemon writes these itself, so they have neither session_id nor repo_root — the
+  // reason the branch is unconditional rather than living inside the per-session active fold.
+  const rollup = accumulateActiveFromEvents(createRollup('2026-08-19'), [
+    { ts: '2026-08-19T07:21:59.794Z', event: 'AccountSwitched', from: 'a', to: 'b', fromName: 'Lyra', toName: 'Phoenix' },
+    ev('UserPromptSubmit', { ts: '2026-08-19T08:00:00.000Z', prompt_id: 'p1' }),
+    ev('Stop', { ts: '2026-08-19T08:00:04.000Z' }),
+    { ts: '2026-08-19T08:59:11.351Z', event: 'AccountSwitched', from: 'b', to: 'c', fromName: 'Phoenix', toName: 'Corvus' },
+  ]);
+  assert.strictEqual(rollup.accountSwitches, 2);
+  // A session-less event must not invent a repo, and must not disturb the active fold.
+  assert.deepStrictEqual(Object.keys(rollup.repos), ['/code/acme-api']);
+  assert.strictEqual(rollup.repos['/code/acme-api'].activeMs, 4000);
+});
+
+test('accumulateActiveFromEvents: a day with no switch counts 0, and the marker is not a switch', () => {
+  const rollup = accumulateActiveFromEvents(createRollup('2026-08-19'), [
+    { ts: '2026-08-19T06:00:00.000Z', event: 'AccountSwitchTrackingStarted' },
+    ev('UserPromptSubmit', { ts: '2026-08-19T08:00:00.000Z', prompt_id: 'p1' }),
+    ev('Stop', { ts: '2026-08-19T08:00:04.000Z' }),
+  ]);
+  assert.strictEqual(rollup.accountSwitches, 0);
+});
+
 // --- accumulateSessionStatsFromEvents (per-session activeMs + chats/tools/agents) ----
 
 test('accumulateSessionStatsFromEvents: activeMs keyed by session, agrees with the per-repo total', () => {
