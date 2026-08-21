@@ -1518,3 +1518,9 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      the exclusion as a choice. Accepted costs: a genuine background BUILD contributes no active
      time on its own, and the "N in flight" chip shows only on a running card, so a shell-only
      session shows none. `bgAgents == null` (older `emit.js` / events) falls back to `bg_tasks`.
+
+206. Released v0.51.0, carrying entries 203–205 (PR #6). Bumped per entry 103 — the plugin
+     cache is keyed by version and `ensure.js` only replaces a running daemon when `/health`
+     reports a DIFFERENT one, so an accounting fix cannot reach a live daemon without it.
+     Merged as the contributor's ORIGINAL commits rather than the rebased copies, so GitHub
+     resolves the PR itself; `marketplace.json` stays at 0.2.0, unmaintained, so it is left alone.
