@@ -96,7 +96,21 @@ function buildRecord(payload) {
   // command / description / name are free text (paths, prompts, secrets) and persisting them
   // would breach the "no message content" privacy boundary. A present array (including empty)
   // is authoritative; absent (older Claude Code) leaves the daemon's last known count intact.
-  if (Array.isArray(payload.background_tasks)) record.bg_tasks = payload.background_tasks.length;
+  //
+  // bg_agents is the same count MINUS `type: 'shell'` entries — a run_in_background Bash. A
+  // shell is in the registry but is not the session working: a dev server or file watcher sits
+  // there for hours, and counting it held the session engaged for its whole lifetime, inflating
+  // active time and reporting a parked session as not-at-rest. ARCHITECTURE.md already states
+  // active time "cannot count a background Bash"; this is what makes that true. Shells stay in
+  // bg_tasks so the card's "N in flight" readout remains honest — only ENGAGEMENT changes.
+  // Denylist, not allowlist: an unrecognised future type keeps counting, as it does today. We
+  // still store only counts, never a task's type-bearing element, command or description.
+  if (Array.isArray(payload.background_tasks)) {
+    record.bg_tasks = payload.background_tasks.length;
+    record.bg_agents = payload.background_tasks.filter(
+      (t) => !(t && typeof t === 'object' && t.type === 'shell')
+    ).length;
+  }
   // SessionStart captures the account/subscription once for the session's life, so a replay
   // reconstructs which account a session STARTED under. It is deliberately not re-read per
   // event (the file is a ~200KB blob and hooks are the hot path) — which is exactly why the

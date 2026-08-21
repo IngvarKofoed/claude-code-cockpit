@@ -438,7 +438,15 @@ const STATUS_LABEL = {
 function effectiveStatus(s) {
   const raw = s.status || "idle";
   if (raw === "waiting" || raw === "error") return raw;
-  return raw === "running" || num(s.bgTasks) > 0 ? "running" : "idle";
+  return raw === "running" || backgroundWork(s) > 0 ? "running" : "idle";
+}
+
+// Background work that means the session is WORKING: the registry minus run_in_background
+// shells (daemon-side `bgAgents`; see emit.js). A dev server or watcher shell lives in the
+// registry for hours and must not badge an otherwise-idle card as Running. Falls back to the
+// full count when bgAgents is absent, so a card from an older daemon behaves exactly as before.
+function backgroundWork(s) {
+  return s.bgAgents == null ? num(s.bgTasks) : num(s.bgAgents);
 }
 
 // Rendering-only status: overlays the GLOBAL pause (docs/specs/2026-07-09-pause-gate.md —
