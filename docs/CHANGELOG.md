@@ -1500,3 +1500,21 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      save interval can't append a duplicate next boot. Do NOT move the call earlier: dropping
      ended sessions, catchUpIngest and the pause fold must all have settled first, or that
      write captures a half-booted picture.
+
+203. A turn resumed after an auto-compact no longer reads Idle while it works. The residual-
+     `running` settle now fires only on events that can END work (`SETTLING_EVENTS`), never on
+     `PreToolUse`/`PostToolUse`, which merely report it. A compact emits `SessionStart` and no
+     fresh `UserPromptSubmit`, so the turn runs with `currentPrompt` null and the old guard
+     cancelled every `PreToolUse`'s `running`. Cost: that turn shows "working", not "elapsed".
+
+204. A background SHELL (`run_in_background` Bash) no longer holds its session engaged.
+     `emit.js` records `bg_agents` — the registry minus `type: 'shell'` — and `backgroundWork()`
+     reads it wherever engagement is decided: engaged clock, `atRest`, card sort, the
+     `idle_prompt` lost-Stop rescue, `effectiveStatus`. Measured: a dev server billed 7.01h
+     active against 1.19h of real work, in one unbroken 5.73h span holding zero events.
+
+205. That REVERSES entry 25's deliberate "a run_in_background Bash now counts as active" bonus.
+     ARCHITECTURE.md claimed the opposite, so the doc was stale, not prescient — it now states
+     the exclusion as a choice. Accepted costs: a genuine background BUILD contributes no active
+     time on its own, and the "N in flight" chip shows only on a running card, so a shell-only
+     session shows none. `bgAgents == null` (older `emit.js` / events) falls back to `bg_tasks`.

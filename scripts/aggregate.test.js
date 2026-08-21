@@ -431,6 +431,57 @@ test('a workflow agent alongside a background shell still keeps the session enga
   assert.strictEqual(s.activeMs, 305000); // 5s turn + 300s of agent work
 });
 
+test('a lone background shell no longer blocks the idle_prompt lost-Stop rescue', () => {
+  // idle_prompt is treated as a missed Stop only when nothing is in flight. Counting a shell
+  // there held inFlight true for the dev server's whole lifetime, so a session whose Stop was
+  // lost could never settle — and a stale `running` retro-bills the entire gap as active time
+  // on its next event, exactly the phantom the shell exclusion removes.
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:02.000Z', tool_name: 'Bash', bg_tasks: 1, bg_agents: 0 }),
+    ev('PostToolUse', { ts: '2026-07-02T10:00:03.000Z' }), // clears currentActivity; Stop never arrives
+    ev('Notification', { ts: '2026-07-02T10:00:09.000Z', notification_type: 'idle_prompt' }),
+  ]);
+  const s = state.sessions.s1;
+  assert.strictEqual(s.status, 'idle'); // rescued despite the shell still in the registry
+  assert.strictEqual(s.currentPrompt, null); // turn closed, so the browser stops ticking
+  assert.strictEqual(s.activeMs, 9000); // the turn only; no further accrual after the rescue
+
+  // a much later event must not retro-bill the gap the rescue closed
+  applyEvent(state, ev('UserPromptSubmit', { ts: '2026-07-02T13:00:00.000Z', prompt_id: 'p2' }));
+  assert.strictEqual(s.activeMs, 9000);
+});
+
+test('a background AGENT still blocks the idle_prompt lost-Stop rescue', () => {
+  // The guard's original purpose: Claude Code emits idle_prompt mid-turn while background work
+  // runs and the main loop is quiet, so real agent work must not be read as a missed Stop.
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:02.000Z', tool_name: 'Bash', bg_tasks: 1, bg_agents: 1 }),
+    ev('PostToolUse', { ts: '2026-07-02T10:00:03.000Z' }),
+    ev('Notification', { ts: '2026-07-02T10:00:09.000Z', notification_type: 'idle_prompt' }),
+  ]);
+  const s = state.sessions.s1;
+  assert.strictEqual(s.status, 'running');
+  assert.ok(s.currentPrompt); // turn left open — the workflow is genuinely working
+});
+
+test('the card sort ranks a shell-only session as idle, matching its badge', () => {
+  // statusRank mirrors the client's effectiveStatus. A session whose only registry entry is a
+  // shell badges idle, so it must not sort above a genuinely idle-but-more-recent card as if
+  // it were running — the grid position would then contradict the card's own appearance.
+  const state = createState();
+  applyEvent(state, ev('SessionStart', { session_id: 'shell' }));
+  applyEvent(state, ev('Stop', { session_id: 'shell', ts: '2026-07-02T10:00:05.000Z', bg_tasks: 1, bg_agents: 0 }));
+  applyEvent(state, ev('SessionStart', { session_id: 'agent' }));
+  applyEvent(state, ev('Stop', { session_id: 'agent', ts: '2026-07-02T10:00:04.000Z', bg_tasks: 1, bg_agents: 1 }));
+
+  const ids = snapshot(state, 0).sessions.map((c) => c.sessionId);
+  assert.deepStrictEqual(ids, ['agent', 'shell']); // the agent ranks running despite older activity
+});
+
 test('bgAgents absent (older emit.js) falls back to bgTasks, preserving past behaviour', () => {
   const state = run([
     ev('SessionStart'),

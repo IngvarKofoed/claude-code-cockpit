@@ -357,8 +357,9 @@ function applyEvent(state, event) {
     case 'PreToolUse':
       // A tool that blocks on the user (see USER_BLOCKING_TOOLS) enters `waiting` — the main
       // agent handed control back and isn't working, so the engaged clock stops while you decide.
-      // Any other tool means Claude is working: `running`. (A concurrent background task keeps
-      // isEngaged true via bgTasks regardless, so background work isn't wrongly paused here.)
+      // Any other tool means Claude is working: `running`. (A concurrent background AGENT keeps
+      // isEngaged true regardless, so background work isn't wrongly paused here; a lone
+      // background shell is not work and correctly stops the clock — see backgroundWork.)
       session.status = USER_BLOCKING_TOOLS.has(event.tool_name) ? 'waiting' : 'running';
       if (event.tool_name != null) session.currentActivity = event.tool_name;
       // num() coercion is required: loadSnapshot restores sessions straight from
@@ -388,11 +389,15 @@ function applyEvent(state, event) {
         // "awaiting input" state that reads as needs-attention on a turn that
         // is simply done. But Claude Code also emits idle_prompt mid-turn while
         // background work runs and the main loop is quiet, so treat it as a
-        // done-signal only when nothing is in flight (no background task per the
-        // authoritative bgTasks count, no tool mid-call); that both avoids falsely
+        // done-signal only when nothing is in flight (no background AGENT per the
+        // authoritative registry count, no tool mid-call); that both avoids falsely
         // idling a working session and still settles a `running` session whose Stop
         // was somehow missed, which would otherwise tick a live timer forever.
-        const inFlight = num(session.bgTasks) > 0 || session.currentActivity != null;
+        // backgroundWork, not bgTasks: a long-lived shell (a dev server) would otherwise
+        // hold inFlight true for its whole lifetime, permanently disabling this rescue —
+        // and a stale `running` retro-bills the whole gap as active time on the next
+        // event, which is the very phantom the shell exclusion exists to remove.
+        const inFlight = backgroundWork(session) > 0 || session.currentActivity != null;
         if (session.status === 'running' && !inFlight) {
           // Treat this as the missed Stop: CLOSE the turn — clear currentPrompt
           // (else snapshot keeps emitting currentPromptStartedAt and the browser
@@ -545,11 +550,13 @@ function toCard(s) {
 
 // Waiting first (needs the user), then running, then everything else; ties
 // broken by most-recent activity. A session with background work still in flight
-// (bgTasks>0) ranks as running — it IS working, and the client colours/ticks it as
-// running — so its grid position agrees with its appearance (mirrors effectiveStatus).
+// ranks as running — it IS working, and the client colours/ticks it as running — so
+// its grid position agrees with its appearance (mirrors effectiveStatus). It must read
+// backgroundWork, not bgTasks: a session whose only registry entry is a shell badges
+// idle client-side, so ranking it as running would sort a card above its own appearance.
 function statusRank(card) {
   if (card.status === 'waiting') return 0;
-  if (card.status === 'running' || num(card.bgTasks) > 0) return 1;
+  if (card.status === 'running' || backgroundWork(card) > 0) return 1;
   return 2;
 }
 
