@@ -185,7 +185,7 @@ function renderLine(data) {
   if (tok) seg.push(C.pink + tok + C.dim + " tok" + C.reset);
 
   const cost = data.cost && typeof data.cost.total_cost_usd === "number" ? data.cost.total_cost_usd : null;
-  if (cost != null) seg.push(C.green + "$" + cost.toFixed(3) + C.reset);
+  if (cost != null) seg.push(C.green + "$" + cost.toFixed(2) + C.reset);
 
   return seg.join(C.dim + " · " + C.reset);
 }

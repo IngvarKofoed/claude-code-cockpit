@@ -186,7 +186,7 @@ function fmtCost(n) {
   if (typeof n !== "number" || !Number.isFinite(n)) return "—";
   const cur = (App.cfg && App.cfg.cost && App.cfg.cost.currency) || "USD";
   const sym = CURRENCY_SYM[cur];
-  const s = ZERO_DECIMAL_CUR.has(cur) ? String(Math.round(n)) : n >= 1 ? n.toFixed(2) : n.toFixed(3);
+  const s = ZERO_DECIMAL_CUR.has(cur) ? String(Math.round(n)) : n.toFixed(2);
   return sym ? sym + s : s + " " + cur;
 }
 

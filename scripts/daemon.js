@@ -968,7 +968,7 @@ function sessionsFileList() {
 // NOT stored here — it's computed fresh per request so a pricing-config change is reflected
 // without invalidating the cache. Every file yields a row: an unreadable/unparseable
 // transcript degrades to tokens:null — marked UNAVAILABLE in the UI, never a misleading
-// 0/$0.000 (the documented graceful-degradation rule) — with a dir-name repo fallback.
+// 0/$0.00 (the documented graceful-degradation rule) — with a dir-name repo fallback.
 async function sessionMeta(tpath, proj) {
   let content;
   try {
