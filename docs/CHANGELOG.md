@@ -1530,3 +1530,8 @@ Each entry is numbered with a monotonically increasing integer. Append new entri
      Sub-$1 values previously showed three ("$0.042"), so a column mixed two- and three-decimal
      figures and the statusline read to the tenth of a cent; a flat 2 keeps the column aligned.
      Zero-decimal currencies (JPY etc.) are unchanged — they never carried fractional digits.
+
+208. Released v0.52.0, carrying entry 207. Bumped per entry 103 — the plugin cache is keyed by
+     version and `ensure.js` only replaces a running daemon when `/health` reports a DIFFERENT
+     one, so a UI-only change still needs the bump to reach anyone. `marketplace.json` stays at
+     0.2.0, unmaintained, so it is left alone.
