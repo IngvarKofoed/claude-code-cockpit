@@ -23,7 +23,7 @@ A single, always-available dashboard — *the cockpit* — that answers at a gla
 
 - **What's running right now**, where, and for how long (a live ticking timer per active prompt).
 - **What each session is currently doing** — the current tool/activity, or that it is idle or blocked.
-- **Which sessions are waiting for me**, surfaced first so nothing stalls unnoticed.
+- **Which sessions are waiting for me**, surfaced first so nothing stalls unnoticed — ahead of every other unpinned session. A card you have explicitly *pinned* still leads, since pinning is a deliberate statement about what you want to watch.
 - **What each repository has consumed** — active time, prompts, tokens (input / output / cache), and an estimated dollar cost — over today, this week, or all time.
 - **Trends over time** — tokens and time per day, activity by hour, top repositories.
 

@@ -20,7 +20,8 @@ const App = {
   liveSort: "status", // "status" (server waiting-first) | "name" (alpha) | "context" (fullest first); set from localStorage in init
   liveTitle: "repo", // what each Live card's head shows; see LIVE_TITLES / cardQualifier. Per-browser localStorage pref, set in init
   theme: "dark", // "dark" (default) | "light"; per-browser localStorage pref, set in init
-  liveShow: { title: true, branch: true, path: true, ctx: true, color: true }, // which optional Live-card rows to show (3 location lines + the context gauge + the /color dot); per-browser localStorage pref, set in init
+  liveShow: { title: true, branch: true, path: true, ctx: true, color: true, pin: true }, // which optional Live-card rows/controls to show (3 location lines + the context gauge + the /color dot + the card-head pin button); per-browser localStorage pref, set in init
+  livePins: new Set(), // pinned session ids — pinned cards lead the grid in EVERY sort mode; per-browser localStorage pref, set in init
   repoRows: [], // normalized rows currently shown in the per-repo table
   repoSort: { key: "activeMs", dir: -1 }, // dir: 1 asc, -1 desc
   sessionsPage: 0, // current 0-based page of the Sessions view
@@ -417,6 +418,15 @@ const TITLE_SVG =
   '<path d="M7.4 2.2H3.2a1 1 0 0 0-1 1v4.2a1 1 0 0 0 .3.7l6.1 6.1a1 1 0 0 0 1.4 0l4.2-4.2a1 1 0 0 0 0-1.4L8.1 2.5a1 1 0 0 0-.7-.3Z"/>' +
   '<circle cx="5" cy="5" r="1"/></svg>';
 
+// The card-head pin glyph: a pushpin whose HEAD is a closed path, so the pinned state is
+// carried by filling it (.pin-btn--on) rather than by a colour — the status palette is
+// wholly spent on the rail/badge semaphore and the accent blue now reads as a meter level,
+// so a hue here would claim a meaning the dashboard has already assigned.
+const PIN_SVG =
+  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round">' +
+  '<path class="pin-glyph" d="M5.5 2.5h5l-1 3.5 2 2v1h-7v-1l2-2z"/>' +
+  '<path d="M8 9.5v4"/></svg>';
+
 const STATUS_LABEL = {
   running: "Running",
   waiting: "Waiting",
@@ -703,6 +713,18 @@ function cardHTML(s) {
     show.color && typeof s.color === "string" && s.color
       ? `<span class="card__dot" data-color="${esc(s.color)}" title="Session colour: ${esc(s.color)}"></span>`
       : "";
+  // The pin toggle sits between the head's title and the CONDITIONAL focus button, so the
+  // always-present control keeps a stable position and the optional one follows it. Its own
+  // show.pin switch can hide it; hiding it does NOT clear existing pins (they keep leading
+  // the grid) — the Settings description says so rather than leaving it a surprise.
+  // The accessible NAME is a static aria-label (like .focus-btn's), not the title: `title` is
+  // the last resort in the accname algorithm and some screen readers skip it, which on an
+  // icon-only button leaves "pressed, button" with no name at all. aria-pressed carries the
+  // state, so the name stays constant while only the hover title flips Pin/Unpin.
+  const isPinned = App.livePins.has(s.sessionId);
+  const pinBtn = show.pin
+    ? `<button class="pin-btn${isPinned ? " pin-btn--on" : ""}" type="button" data-pin-session="${esc(s.sessionId)}" aria-pressed="${isPinned}" aria-label="Pin session" title="${isPinned ? "Unpin" : "Pin"} this session — pinned cards sort first">${PIN_SVG}</button>`
+    : "";
   const title = show.title
     ? `<div class="card__title"${s.title ? ` title="${esc(s.title)}"` : ""}>${dot}${TITLE_SVG}<span>${s.title ? esc(s.title) : ""}</span></div>`
     : "";
@@ -721,6 +743,7 @@ function cardHTML(s) {
     <div class="card__body">
       <div class="card__head">
         ${headTitleHTML(s)}
+        ${pinBtn}
         ${s.focusable ? `<button class="focus-btn" type="button" data-focus-session="${esc(s.sessionId)}" title="Bring this session's terminal window to the front" aria-label="Focus terminal">${TERMINAL_SVG}</button>` : ""}
         <span class="badge">${esc(STATUS_LABEL[status] || status)}</span>
       </div>
@@ -1558,12 +1581,28 @@ function renderLive() {
       return String(a.sessionId || "").localeCompare(String(b.sessionId || ""));
     });
   }
+  // Pinned cards lead, each group still in the order the selected sort produced (a two-bucket
+  // pass over an already-ordered list, so relative order inside each group is untouched).
+  // Skipped entirely when nothing is pinned, so "status" keeps rendering the daemon's
+  // compareCards order verbatim rather than becoming a client-sorted mode by default.
+  // DELIBERATE: running last and unconditionally, this puts a pinned card ahead of a WAITING
+  // one — overriding aggregate.statusRank's waiting-first rule. See docs/specs/
+  // 2026-09-09-live-card-pinning.md; CONCEPT/ARCHITECTURE are amended to match.
+  if (App.livePins.size) {
+    const pinned = [];
+    const rest = [];
+    for (const s of ordered) (App.livePins.has(s.sessionId) ? pinned : rest).push(s);
+    ordered = pinned.concat(rest);
+  }
   cards.innerHTML = ordered.map(cardHTML).join("");
   cards.querySelectorAll(".path").forEach((btn) =>
     btn.addEventListener("click", () => copyPath(btn.dataset.path))
   );
   cards.querySelectorAll(".focus-btn").forEach((btn) =>
     btn.addEventListener("click", () => focusTerminal(btn.dataset.focusSession))
+  );
+  cards.querySelectorAll(".pin-btn").forEach((btn) =>
+    btn.addEventListener("click", () => toggleLivePin(btn.dataset.pinSession))
   );
   collectTimers();
   tick(); // paint timers immediately rather than waiting up to a second
@@ -1646,6 +1685,51 @@ function setLiveShow(key, on) {
   App.liveShow[key] = !!on;
   persistPref("cockpit.liveShow", JSON.stringify(App.liveShow));
   renderLive();
+}
+
+// A pinned session card leads the Live grid. Per-browser (localStorage), NOT daemon config,
+// so it never PUTs and never pops a "Settings saved" toast — the same footing as the sort
+// mode it modifies. Re-renders immediately, like setLiveSort / setLiveShow.
+const MAX_PINS = 50;
+
+function toggleLivePin(sessionId) {
+  if (!sessionId) return;
+  if (App.livePins.has(sessionId)) App.livePins.delete(sessionId);
+  else {
+    App.livePins.add(sessionId);
+    evictIfOver();
+  }
+  persistPref("cockpit.livePins", JSON.stringify([...App.livePins]));
+  renderLive();
+  // renderLive() replaces cards.innerHTML wholesale, destroying the very button that was just
+  // activated — so keyboard focus would fall back to <body> and a user could neither toggle the
+  // same pin twice nor tab on from where they were. Unlike .focus-btn (whose click only fires a
+  // POST), this control's own action rebuilds the grid it lives in, so it has to put focus back.
+  // preventScroll: a pinned card jumps to the top of the grid, and scrolling the page to follow
+  // it would yank a mouse user who was reading further down.
+  const btn = [...$("cards").querySelectorAll(".pin-btn")].find(
+    (b) => b.dataset.pinSession === sessionId
+  );
+  if (btn) btn.focus({ preventScroll: true });
+}
+
+// Bound storage while shedding a DEAD id rather than a card the user can see: evict the oldest
+// id whose session is not currently live. The fallback — the plain oldest, when all MAX_PINS are
+// live — does unpin a visible card, which is accepted rather than prevented: it needs 50
+// concurrently live pinned sessions, far outside any working set, and the alternative (refusing
+// the new pin) would silently ignore a click. This is eviction ORDER, not pruning — nothing is
+// dropped while under the cap, so a pin still re-applies to a session resumed later (--resume
+// reuses the session_id).
+function evictIfOver() {
+  if (App.livePins.size <= MAX_PINS) return;
+  const live = new Set(((App.state && App.state.sessions) || []).map((x) => x.sessionId));
+  for (const id of App.livePins) {
+    // Set iteration is insertion-ordered (oldest first); deleting the CURRENT element
+    // mid-iteration is well-defined and does not skip the next one.
+    if (App.livePins.size <= MAX_PINS) break;
+    if (!live.has(id)) App.livePins.delete(id);
+  }
+  while (App.livePins.size > MAX_PINS) App.livePins.delete(App.livePins.values().next().value);
 }
 
 // Theme is a per-browser preference (localStorage), NOT daemon config — never PUT it (a config
@@ -2627,6 +2711,11 @@ function settingsHTML(cfg) {
         sw("set-show-ctx", App.liveShow.ctx)
       ) +
       fieldRow(
+        "Show pin button",
+        "Pin control in each live card's head — pinned cards lead the grid. Hiding it keeps existing pins active (this browser only)",
+        sw("set-show-pin", App.liveShow.pin)
+      ) +
+      fieldRow(
         "Card title",
         "What each live card's heading shows (this browser only)",
         `<select class="select" id="set-liveTitle">
@@ -3048,10 +3137,22 @@ function init() {
         path: v.path !== false,
         ctx: v.ctx !== false,
         color: v.color !== false,
+        pin: v.pin !== false,
       };
     }
   } catch (_e) {
     /* malformed stored value — keep all lines shown */
+  }
+
+  // Per-browser pinned session ids. A malformed/absent value leaves the empty default, the
+  // same guard shape as liveShow above. Stored as a JSON array in insertion order (oldest
+  // first) so evictIfOver can reach the oldest without a separate timestamp.
+  try {
+    const raw = loadPref("cockpit.livePins");
+    const v = raw ? JSON.parse(raw) : null;
+    if (Array.isArray(v)) App.livePins = new Set(v.filter((x) => typeof x === "string"));
+  } catch (_e) {
+    /* malformed stored value — keep the empty set */
   }
 
   $("nav").addEventListener("click", (e) => {

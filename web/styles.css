@@ -844,6 +844,37 @@ body {
 .focus-btn svg { width: 14px; height: 14px; opacity: 0.75; }
 .focus-btn:hover { background: var(--surface-2); color: var(--ink); }
 .focus-btn:hover svg { opacity: 1; }
+/* The card-head pin toggle. Deliberately identical in shape and weight to .focus-btn above —
+   both are card-level affordances in the head's left cluster (.badge carries margin-left:auto,
+   so it stays pushed right). `flex: none` keeps it out of the title's squeeze: .card__repo
+   absorbs the width instead, and its qualifier ellipsizes first, per the rule below it. The
+   `margin-left: -4px` is .focus-btn's and must match: it trims the head's 10px flex gap to an
+   optical 6px, so dropping it here would sit the pin 4px further from the repo name than the
+   focus button it precedes — the two would read as unevenly spaced rather than one cluster. */
+.pin-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--ink-2);
+  padding: 3px;
+  margin-left: -4px;
+  border-radius: 6px;
+  cursor: pointer;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+}
+.pin-btn svg { width: 14px; height: 14px; opacity: 0.75; }
+.pin-btn:hover { background: var(--surface-2); color: var(--ink); }
+.pin-btn:hover svg { opacity: 1; }
+/* Pinned reads as FILL, never as a hue: the status palette is wholly spent on the rail and
+   badge, and the accent blue now reads as a meter level (context gauge / usage bars), so a
+   coloured pin would claim a meaning already assigned. Full-strength ink + a solid head is
+   legible at rest, which is what lets a pinned card be told apart from one that merely
+   sorted to the top. */
+.pin-btn--on { color: var(--ink); }
+.pin-btn--on svg { opacity: 1; }
+.pin-btn--on .pin-glyph { fill: currentColor; }
 
 .card__activity {
   display: flex;
