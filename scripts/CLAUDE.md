@@ -2,7 +2,7 @@
 
 The Node.js side of the plugin. Refer to `docs/ARCHITECTURE.md` for the broader context.
 
-Contents: `emit.js` (hook entry — parse stdin, append event, ping daemon, exit 0), `ensure.js` / `ensure-deps.js` (SessionStart: idempotent deps + spawn the daemon), `daemon.js` (the always-on server: aggregate + HTTP + SSE + notify), the pure core modules `aggregate.js` / `transcript.js` / `repo.js` / `pricing.js`, plus `notify.js`, `config.js`, `paths.js`, and `*.test.js`.
+Contents, by role: **hook entry points** `emit.js` (parse stdin, append event, ping daemon, exit 0), `gate.js` (the blocking pause gate), `ensure.js` / `ensure-deps.js` (SessionStart: idempotent deps + spawn the daemon); the always-on server `daemon.js` (aggregate + HTTP + SSE + notify); the **pure, unit-testable core** `aggregate.js` (events → session state + rollups), `transcript.js` (transcript → token usage), `repo.js` (cwd → git root / name / branch), `pricing.js` (tokens + model → cost), `usage.js` (rate-limit + context normalization, freshness guard), `pause.js` (gate + auto-pause decisions), `owner-pid.js` (hook pid → durable claude.exe pid); and the **I/O and platform** modules `notify.js`, `focus-terminal.js` (raise a session's terminal), `winproc.js` (shared Windows PowerShell runner + ancestor walk), `account.js` (`~/.claude.json` → the signed-in account), `event-log.js` (hook-side append + daemon nudge), `pause-cli.js`, `config.js`, `paths.js`, plus `*.test.js`.
 
 ## Required tools
 

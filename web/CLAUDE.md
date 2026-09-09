@@ -2,7 +2,7 @@
 
 The buildless browser dashboard served by the daemon over `127.0.0.1`. Refer to `docs/ARCHITECTURE.md` for the broader context.
 
-Contents: `index.html` (dashboard shell), `app.js` (loads `GET /api/state`, subscribes to the SSE stream, renders the live cards / per-repo table / Settings), `charts.js` (inline-SVG chart helpers), `styles.css`.
+Contents: `index.html` (dashboard shell), `app.js` (loads `GET /api/state`, subscribes to the SSE stream, renders the Live cards + ribbon and usage bars, the Repos table, the History charts, the Sessions list, and Settings), `charts.js` (inline-SVG chart helpers), `styles.css`.
 
 ## Required tools
 
