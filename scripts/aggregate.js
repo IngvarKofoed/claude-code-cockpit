@@ -1,5 +1,11 @@
 'use strict';
 
+// Pure -> pure, acyclic (pricing.js requires nothing): toCard needs the model
+// FAMILY for the client's chip tint, and pricing.js is where model-id string
+// surgery already lives. This does NOT import pricing's token class list — see
+// the USAGE_KEYS agreement test in pricing.test.js for why those stay separate.
+const pricing = require('./pricing');
+
 // Pure reducer over normalized event records (see CONTRACTS §0/§5): folds the
 // event stream into per-session live state, produces the /api/state snapshot,
 // and accumulates per-day per-repo rollups. No I/O, no throwing on bad input —
@@ -545,6 +551,12 @@ function toCard(s) {
   delete card.focusTarget;
   delete card.focusTitle;
   delete card.ownerPidVerified;
+  // The family the client tints the model chip by (config.modelColors -> --mc-*).
+  // Resolved server-side because it is unit-testable there and web/ has no test
+  // framework; the client maps family -> colour at render time, so changing a
+  // colour repaints from config alone and never touches this payload. null for an
+  // unknown/absent model, which renders the neutral chip.
+  card.modelFamily = pricing.modelFamily(s.model);
   return card;
 }
 

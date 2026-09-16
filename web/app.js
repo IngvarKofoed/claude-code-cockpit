@@ -216,6 +216,23 @@ function shortModel(m) {
   return String(m || "").replace(/^claude-/, "");
 }
 
+// The Live card's model-chip tint: the daemon ships a model FAMILY on the card,
+// config.modelColors maps it to a palette slot, and the slot names a --mc-* token.
+// MODEL_COLOR_SLOTS mirrors scripts/config.js — the browser bundle is an ES module
+// and cannot require the CommonJS file, so the two lists must change together.
+const MODEL_COLOR_SLOTS = ["rose", "magenta", "violet", "blue", "cyan", "teal", "amber", "orange", "none"];
+const MODEL_FAMILIES = ["opus", "sonnet", "haiku", "fable", "mythos"];
+
+// A family's slot, or null meaning "render today's neutral chip". Guarded on App.cfg
+// (null until the first state frame, like costEnabled) and on a MISSING entry, which
+// must read as `none`: a family present in MODEL_FAMILIES but absent from the config
+// map would otherwise emit var(--mc-undefined) and blank the chip's text.
+function modelChipSlot(family) {
+  if (!family || !App.cfg || !App.cfg.modelColorsEnabled) return null;
+  const slot = App.cfg.modelColors ? App.cfg.modelColors[family] : null;
+  return slot && slot !== "none" && MODEL_COLOR_SLOTS.includes(slot) ? slot : null;
+}
+
 // Tooltip for the card's model chip. With more than one model seen this session
 // (a mid-session /model switch), list them in first-seen order with the current
 // one marked; capped at 5 shown + "+N more". A single model → just its name.
@@ -664,8 +681,14 @@ function cardHTML(s) {
   if (s.effortLevel) chips.push(chip("effort: " + s.effortLevel));
   // The model chip shows the current model; its tooltip reveals every model this
   // session has used (marking the current one) when a /model switch has occurred.
-  if (s.model)
-    chips.push(`<span class="chip chip--mono" title="${esc(modelsTooltip(s))}">${esc(shortModel(s.model))}</span>`);
+  if (s.model) {
+    // Tinted by model family when configured; otherwise byte-identical to the chip
+    // this has always rendered — no class, no inline style.
+    const slot = modelChipSlot(s.modelFamily);
+    const cls = slot ? "chip chip--mono chip--model" : "chip chip--mono";
+    const style = slot ? ` style="--model-c: var(--mc-${slot})"` : "";
+    chips.push(`<span class="${cls}"${style} title="${esc(modelsTooltip(s))}">${esc(shortModel(s.model))}</span>`);
+  }
 
   const sa = s.subagents || {};
   // Column order: Tokens | Cost | Chats | Tools | Agents | Active. Cost drops out when
@@ -3142,6 +3165,41 @@ function section(title, hint, inner) {
   return `<section class="card-section"><h3>${esc(title)}</h3>${hint ? `<p class="hint">${esc(hint)}</p>` : ""}${inner}</section>`;
 }
 
+// One row per model family: a label, a slot <select>, and a LIVE PREVIEW chip in the
+// real .chip--model markup. The preview is what makes "border and text, not fill"
+// legible in the setting itself, so it has to track the select immediately — see the
+// change handler, which repaints it inline rather than waiting for a re-render.
+function modelColourRowsHTML(assigned) {
+  const label = { opus: "Opus", sonnet: "Sonnet", haiku: "Haiku", fable: "Fable", mythos: "Mythos" };
+  const rows = MODEL_FAMILIES.map((fam) => {
+    const cur = MODEL_COLOR_SLOTS.includes(assigned[fam]) ? assigned[fam] : "none";
+    const opts = MODEL_COLOR_SLOTS.map(
+      (sl) => `<option value="${sl}" ${cur === sl ? "selected" : ""}>${sl === "none" ? "No colour" : sl[0].toUpperCase() + sl.slice(1)}</option>`
+    ).join("");
+    const tinted = cur !== "none";
+    return (
+      `<div class="mcrow">` +
+      `<span class="mcrow__name">${esc(label[fam] || fam)}</span>` +
+      `<select class="select mc-slot" id="set-mc-${fam}" data-family="${fam}">${opts}</select>` +
+      `<span class="chip chip--mono${tinted ? " chip--model" : ""}" id="mc-preview-${fam}"` +
+      `${tinted ? ` style="--model-c: var(--mc-${cur})"` : ""}>${esc(fam)}</span>` +
+      `</div>`
+    );
+  }).join("");
+  return `<div class="mcrows">${rows}</div>`;
+}
+
+// Repaint one family's preview chip to a slot, matching what cardHTML renders.
+// Tolerates a missing node (the section may not be on screen).
+function paintModelColourPreview(family, slot) {
+  const el = $("mc-preview-" + family);
+  if (!el) return;
+  const tinted = slot && slot !== "none" && MODEL_COLOR_SLOTS.includes(slot);
+  el.classList.toggle("chip--model", !!tinted);
+  if (tinted) el.style.setProperty("--model-c", `var(--mc-${slot})`);
+  else el.style.removeProperty("--model-c");
+}
+
 function rateRowHTML(model, r) {
   r = r || {};
   return `<tr>
@@ -3288,6 +3346,22 @@ function settingsHTML(cfg) {
       )
   );
 
+  const modelColours = section(
+    "Model colours",
+    "Tint each live card's model chip by model family — border and text only, never a fill. Shared by every browser pointed at this daemon.",
+    fieldRow(
+      "Colour model chips",
+      "Master switch. Turning it off keeps the assignment below, so switching back on restores it.",
+      sw("set-modelColorsEnabled", cfg.modelColorsEnabled)
+    ) +
+      fieldRow(
+        "Family colours",
+        "Eight hues, tuned to this theme and to stay legible as small text in both light and dark. There is no green: it would read as the running status. A few sit near a status colour, so pick by what you can tell apart on your own cards.",
+        modelColourRowsHTML(cfg.modelColors || {}),
+        true
+      )
+  );
+
   const behavior = section(
     "Thresholds",
     null,
@@ -3328,7 +3402,7 @@ function settingsHTML(cfg) {
       ratesTableHTML(cost.rates)
   );
 
-  return notifications + dashboard + behavior + costSection + data;
+  return notifications + dashboard + modelColours + behavior + costSection + data;
 }
 
 function renderSettings() {
@@ -3350,6 +3424,22 @@ function maybeRenderSettings() {
   const host = $("settings");
   if (host && host.contains(document.activeElement)) return;
   renderSettings();
+}
+
+// Read the family->slot map back off the pickers. It STARTS from the live config map so a
+// key this bundle doesn't know — a family the daemon added after this page was cached, or a
+// slot added to MODEL_COLOR_SLOTS since — passes through untouched. That matters because the
+// PUT carries the whole config and validateConfig rebuilds from DEFAULT_CONFIG: a key omitted
+// here is not "left alone", it is reset to its default, which would silently undo a
+// hand-edited config.json. Only a family with a rendered row is overwritten.
+function readModelColoursForm() {
+  const out = Object.assign({}, (App.cfg && App.cfg.modelColors) || {});
+  for (const fam of MODEL_FAMILIES) {
+    const el = $("set-mc-" + fam);
+    if (!el) continue; // row not rendered — keep the live value rather than forcing "none"
+    out[fam] = MODEL_COLOR_SLOTS.includes(el.value) ? el.value : "none";
+  }
+  return out;
 }
 
 function readSettingsForm() {
@@ -3387,6 +3477,10 @@ function readSettingsForm() {
     activityDetail: $("set-activityDetail").value,
     usagePace: $("set-usagePace").value,
     pauseGateEnabled: cb("set-pauseGateEnabled"),
+    // Both keys MUST be sent: this posts the full config and validateConfig rebuilds
+    // from defaults, so omitting one resets it on the next save of anything else.
+    modelColorsEnabled: cb("set-modelColorsEnabled"),
+    modelColors: readModelColoursForm(),
     autoPauseFiveHourPct: nv("set-autoPauseFiveHourPct", 0),
     autoPauseWeeklyPct: nv("set-autoPauseWeeklyPct", 0),
     subscriptionLabelPattern: $("set-subscriptionLabelPattern").value,
@@ -3751,6 +3845,16 @@ function init() {
     // Ditto the stat-column checkboxes.
     if (e.target.id && e.target.id.startsWith("set-stat-")) {
       setLiveStat(e.target.id.slice("set-stat-".length), e.target.checked);
+      return;
+    }
+    // A model-colour picker DOES save (it is daemon config), but its preview chip has
+    // to be repainted here and now. saveSettings() never re-renders Settings, and the
+    // SSE config frame's maybeRenderSettings() bails while focus is inside the form —
+    // and after a mouse change the <select> still holds it. Without this the preview
+    // would sit stale until the user clicked away AND another frame arrived.
+    if (e.target.classList && e.target.classList.contains("mc-slot")) {
+      paintModelColourPreview(e.target.dataset.family, e.target.value);
+      scheduleSave();
       return;
     }
     // The Data section (store size + cleanup) isn't part of the config, so its inputs

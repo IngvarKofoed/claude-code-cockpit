@@ -14,6 +14,14 @@ const paths = require('./paths');
 // already persisted the old value, and add the matching migration below.
 const CONFIG_VERSION = 3;
 
+// The palette slots a modelColors value may take. Mirrors the --mc-* tokens in
+// web/styles.css (and MODEL_COLOR_SLOTS in web/app.js — the browser bundle is an ES
+// module and cannot require this file, so the two lists change together). 'none' is
+// the neutral chip. Ordered around the colour wheel, so neighbouring names are also
+// neighbouring hues in the picker. There is deliberately NO green: at dE 3.5 from
+// --st-running it would read as the running indicator.
+const MODEL_COLOR_SLOTS = ['rose', 'magenta', 'violet', 'blue', 'cyan', 'teal', 'amber', 'orange', 'none'];
+
 const DEFAULT_CONFIG = {
   configVersion: CONFIG_VERSION,
   port: 4319,
@@ -44,6 +52,23 @@ const DEFAULT_CONFIG = {
   pauseGateEnabled: true,
   autoPauseFiveHourPct: 90,
   autoPauseWeeklyPct: 0,
+  // Live-card model-chip tint. modelColors maps a model FAMILY (pricing.MODEL_FAMILIES)
+  // to one of the MODEL_COLOR_SLOTS above; 'none' renders today's neutral chip. The palette
+  // is eight hues wide, generated at the theme's own measured colour character so it sits
+  // with the rest of the instrument tokens, and every slot clears 4.5:1 as 11px text on
+  // --surface-2 in BOTH themes (the hue IS the chip's text colour). There is deliberately no
+  // green — it would read as --st-running. Defaults cover the three families run side by
+  // side; fable/mythos ship 'none'.
+  // Unlike cost.rates (which REPLACES the default map), this merges per key like events,
+  // so a config saved before this key existed comes up with the defaults, not empty.
+  modelColorsEnabled: true,
+  modelColors: {
+    opus: 'magenta',
+    sonnet: 'teal',
+    haiku: 'orange',
+    fable: 'none',
+    mythos: 'none',
+  },
   cost: {
     enabled: true,
     currency: 'USD',
@@ -246,7 +271,7 @@ function validateConfig(input) {
     else cfg.port = p;
   }
 
-  for (const key of ['osNotifications', 'sound', 'browserSounds', 'pauseGateEnabled']) {
+  for (const key of ['osNotifications', 'sound', 'browserSounds', 'pauseGateEnabled', 'modelColorsEnabled']) {
     if (key in input) {
       const b = toBool(input[key]);
       if (b === null) errors.push(`${key} must be a boolean`);
@@ -318,6 +343,24 @@ function validateConfig(input) {
       const n = toNum(input[key]);
       if (n === null) errors.push(`${key} must be a number`);
       else cfg[key] = Math.min(100, clampMin(n, 0));
+    }
+  }
+
+  // Per-key merge onto the defaults (the events precedent), NOT a wholesale replace:
+  // an unknown family key is ignored rather than rejected, so a future family can be
+  // added to pricing.MODEL_FAMILIES without an older config failing validation. A bad
+  // VALUE is an error, following activityDetail — validateConfig's caller leaves the
+  // on-disk config untouched on a failed PUT.
+  if ('modelColors' in input) {
+    if (!isPlainObject(input.modelColors)) {
+      errors.push('modelColors must be an object');
+    } else {
+      for (const family of Object.keys(DEFAULT_CONFIG.modelColors)) {
+        if (!(family in input.modelColors)) continue;
+        const slot = input.modelColors[family];
+        if (MODEL_COLOR_SLOTS.includes(slot)) cfg.modelColors[family] = slot;
+        else errors.push(`modelColors.${family} must be one of ${MODEL_COLOR_SLOTS.join(', ')}`);
+      }
     }
   }
 

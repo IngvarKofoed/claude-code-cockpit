@@ -403,3 +403,51 @@ test('validateConfig: cacheWrite1h survives validation; absent stays absent (fal
   assert.ok(without.valid);
   assert.strictEqual('cacheWrite1h' in without.config.cost.rates.m, false);
 });
+
+// ---- modelColors -------------------------------------------------------------
+
+test('modelColors: defaults ship, and an absent key MERGES them (not cost.rates semantics)', () => {
+  // The whole point of merging like `events` rather than replacing like cost.rates:
+  // a config persisted before this key existed must come up fully coloured, not blank.
+  const { config } = validateConfig({ port: 4319 });
+  assert.strictEqual(config.modelColorsEnabled, true);
+  assert.deepStrictEqual(config.modelColors, {
+    opus: 'magenta', sonnet: 'teal', haiku: 'orange', fable: 'none', mythos: 'none',
+  });
+});
+
+test('modelColors: a partial map keeps the defaults for the families it omits', () => {
+  const { valid, config } = validateConfig({ modelColors: { opus: 'teal' } });
+  assert.strictEqual(valid, true);
+  assert.strictEqual(config.modelColors.opus, 'teal');
+  assert.strictEqual(config.modelColors.sonnet, 'teal'); // untouched default
+  assert.strictEqual(config.modelColors.haiku, 'orange');
+});
+
+test('modelColors: an UNKNOWN family key is ignored, never an error', () => {
+  // So a family added to pricing.MODEL_FAMILIES later cannot make an older config
+  // fail validation (and a hand-typo doesn't reject the whole PUT).
+  const { valid, config } = validateConfig({ modelColors: { opus: 'teal', sonnetx: 'orange' } });
+  assert.strictEqual(valid, true);
+  assert.ok(!('sonnetx' in config.modelColors));
+});
+
+test('modelColors: a bad VALUE is an error, so the PUT leaves config.json untouched', () => {
+  const { valid, errors } = validateConfig({ modelColors: { opus: 'chartreuse' } });
+  assert.strictEqual(valid, false);
+  assert.ok(errors.some((e) => e.includes('modelColors.opus')));
+});
+
+test('modelColors: a non-object is rejected, and modelColorsEnabled coerces like a boolean', () => {
+  assert.strictEqual(validateConfig({ modelColors: 'teal' }).valid, false);
+  assert.strictEqual(validateConfig({ modelColorsEnabled: false }).config.modelColorsEnabled, false);
+  assert.strictEqual(validateConfig({ modelColorsEnabled: 'yes' }).valid, false);
+});
+
+test('modelColors: every default family has a slot, so the renderer never sees undefined', () => {
+  // A family in MODEL_FAMILIES but missing from the default map would render
+  // var(--mc-undefined) unless the client treats it as 'none' — keep them in step.
+  const { MODEL_FAMILIES } = require('./pricing');
+  const keys = Object.keys(DEFAULT_CONFIG.modelColors).sort();
+  assert.deepStrictEqual(keys, [...MODEL_FAMILIES].sort());
+});

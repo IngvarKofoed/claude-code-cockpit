@@ -49,6 +49,28 @@ function baseModelId(model) {
   return out || model; // an id that is ONLY a suffix keeps its original form
 }
 
+// The model families the dashboard can tint a chip by (see web/styles.css's --mc-*
+// tokens and config.modelColors). A closed set on purpose; the slot a family maps to
+// is config, so a family added here without an assignment simply renders the neutral
+// chip. Keep it in step with DEFAULT_CONFIG.modelColors — a config.test.js assertion
+// enforces that, because a family with no default slot would render var(--mc-undefined).
+const MODEL_FAMILIES = ['opus', 'sonnet', 'haiku', 'fable', 'mythos'];
+
+// The family token's POSITION varies by id generation: "claude-opus-5" carries it
+// second, "claude-3-5-haiku" last. So scan the segments for the first known family
+// rather than indexing a fixed one. baseModelId first, so a "[1m]" variant and a
+// dated snapshot resolve like their base id. Returns null for an id with no known
+// family — a model Claude Code ships before the cockpit knows it must render as
+// today's neutral chip, never as some other family's colour.
+function modelFamily(model) {
+  if (typeof model !== 'string') return null;
+  const parts = baseModelId(model).split('-');
+  for (const p of parts) {
+    if (MODEL_FAMILIES.includes(p)) return p;
+  }
+  return null;
+}
+
 // Resolve a model's rate, falling back to its base id when the exact variant
 // has none: Opus 4.7+ and Sonnet 5 ship 1M context at standard pricing, so a
 // "[1m]" variant bills at the base rate rather than showing as unpriced. An
@@ -138,6 +160,8 @@ module.exports = {
   costByClass,
   estimateCost,
   baseModelId,
+  modelFamily,
+  MODEL_FAMILIES,
   resolveRate,
   TOKEN_KEYS,
   USAGE_KEYS,

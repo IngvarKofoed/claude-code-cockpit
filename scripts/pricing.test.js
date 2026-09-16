@@ -2,7 +2,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { costForModel, costByClass, estimateCost, baseModelId } = require('./pricing');
+const { costForModel, costByClass, estimateCost, baseModelId, modelFamily, MODEL_FAMILIES } = require('./pricing');
 
 // Float-tolerant comparison for money math.
 function approx(actual, expected, msg) {
@@ -205,9 +205,44 @@ test('USAGE_KEYS is TOKEN_KEYS plus cacheWrite1h, and every module agrees on it'
   const { USAGE_KEYS, TOKEN_KEYS } = require('./pricing');
   assert.deepStrictEqual(USAGE_KEYS, [...TOKEN_KEYS, 'cacheWrite1h']);
   // The pure modules keep their own copies of the class list (they don't import
-  // pricing); if one drifts, tokens silently stop being counted somewhere.
+  // pricing's USAGE_KEYS, even where they require pricing for something else);
+  // if one drifts, tokens silently stop being counted somewhere.
   const fromTranscript = Object.keys(require('./transcript').__testEmptyTokens());
   const fromAggregate = Object.keys(require('./aggregate').__testEmptyTokens());
   assert.deepStrictEqual(fromTranscript.sort(), [...USAGE_KEYS].sort());
   assert.deepStrictEqual(fromAggregate.sort(), [...USAGE_KEYS].sort());
+});
+
+// ---- modelFamily -------------------------------------------------------------
+// Feeds the Live card's model-chip tint (config.modelColors -> --mc-* tokens).
+
+test('modelFamily: plain ids, and both suffix forms via baseModelId', () => {
+  assert.strictEqual(modelFamily('claude-opus-5'), 'opus');
+  assert.strictEqual(modelFamily('claude-sonnet-4-0'), 'sonnet');
+  assert.strictEqual(modelFamily('claude-opus-5[1m]'), 'opus');            // context variant
+  assert.strictEqual(modelFamily('claude-haiku-4-5-20251001'), 'haiku');   // dated snapshot
+});
+
+test('modelFamily: finds the family wherever it sits in the id', () => {
+  // claude-3-5-haiku puts the family LAST, unlike every current id — the reason
+  // this scans segments instead of indexing a fixed position.
+  assert.strictEqual(modelFamily('claude-3-5-haiku'), 'haiku');
+});
+
+test('modelFamily: an unknown or unusable id is null, never a guess', () => {
+  // A model Claude Code ships before the cockpit knows it must fall back to the
+  // neutral chip, not borrow another family's colour.
+  assert.strictEqual(modelFamily('claude-newthing-1'), null);
+  assert.strictEqual(modelFamily(''), null);
+  assert.strictEqual(modelFamily(null), null);
+  assert.strictEqual(modelFamily(undefined), null);
+  assert.strictEqual(modelFamily(42), null);
+});
+
+test('modelFamily: every default rate id resolves to a known family', () => {
+  // If a shipped rate id stopped resolving, its chip would silently go neutral.
+  const ids = Object.keys(require('./config').DEFAULT_CONFIG.cost.rates);
+  const unresolved = ids.filter((m) => modelFamily(m) === null);
+  assert.deepStrictEqual(unresolved, []);
+  for (const m of ids) assert.ok(MODEL_FAMILIES.includes(modelFamily(m)));
 });

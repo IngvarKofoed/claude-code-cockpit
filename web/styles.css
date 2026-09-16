@@ -41,6 +41,26 @@
   --sc-pink: #f06ec2;
   --sc-cyan: #3fc7d4;
 
+  /* Model-family chip palette (--mc-*) for the Live card's model chip: BORDER + TEXT
+     only, never a fill. Generated AT THE HOUSE COLOUR CHARACTER measured from the
+     existing status/series/session tokens (dark L~0.69, C~0.156) so the chips sit in
+     the same visual family as the rest of the instrument theme, rather than at max
+     chroma, which came out neon. Hard requirement, since the hue IS the text colour:
+     every slot clears 4.5:1 on --surface-2 in BOTH themes (dark min 5.39).
+     Deliberately NO green slot — at dE 3.5 from --st-running it would read as the
+     running indicator, which is the loudest and most frequent status on the card.
+     Adjacent wheel neighbours (rose/magenta, cyan/teal) sit at dE 6-8; acceptable
+     because this is a PICKER the user assigns by hand, not an auto-assigned chart
+     series, and the chip always spells out the model name as a permanent label. */
+  --mc-rose: #e06fa9;
+  --mc-magenta: #c778d4;
+  --mc-violet: #9f87f2;
+  --mc-blue: #5b9bfa;
+  --mc-cyan: #00adce;
+  --mc-teal: #00b5a2;
+  --mc-amber: #ca9000;
+  --mc-orange: #e9754b;
+
   /* Chart tokens (validated dark categorical/sequential set) */
   --series-1: #3987e5;
   --series-2: #199e70;
@@ -102,6 +122,19 @@
   --sc-orange: #c2620f;
   --sc-pink: #c53a92;
   --sc-cyan: #0f7f8c;
+  /* Model-chip palette, own light steps (NOT an automatic flip) at the light house
+     character (L~0.58, C~0.162). Every slot clears 4.5:1 on the light --surface-2
+     #f1f3f7 (min 4.50). Cyan and teal carry lower chroma than the rest: both are
+     intrinsically light hues, so reaching text contrast on a light surface costs
+     saturation. */
+  --mc-rose: #b94383;
+  --mc-magenta: #a04dad;
+  --mc-violet: #785ccb;
+  --mc-blue: #296dce;
+  --mc-cyan: #057a91;
+  --mc-teal: #007d70;
+  --mc-amber: #936700;
+  --mc-orange: #c04815;
   /* Chart categorical — dataviz-validated LIGHT steps of the same six hues. */
   --series-1: #2a78d6;
   --series-2: #1baf7a;
@@ -1169,6 +1202,18 @@ body {
 }
 .chip--mono { font-family: var(--font-mono); }
 
+/* Model-family tint: OUTLINE + TEXT only. The inherited --surface-2 background
+   deliberately stays — a filled chip would read as .chip--live's "work happening
+   now". --model-c is set inline per card from config.modelColors. Several slots sit
+   within dE ~5-8 of a status token (violet/--st-paused, orange/--st-error,
+   teal/--st-running, blue/--accent), so the separation from status is carried by
+   FORM (bordered mono text in the chips row vs. a filled rail and a badge with a
+   word in it), never by hue alone. */
+.chip--model {
+  color: var(--model-c);
+  border-color: var(--model-c);
+}
+
 /* Live in-flight pill (background tasks / workflow subagents running now). Reads as
    active work with the running-green accent + a pulsing leading dot, distinct from the
    muted cumulative "Agents" stat below. */
@@ -1189,6 +1234,15 @@ body {
   box-shadow: 0 0 0 0 rgba(51, 193, 122, 0.5);
   animation: pulse 1.6s infinite; /* shared green-ping keyframe (also .conn__dot / .spark) */
 }
+
+/* Model-colour picker rows (Settings > Model colours). One grid so the selects and
+   preview chips line up down the column regardless of family-name length. */
+.mcrows { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+.mcrow { display: grid; grid-template-columns: 80px minmax(0, 160px) auto; align-items: center; gap: 10px; }
+.mcrow__name { font-size: 13px; color: var(--ink-2); }
+/* The preview chip is a grid item, so it would blockify and stretch across the
+   remaining track — pin it to its intrinsic width so it looks like the real chip. */
+.mcrow .chip { justify-self: start; }
 
 /* ---------- Empty state ---------- */
 
