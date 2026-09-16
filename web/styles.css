@@ -67,6 +67,7 @@
   --heat-zero: #171d27;                  /* heatmap/calendar ramp: zero cell */
   --heat-lo: #1b3350;                    /* heatmap/calendar ramp: low end */
   --heat-hi: #5598e7;                    /* heatmap/calendar ramp: high end */
+  --group-bg: rgba(255, 255, 255, 0.022); /* live-card group box: a hair above the plane */
 }
 
 :root[data-theme="light"] {
@@ -121,6 +122,7 @@
   --heat-zero: #eef1f5;
   --heat-lo: #cde2fb;
   --heat-hi: #2a78d6;
+  --group-bg: rgba(11, 17, 30, 0.025);
 }
 /* The connection-lost banner's code chip: a dark chip only suited the dark theme. */
 :root[data-theme="light"] .banner code { background: rgba(0, 0, 0, 0.06); color: var(--ink); }
@@ -876,6 +878,206 @@ body {
 .pin-btn--on svg { opacity: 1; }
 .pin-btn--on .pin-glyph { fill: currentColor; }
 
+/* ---------- Live card groups ---------- */
+/* #cards IS the card grid (display:grid + auto-fill tracks above). While groups exist it drops
+   to block flow so the nested regions lay themselves out; with no groups the modifier is absent
+   and the element renders exactly as it did before groups existed. */
+.cards--grouped { display: block; }
+/* The ungrouped remainder, once #cards is no longer the grid itself — same track rule. */
+.cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(420px, 100%), 1fr));
+  gap: 12px;
+}
+
+/* One wrapping flex flow, so a VERTICAL group (one card track) and a HORIZONTAL one (a band)
+   sit side by side rather than each claiming a row. The bases carry .cards' documented 420px
+   card floor PLUS this box's own chrome (4px rail + 2×12px padding + 2×1px border = 30px), so a
+   grouped card is never narrower than an ungrouped one and the stat row holds. */
+.groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: flex-start;
+  margin-bottom: 16px;
+}
+.group {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  background: var(--group-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  overflow: hidden;
+}
+.group--v { flex: 0 1 min(438px, 100%); }
+.group--h { flex: 1 1 min(870px, 100%); }
+/* A VERTICAL group stacks cards that each carry their own left rail, so a group rail on the same
+   edge runs parallel to them — two colour bars a few px apart, competing to mean status. Turning
+   the box into a column moves its rail to the TOP edge, spanning the full width, where it reads as
+   the group's own header accent. A HORIZONTAL group keeps the left rail: only its first card's
+   rail is adjacent, and a bar across a wide band would read as a divider rather than a status.
+   Side effect, welcome: dropping the 4px left rail gives the stacked cards 4px more width. */
+.group--v { flex-direction: column; }
+.group--v .group__rail { width: auto; height: 4px; }
+
+/* The aggregate status, in the same visual language as .card__rail — deliberately redundant
+   with the status badges on the cards inside, so status is never colour-alone. Waiting and
+   error ALSO tint the box border (.group--alert); running takes the rail only, which is what
+   keeps the exceptional states louder than the ordinary one. No glow: that stays a card-level
+   cue, so a waiting card inside a waiting group reads as "box tinted, card lit". */
+.group__rail {
+  width: 4px;
+  flex: none;
+  background: var(--st-idle);
+}
+.group[data-status="running"] .group__rail { background: var(--st-running); }
+.group[data-status="waiting"] .group__rail { background: var(--st-waiting); }
+.group[data-status="error"] .group__rail { background: var(--st-error); }
+.group--alert { border-color: rgba(245, 177, 32, 0.55); }
+.group[data-status="error"].group--alert { border-color: rgba(226, 86, 79, 0.55); }
+
+.group__main {
+  flex: 1;
+  min-width: 0;
+  /* Side padding is deliberately tighter than the block padding. The box's chrome is pure
+     overhead against the card track inside it (4px rail + 2×6px padding + 2×1px border = 18px),
+     and at 12px a side it made a vertical group 450px wide — so three of them needed 1374px
+     against the 1356px content column and wrapped to two, where three plain cards fit. */
+  padding: 9px 6px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.group__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.group__cards { display: grid; gap: 12px; }
+.group--v .group__cards { grid-template-columns: minmax(0, 1fr); }
+.group--h .group__cards { grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); }
+
+/* Borderless until hovered or focused: the name is a label most of the time and an input only
+   when you reach for it, so the header stays quiet at rest. */
+.group__name {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  padding: 2px 6px;
+  margin-left: -6px;
+  border-radius: 5px;
+  min-width: 0;
+  flex: 0 1 auto;
+  text-overflow: ellipsis;
+}
+.group__name:hover { border-color: var(--border-strong); }
+.group__name:focus { border-color: var(--accent); background: var(--surface-1); outline: none; }
+.group__orient {
+  margin-left: auto;
+  flex: none;
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--surface-2);
+  border-radius: 6px;
+}
+.orient-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--ink-muted);
+  padding: 3px 5px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+}
+.orient-btn svg { width: 13px; height: 13px; }
+.orient-btn:hover { color: var(--ink-2); }
+.orient-btn[aria-pressed="true"] { background: var(--surface-3); color: var(--ink); }
+/* Same shape and weight as .pin-btn / .focus-btn — another card-level affordance, not a
+   destructive-looking one: deleting a group only ungroups its cards. */
+.group__del {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--ink-muted);
+  padding: 3px;
+  border-radius: 6px;
+  cursor: pointer;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+}
+.group__del svg { width: 14px; height: 14px; }
+.group__del:hover { background: var(--surface-2); color: var(--ink); }
+
+/* Section rule above the ungrouped remainder. */
+.lane {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 2px 0 9px;
+}
+.lane__label {
+  flex: none;
+  font-size: 11px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--ink-2);
+}
+.lane__count {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-muted);
+}
+.lane__rule { flex: 1; height: 1px; background: var(--border); }
+
+/* Group-picker additions to the shared .menu. Scoped to --pick so the repo table's single-item
+   menu keeps its own plain treatment. */
+.menu__label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-muted);
+  padding: 5px 10px 3px;
+}
+.menu__empty {
+  font-size: 12.5px;
+  color: var(--ink-muted);
+  padding: 4px 10px 6px;
+}
+.menu__sep {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 6px;
+}
+.menu__item--pick {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.menu__item--pick:disabled {
+  color: var(--ink-muted);
+  cursor: default;
+  background: transparent;
+}
+.menu__tick {
+  width: 12px;
+  flex: none;
+  display: inline-flex;
+  color: var(--accent);
+}
+.menu__tick svg { width: 12px; height: 12px; }
+
 .card__activity {
   display: flex;
   align-items: center;
@@ -1275,6 +1477,14 @@ body {
   padding: 11px 0;
   border-top: 1px solid var(--border);
 }
+/* A control too wide to share the row drops onto its own full-width line under the label,
+   so the description keeps the full column instead of wrapping into a narrow ribbon. */
+.field--stacked {
+  display: block;
+}
+.field--stacked .field__control {
+  margin-top: 8px;
+}
 .field:first-of-type { border-top: 0; }
 .field__label { flex: 1; min-width: 0; }
 .field__label b { display: block; font-weight: 550; font-size: 13.5px; }
@@ -1441,6 +1651,25 @@ body {
 .menu__item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .menu__item--danger { color: var(--danger-ink); }
 .menu__item--danger:hover { background: rgba(226, 86, 79, 0.15); color: var(--danger-ink); }
+
+/* Stat-column checkboxes in Settings — a wrapping row of small labelled boxes rather than six
+   more switch rows, which would dominate the Dashboard section. */
+.statbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--ink-2);
+  padding: 4px 9px;
+  margin: 0 6px 6px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  user-select: none;
+}
+.statbox:hover { border-color: var(--border-strong); color: var(--ink); }
+.statbox input { accent-color: var(--accent); margin: 0; cursor: pointer; }
+.statbox:has(input:checked) { color: var(--ink); border-color: var(--border-strong); }
 
 /* ---------- Confirm modal ---------- */
 

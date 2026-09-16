@@ -20,8 +20,11 @@ const App = {
   liveSort: "status", // "status" (server waiting-first) | "name" (alpha) | "context" (fullest first); set from localStorage in init
   liveTitle: "repo", // what each Live card's head shows; see LIVE_TITLES / cardQualifier. Per-browser localStorage pref, set in init
   theme: "dark", // "dark" (default) | "light"; per-browser localStorage pref, set in init
-  liveShow: { title: true, branch: true, path: true, ctx: true, color: true, pin: true }, // which optional Live-card rows/controls to show (3 location lines + the context gauge + the /color dot + the card-head pin button); per-browser localStorage pref, set in init
-  livePins: new Set(), // pinned session ids — pinned cards lead the grid in EVERY sort mode; per-browser localStorage pref, set in init
+  liveShow: { title: true, branch: true, path: true, ctx: true, color: true, pin: true, stats: true }, // which optional Live-card rows/controls to show (3 location lines + the context gauge + the /color dot + the card-head group button + the whole stats block, BOTH rows); per-browser localStorage pref, set in init
+  liveStats: { tokens: true, cost: true, chats: true, tools: true, agents: true, active: true }, // which stat COLUMNS each live card shows; hiding one takes its heading and both rows' cells; per-browser localStorage pref, set in init
+  liveGroups: [], // named card groups — [{ id, name, orient:"v"|"h", members:[{sid,pid,root}] }]; per-browser localStorage pref, set in init
+  groupAssign: null, // Map sessionId -> { group, idx } for the CURRENT render; cardHTML reads it
+  liveRenderPending: false, // a renderLive() deferred because the groups region held focus / an open menu
   repoRows: [], // normalized rows currently shown in the per-repo table
   repoSort: { key: "activeMs", dir: -1 }, // dir: 1 asc, -1 desc
   sessionsPage: 0, // current 0-based page of the Sessions view
@@ -427,6 +430,21 @@ const PIN_SVG =
   '<path class="pin-glyph" d="M5.5 2.5h5l-1 3.5 2 2v1h-7v-1l2-2z"/>' +
   '<path d="M8 9.5v4"/></svg>';
 
+// Group-header glyphs: two stacked tracks vs two side-by-side tracks — the axis a group grows
+// along, drawn as the shape it produces rather than as an arrow.
+const VERT_SVG =
+  '<svg viewBox="0 0 16 16" fill="currentColor"><rect x="3" y="2.5" width="10" height="4.6" rx="1.2"/>' +
+  '<rect x="3" y="8.9" width="10" height="4.6" rx="1.2"/></svg>';
+const HORZ_SVG =
+  '<svg viewBox="0 0 16 16" fill="currentColor"><rect x="2.5" y="3" width="4.6" height="10" rx="1.2"/>' +
+  '<rect x="8.9" y="3" width="4.6" height="10" rx="1.2"/></svg>';
+const CLOSE_SVG =
+  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">' +
+  '<path d="m4.5 4.5 7 7M11.5 4.5l-7 7"/></svg>';
+const TICK_SVG =
+  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" ' +
+  'stroke-linejoin="round"><path d="m3.5 8.4 3 3 6-6.8"/></svg>';
+
 const STATUS_LABEL = {
   running: "Running",
   waiting: "Waiting",
@@ -653,38 +671,54 @@ function cardHTML(s) {
   // Column order: Tokens | Cost | Chats | Tools | Agents | Active. Cost drops out when
   // disabled, shifting the rest left one column; the repo-total row below mirrors the
   // same order so the two rows stay aligned straight down.
-  const stats = [
-    `<div class="stat"><span class="stat__k">Tokens</span><span class="stat__v">${tokensTotal == null ? "—" : esc(fmtTokens(tokensTotal))}</span></div>`,
-  ];
-  if (costEnabled())
-    stats.push(`<div class="stat"><span class="stat__k">Cost</span><span class="stat__v">${esc(fmtCost(s.cost))}</span></div>`);
-  stats.push(`<div class="stat"><span class="stat__k">Chats</span><span class="stat__v">${num(s.promptCount)}</span></div>`);
-  // Tools (all tool invocations this session, incl. those inside subagents) and Agents
-  // (subagents spawned; tooltip breaks down by type + active count).
-  stats.push(`<div class="stat"><span class="stat__k">Tools</span><span class="stat__v">${num(s.toolCount)}</span></div>`);
-  stats.push(`<div class="stat" title="${esc(subagentsTitle(sa))}"><span class="stat__k">Agents</span><span class="stat__v">${num(sa.total)}</span></div>`);
-  // Active = this session's cumulative working time (sum of closed turns). Uses
-  // fmtDuration to match the Per-repo table and History, which render the same metric.
-  stats.push(`<div class="stat"><span class="stat__k">Active</span><span class="stat__v">${esc(fmtDuration(num(s.activeMs)))}</span></div>`);
-
-  // Repo-wide cumulative total (all sessions, all time), rendered as a second row
-  // that shares the stat grid's columns — prompts/tokens/cost each land under the
-  // matching per-session value so the two rows compare straight down. It carries no
-  // text label: the muted colour + the dashed divider mark it as the repo total; the
-  // tooltip explains it. Cells auto-flow in the same column order as the stats row.
   const rt = App.state && App.state.repoTotals && s.repoRoot ? App.state.repoTotals[s.repoRoot] : null;
   const repoTok = rt && rt.tokens != null ? sumTokens(rt.tokens) : null;
   const atTitle = "This repo's cumulative total across every session on record (all time), including backfilled sessions. Chats, active time, agents and tools come from live sessions only — backfilled history contributes tokens/cost but not those.";
-  const rtCells = [
-    `<span class="card__at-v" title="${atTitle}">${repoTok == null ? "—" : esc(fmtTokens(repoTok))}</span>`,
+
+  // ONE definition per column, carrying both rows' values — the per-session cell and the muted
+  // repo-total cell beneath it. Previously these were two parallel push sequences that had to be
+  // kept in the same order by hand; with columns now user-hideable, any drift would silently
+  // file a repo total under the wrong heading, so the two rows are derived from one list and
+  // cannot diverge. Order is the canonical one (ARCHITECTURE, "Canonical stat-column order"):
+  // Tokens | Cost | Chats | Tools | Agents | Active.
+  const cols = [
+    { key: "tokens", label: "Tokens",
+      v: tokensTotal == null ? "—" : esc(fmtTokens(tokensTotal)),
+      t: repoTok == null ? "—" : esc(fmtTokens(repoTok)) },
+    { key: "cost", label: "Cost", on: costEnabled(),
+      v: esc(fmtCost(s.cost)),
+      t: esc(fmtCost(rt ? rt.cost : null)) },
+    { key: "chats", label: "Chats",
+      v: num(s.promptCount),
+      t: rt && rt.prompts != null ? num(rt.prompts) : "—" },
+    // Tools = all tool invocations this session, incl. those inside subagents.
+    { key: "tools", label: "Tools",
+      v: num(s.toolCount),
+      t: rt && rt.tools != null ? num(rt.tools) : "—" },
+    // Agents = subagents spawned; the tooltip breaks down by type + active count.
+    { key: "agents", label: "Agents", title: subagentsTitle(sa),
+      v: num(sa.total),
+      t: rt && rt.subagents != null ? num(rt.subagents) : "—" },
+    // Active = cumulative working time. fmtDuration matches the Repos table and History,
+    // which render the same metric.
+    { key: "active", label: "Active",
+      v: esc(fmtDuration(num(s.activeMs))),
+      t: rt && rt.activeMs != null ? esc(fmtDuration(num(rt.activeMs))) : "—" },
   ];
-  if (costEnabled()) rtCells.push(`<span class="card__at-v" title="${atTitle}">${esc(fmtCost(rt ? rt.cost : null))}</span>`);
-  // Chats, then Tools, then Agents, then Active — pushed in this order (after the optional
-  // cost) so the repo-total cells land under the matching stats-row columns in both layouts.
-  rtCells.push(`<span class="card__at-v" title="${atTitle}">${rt && rt.prompts != null ? num(rt.prompts) : "—"}</span>`);
-  rtCells.push(`<span class="card__at-v" title="${atTitle}">${rt && rt.tools != null ? num(rt.tools) : "—"}</span>`);
-  rtCells.push(`<span class="card__at-v" title="${atTitle}">${rt && rt.subagents != null ? num(rt.subagents) : "—"}</span>`);
-  rtCells.push(`<span class="card__at-v" title="${atTitle}">${rt && rt.activeMs != null ? esc(fmtDuration(num(rt.activeMs))) : "—"}</span>`);
+  // A column drops out two ways: cost display is off globally, or the user hid that column in
+  // Settings. Hiding takes the heading and BOTH rows' cells with it, so the column leaves no gap.
+  const shown = cols.filter((c) => c.on !== false && App.liveStats[c.key] !== false);
+  const stats = shown.map(
+    (c) =>
+      `<div class="stat"${c.title ? ` title="${esc(c.title)}"` : ""}>` +
+      `<span class="stat__k">${c.label}</span><span class="stat__v">${c.v}</span></div>`
+  );
+  // The muted repo-total second row shares the stat grid's columns, so each total lands directly
+  // under its own heading. No text label: the muted colour + dashed divider mark it, and the
+  // tooltip explains it. It rides with the per-session row rather than toggling separately —
+  // Show stats is one switch over the whole block, both rows together.
+  const rtCells = shown.map((c) => `<span class="card__at-v" title="${esc(atTitle)}">${c.t}</span>`);
+  const showStats = App.liveShow.stats && shown.length > 0;
 
   // Pulse while this session's status-change window is open (see detectSoundCues).
   // The window (a timestamp) keeps the class across the frequent card-grid re-renders;
@@ -713,17 +747,20 @@ function cardHTML(s) {
     show.color && typeof s.color === "string" && s.color
       ? `<span class="card__dot" data-color="${esc(s.color)}" title="Session colour: ${esc(s.color)}"></span>`
       : "";
-  // The pin toggle sits between the head's title and the CONDITIONAL focus button, so the
+  // The group button sits between the head's title and the CONDITIONAL focus button, so the
   // always-present control keeps a stable position and the optional one follows it. Its own
-  // show.pin switch can hide it; hiding it does NOT clear existing pins (they keep leading
+  // show.pin switch can hide it; hiding it does NOT clear existing groups (they keep leading
   // the grid) — the Settings description says so rather than leaving it a surprise.
-  // The accessible NAME is a static aria-label (like .focus-btn's), not the title: `title` is
-  // the last resort in the accname algorithm and some screen readers skip it, which on an
-  // icon-only button leaves "pressed, button" with no name at all. aria-pressed carries the
-  // state, so the name stays constant while only the hover title flips Pin/Unpin.
-  const isPinned = App.livePins.has(s.sessionId);
+  // The accessible NAME is the aria-label, never the title: `title` is the last resort in the
+  // accname algorithm and some screen readers skip it, which on an icon-only button would leave
+  // "button" with no name at all. This control opens a menu rather than toggling, so there is no
+  // aria-pressed to carry the state — the LABEL carries it, which is why it names the group
+  // instead of staying constant; `title` mirrors it for sighted hover.
+  const grouped = !!(App.groupAssign && App.groupAssign.get(s.sessionId));
+  const groupName = grouped ? App.groupAssign.get(s.sessionId).group.name : "";
+  const pinLabel = grouped ? "Session group: " + groupName : "Add this session to a group";
   const pinBtn = show.pin
-    ? `<button class="pin-btn${isPinned ? " pin-btn--on" : ""}" type="button" data-pin-session="${esc(s.sessionId)}" aria-pressed="${isPinned}" aria-label="Pin session" title="${isPinned ? "Unpin" : "Pin"} this session — pinned cards sort first">${PIN_SVG}</button>`
+    ? `<button class="pin-btn${grouped ? " pin-btn--on" : ""}" type="button" data-pin-session="${esc(s.sessionId)}" aria-haspopup="menu" aria-label="${esc(pinLabel)}" title="${esc(pinLabel)}">${PIN_SVG}</button>`
     : "";
   const title = show.title
     ? `<div class="card__title"${s.title ? ` title="${esc(s.title)}"` : ""}>${dot}${TITLE_SVG}<span>${s.title ? esc(s.title) : ""}</span></div>`
@@ -755,11 +792,15 @@ function cardHTML(s) {
         <span class="telemetry__label">${timerLabel}</span>
       </div>
       ${chips.length ? `<div class="chips">${chips.join("")}</div>` : ""}
-      <div class="card__stats" style="grid-template-columns: repeat(${stats.length}, minmax(0, 1fr))">
+      ${
+        showStats
+          ? `<div class="card__stats" style="grid-template-columns: repeat(${stats.length}, minmax(0, 1fr))">
         ${stats.join("")}
         <div class="card__stats-div"></div>
         ${rtCells.join("")}
-      </div>
+      </div>`
+          : ""
+      }
     </div>
   </article>`;
 }
@@ -1521,22 +1562,68 @@ function renderLiveRibbon() {
 }
 
 function renderLive() {
+  // Two controls now live INSIDE the region this function replaces wholesale — the group-name
+  // input and the floating group picker — and SSE frames arrive several times a second while a
+  // session loops tools. A blind rebuild would wipe a half-typed name (value, caret and focus)
+  // and leave the menu anchored to a destroyed button. So defer instead, and re-apply as soon
+  // as focus leaves or the menu closes (flushLiveRender). A skipped frame is invisible: timers
+  // tick client-side from server anchors, so nothing freezes.
+  // The RIBBON is refreshed first and unconditionally: it lives outside #cards, so the rebuild
+  // below never destroys it and there is nothing to defer — deferring it too would freeze
+  // today's totals for as long as a picker stays open.
+  renderLiveRibbon();
+  if (liveRenderBlocked()) {
+    App.liveRenderPending = true;
+    return;
+  }
+  App.liveRenderPending = false;
+
+  // Membership is resolved over the UNFILTERED list, because a grouped session must survive the
+  // zero-token filter below.
+  const all = (App.state && App.state.sessions) || [];
+  const assign = resolveGroupMembership(all);
+  App.groupAssign = assign;
+
   // Hide an IDLE session that spent 0 tokens (and so 0 cost) — an opened-but-never-worked
   // session sitting idle. A RUNNING/WAITING/ERROR session is NEVER hidden: pollTokens sets a
   // running first-turn session's tokens to a KNOWN {0,0,0,0} before its first assistant usage
   // flushes, so a bare "known-zero" test would drop actively-running cards (and could show the
   // empty state while a session runs). Gating on effectiveStatus==="idle" keeps active cards
   // visible. tokens===null (transcript not read yet / unavailable) is unknown, not zero -> kept.
-  const sessions = ((App.state && App.state.sessions) || []).filter(
-    (s) => !(effectiveStatus(s) === "idle" && s.tokens != null && sumTokens(s.tokens) === 0)
+  // A GROUPED session is exempt: a just-/clear'ed one is idle at zero tokens for a moment, and
+  // under the bare rule its card would blink out of its group and return elsewhere — the exact
+  // bug groups exist to fix. This REVERSES the pinning spec's "pinning does not override
+  // visibility"; the exemption is scoped to membership, never a relaxation of the filter.
+  const sessions = all.filter(
+    (s) =>
+      assign.has(s.sessionId) ||
+      !(effectiveStatus(s) === "idle" && s.tokens != null && sumTokens(s.tokens) === 0)
   );
-  renderLiveRibbon();
   const cards = $("cards");
   if (!sessions.length) {
+    cards.classList.remove("cards--grouped");
     cards.innerHTML =
       '<div class="empty"><strong>No active sessions</strong>Start a Claude Code session and it will appear here.</div>';
     App.timers = [];
     return;
+  }
+  // Split grouped from ungrouped BEFORE sorting: the selected sort orders the ungrouped
+  // remainder only. It never orders cards within a group (placement order wins there, so the
+  // card you put first stays first through every status change) and never reorders the boxes,
+  // which hold creation order so a named group keeps a stable screen position.
+  const bucket = new Map();
+  const loose = [];
+  for (const s of sessions) {
+    const a = assign.get(s.sessionId);
+    if (!a) {
+      loose.push(s);
+      continue;
+    }
+    if (!bucket.has(a.group.id)) bucket.set(a.group.id, []);
+    bucket.get(a.group.id).push(s);
+  }
+  for (const list of bucket.values()) {
+    list.sort((a, b) => assign.get(a.sessionId).idx - assign.get(b.sessionId).idx);
   }
   // "status" renders the server order (already waiting-first via compareCards);
   // "name" re-sorts a COPY alphabetically for stable positions (repo, then the card
@@ -1551,9 +1638,9 @@ function renderLive() {
   // "context" floats the session nearest compaction to the top; sessions with no
   // reading (no statusline forwarder) sink below every session that has one rather
   // than sorting as 0%, which would claim an empty context they never reported.
-  let ordered = sessions;
+  let ordered = loose;
   if (App.liveSort === "name") {
-    ordered = sessions.slice().sort((a, b) => {
+    ordered = loose.slice().sort((a, b) => {
       const byRepo = String(a.repoName || "").localeCompare(String(b.repoName || ""));
       if (byRepo) return byRepo;
       const byRoot = String(a.repoRoot || "").localeCompare(String(b.repoRoot || ""));
@@ -1571,7 +1658,7 @@ function renderLive() {
       return String(a.sessionId || "").localeCompare(String(b.sessionId || ""));
     });
   } else if (App.liveSort === "context") {
-    ordered = sessions.slice().sort((a, b) => {
+    ordered = loose.slice().sort((a, b) => {
       const pa = a.context && typeof a.context.usedPct === "number" ? a.context.usedPct : null;
       const pb = b.context && typeof b.context.usedPct === "number" ? b.context.usedPct : null;
       if (pa == null && pb == null) return String(a.sessionId || "").localeCompare(String(b.sessionId || ""));
@@ -1581,20 +1668,34 @@ function renderLive() {
       return String(a.sessionId || "").localeCompare(String(b.sessionId || ""));
     });
   }
-  // Pinned cards lead, each group still in the order the selected sort produced (a two-bucket
-  // pass over an already-ordered list, so relative order inside each group is untouched).
-  // Skipped entirely when nothing is pinned, so "status" keeps rendering the daemon's
-  // compareCards order verbatim rather than becoming a client-sorted mode by default.
-  // DELIBERATE: running last and unconditionally, this puts a pinned card ahead of a WAITING
-  // one — overriding aggregate.statusRank's waiting-first rule. See docs/specs/
-  // 2026-09-09-live-card-pinning.md; CONCEPT/ARCHITECTURE are amended to match.
-  if (App.livePins.size) {
-    const pinned = [];
-    const rest = [];
-    for (const s of ordered) (App.livePins.has(s.sessionId) ? pinned : rest).push(s);
-    ordered = pinned.concat(rest);
+  // Group boxes lead, in creation order, each holding its cards in placement order; the sorted
+  // remainder follows under the Ungrouped lane. Skipped entirely when nothing is grouped, so
+  // "status" keeps rendering the daemon's compareCards order verbatim and #cards keeps its own
+  // grid, rather than the view becoming client-composed by default.
+  // DELIBERATE: a grouped card leads a WAITING one — overriding aggregate.statusRank's
+  // waiting-first rule, as pinning did before it. See docs/specs/2026-09-16-live-card-groups.md
+  // (and 2026-09-09-live-card-pinning.md, which this supersedes); CONCEPT/ARCHITECTURE match.
+  const boxes = App.liveGroups.filter((g) => bucket.has(g.id));
+  if (boxes.length) {
+    // #cards IS the card grid (its own display:grid + auto-fill tracks), so while groups exist
+    // it drops to block flow and the nested regions lay themselves out. With no groups the
+    // modifier is absent and the element renders byte-identically to before.
+    cards.classList.add("cards--grouped");
+    let html = '<div class="groups">' + boxes.map((g) => groupHTML(g, bucket.get(g.id))).join("") + "</div>";
+    if (ordered.length) {
+      // The lane header is omitted when every live session is grouped — the same rule an empty
+      // group follows, so the page ends with the last box rather than a header over nothing.
+      html +=
+        '<div class="lane"><span class="lane__label">Ungrouped</span>' +
+        '<span class="lane__count">' + ordered.length + "</span>" +
+        '<span class="lane__rule"></span></div>' +
+        '<div class="cards-grid">' + ordered.map(cardHTML).join("") + "</div>";
+    }
+    cards.innerHTML = html;
+  } else {
+    cards.classList.remove("cards--grouped");
+    cards.innerHTML = ordered.map(cardHTML).join("");
   }
-  cards.innerHTML = ordered.map(cardHTML).join("");
   cards.querySelectorAll(".path").forEach((btn) =>
     btn.addEventListener("click", () => copyPath(btn.dataset.path))
   );
@@ -1602,10 +1703,189 @@ function renderLive() {
     btn.addEventListener("click", () => focusTerminal(btn.dataset.focusSession))
   );
   cards.querySelectorAll(".pin-btn").forEach((btn) =>
-    btn.addEventListener("click", () => toggleLivePin(btn.dataset.pinSession))
+    btn.addEventListener("click", () => openGroupMenu(btn))
   );
+  bindGroupControls(cards);
   collectTimers();
   tick(); // paint timers immediately rather than waiting up to a second
+}
+
+// True while the groups region holds something a wholesale rebuild would destroy: a focused
+// group-name input (mid-typing) or the open group picker (anchored to a button the rebuild
+// discards). renderLive defers rather than fighting either.
+function liveRenderBlocked() {
+  if (activeMenu && activeMenu.dataset.groupMenu) return true;
+  const ae = document.activeElement;
+  if (!(ae && ae.classList && ae.classList.contains("group__name"))) return false;
+  // A focused input keeps `document.activeElement` even after the WINDOW loses focus, so a name
+  // clicked into and then alt-tabbed away from would hold the rebuild off indefinitely — cards
+  // frozen on a stale status and activity line while their timers keep ticking from stale
+  // anchors, which is worse than a lost caret. Nobody is typing into an unfocused document, and
+  // groupRename persists every keystroke, so the rebuild re-renders the name that was stored.
+  return typeof document.hasFocus === "function" ? document.hasFocus() : true;
+}
+
+// Re-apply a render that was deferred. Called when the picker closes and when the name input
+// blurs — the two events that clear liveRenderBlocked().
+function flushLiveRender() {
+  if (App.liveRenderPending && !liveRenderBlocked()) renderLive();
+}
+
+// The most urgent member state a group box reports. Deliberately puts ERROR above RUNNING where
+// aggregate.statusRank does not: that function orders CARDS by who needs you soonest, while a
+// group rail is an alert surface, where a failed session is more noteworthy than a working one.
+// `paused` is excluded — a pause is global, so every group would light at once and the global
+// banner already says it. That exclusion only holds if we read the SAME status the cards do:
+// displayStatus, not effectiveStatus. A globally paused at-rest session is still "running" to
+// effectiveStatus, which would paint the rail green while every card inside read "Paused".
+const GROUP_STATUS_RANK = { waiting: 0, error: 1, running: 2 };
+
+function groupStatus(list) {
+  let best = null;
+  for (const s of list) {
+    const st = displayStatus(s);
+    if (!(st in GROUP_STATUS_RANK)) continue;
+    if (best === null || GROUP_STATUS_RANK[st] < GROUP_STATUS_RANK[best]) best = st;
+  }
+  return best;
+}
+
+// A group box: a rail carrying the aggregate status (the same visual language as .card__rail),
+// a header, and the member cards in placement order. The rail is deliberately REDUNDANT with
+// the status badges on the cards inside it, so status is never carried by colour alone.
+function groupHTML(g, list) {
+  const st = groupStatus(list);
+  const alert = st === "waiting" || st === "error";
+  const orient = g.orient === "h" ? "h" : "v";
+  const orientBtn = (o, svg, label) =>
+    `<button class="orient-btn" type="button" data-group-orient="${esc(g.id)}" data-orient="${o}" ` +
+    `aria-pressed="${orient === o}" title="${label}" aria-label="${label}">${svg}</button>`;
+  return (
+    `<section class="group group--${orient}${alert ? " group--alert" : ""}"` +
+    (st ? ` data-status="${esc(st)}"` : "") +
+    `>` +
+    '<div class="group__rail"></div>' +
+    '<div class="group__main">' +
+    '<div class="group__head">' +
+    `<input class="group__name" type="text" value="${esc(g.name)}" maxlength="${MAX_GROUP_NAME}" ` +
+    `data-group-name="${esc(g.id)}" aria-label="Group name" spellcheck="false">` +
+    '<div class="group__orient" role="group" aria-label="Group direction">' +
+    orientBtn("v", VERT_SVG, "Stack downwards") +
+    orientBtn("h", HORZ_SVG, "Run across") +
+    "</div>" +
+    `<button class="group__del" type="button" data-group-del="${esc(g.id)}" ` +
+    `title="Delete group" aria-label="Delete group">${CLOSE_SVG}</button>` +
+    "</div>" +
+    `<div class="group__cards">${list.map(cardHTML).join("")}</div>` +
+    "</div></section>"
+  );
+}
+
+function bindGroupControls(root) {
+  root.querySelectorAll("[data-group-orient]").forEach((btn) =>
+    btn.addEventListener("click", () => groupSetOrient(btn.dataset.groupOrient, btn.dataset.orient))
+  );
+  root.querySelectorAll("[data-group-del]").forEach((btn) =>
+    btn.addEventListener("click", () => groupDelete(btn.dataset.groupDel))
+  );
+  root.querySelectorAll("[data-group-name]").forEach((input) => {
+    // Persist on every keystroke but never re-render from here — renderLive is deferred while
+    // this input holds focus (liveRenderBlocked), and blur is what releases it.
+    input.addEventListener("input", () => groupRename(input.dataset.groupName, input.value));
+    input.addEventListener("blur", (e) => {
+      groupRename(input.dataset.groupName, input.value);
+      // Echo back what was actually KEPT: groupRename trims, truncates, and refuses an empty
+      // name, so an emptied field would otherwise sit there showing a name that was never
+      // stored — indefinitely, since the render that would correct it is deferred and only
+      // flushes when a frame was already pending.
+      const g = findGroup(input.dataset.groupName);
+      if (g && input.value !== g.name) input.value = g.name;
+      // Focus landing on another control INSIDE the grid means a mousedown is in flight (that
+      // mousedown is what blurred us). Rebuilding here synchronously detaches the control under
+      // the cursor, so its mouseup never completes a click and the first press after a rename is
+      // swallowed. Leave the frame pending instead — nothing blocks it now, so the next render
+      // (this control's own action, or the next SSE frame) applies it.
+      if (e.relatedTarget && root.contains(e.relatedTarget)) return;
+      flushLiveRender();
+    });
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === "Escape") input.blur();
+    });
+  });
+}
+
+// The card-head button opens this picker on every click — one button, one behaviour. Reuses the
+// floating .menu machinery the repo table already owns (anchoring, viewport clamping,
+// outside-click / scroll / resize dismissal), so this is a second caller, not a new popover.
+function openGroupMenu(btn) {
+  // Anchor rect FIRST: closeMenu() releases the render block and may re-render the grid, which
+  // detaches `btn`. The coordinates are all we need from it afterwards.
+  const r = btn.getBoundingClientRect();
+  closeMenu();
+  const sid = btn.dataset.pinSession;
+  const s = ((App.state && App.state.sessions) || []).find((x) => x.sessionId === sid);
+  if (!s) return;
+  const a = App.groupAssign && App.groupAssign.get(sid);
+  const g = a && a.group;
+
+  const row = (act, label, extra, on) =>
+    `<button class="menu__item menu__item--pick${on ? " menu__item--on" : ""}" type="button" ` +
+    `data-act="${act}"${extra || ""}>` +
+    `<span class="menu__tick">${on ? TICK_SVG : ""}</span>${esc(label)}</button>`;
+
+  // Every group is listed, INCLUDING empty ones: an empty group has no header, so adding a card
+  // to it is how its rename / direction / delete controls come back.
+  let html = '<div class="menu__label">Add to group</div>';
+  html += App.liveGroups.map((x) => row("move", x.name, ` data-g="${esc(x.id)}"`, g === x)).join("");
+  if (!App.liveGroups.length) html += '<div class="menu__empty">No groups yet</div>';
+  if (g) {
+    // Reordering steps over members whose session is gone (see boundMemberIndices), so the ends
+    // — and whether the pair is worth offering at all — are read off the VISIBLE cards. Reading
+    // the raw member array here would enable "Move down" on the card that is already last.
+    const bound = boundMemberIndices(g);
+    const at = bound.indexOf(a.idx);
+    if (bound.length > 1) {
+      html += '<div class="menu__sep"></div>';
+      html += row("up", "Move up", at <= 0 ? " disabled" : "");
+      html += row("down", "Move down", at < 0 || at >= bound.length - 1 ? " disabled" : "");
+    }
+    html += '<div class="menu__sep"></div>';
+    html += row("remove", "Remove from group");
+  }
+  html += '<div class="menu__sep"></div>';
+  html += row("new", "New group");
+
+  const menu = document.createElement("div");
+  menu.className = "menu";
+  menu.dataset.groupMenu = "1";
+  menu.innerHTML = html;
+  document.body.appendChild(menu);
+  activeMenu = menu;
+  const mw = menu.offsetWidth;
+  const left = clamp(r.right - mw, 8, Math.max(8, window.innerWidth - mw - 8));
+  menu.style.top = Math.round(r.bottom + 4) + "px";
+  menu.style.left = Math.round(left) + "px";
+
+  menu.addEventListener("click", (e) => {
+    const item = e.target.closest(".menu__item");
+    if (!item || item.disabled) return;
+    const act = item.dataset.act;
+    closeMenu();
+    if (act === "move") groupAddSession(item.dataset.g, s);
+    else if (act === "up") groupMoveMember(s, -1);
+    else if (act === "down") groupMoveMember(s, 1);
+    else if (act === "remove") groupRemoveSession(s);
+    else if (act === "new") groupCreateFor(s);
+    // Each action rebuilds the grid this button lives in, so focus would fall back to <body>.
+    // preventScroll: a newly grouped card jumps to the top, and following it would yank a
+    // reader further down the page. Same rule the pin toggle carried.
+    const again = [...$("cards").querySelectorAll(".pin-btn")].find((b) => b.dataset.pinSession === sid);
+    if (again) again.focus({ preventScroll: true });
+  });
+
+  setTimeout(() => document.addEventListener("click", onDocClickForMenu), 0);
+  window.addEventListener("resize", closeMenu);
+  window.addEventListener("scroll", closeMenu, true);
 }
 
 // Why a focus attempt failed, in the user's terms. The daemon returns a stable reason
@@ -1687,49 +1967,255 @@ function setLiveShow(key, on) {
   renderLive();
 }
 
-// A pinned session card leads the Live grid. Per-browser (localStorage), NOT daemon config,
-// so it never PUTs and never pops a "Settings saved" toast — the same footing as the sort
-// mode it modifies. Re-renders immediately, like setLiveSort / setLiveShow.
-const MAX_PINS = 50;
-
-function toggleLivePin(sessionId) {
-  if (!sessionId) return;
-  if (App.livePins.has(sessionId)) App.livePins.delete(sessionId);
-  else {
-    App.livePins.add(sessionId);
-    evictIfOver();
-  }
-  persistPref("cockpit.livePins", JSON.stringify([...App.livePins]));
+// Stat-column visibility, per-browser like setLiveShow. Hiding a column removes its heading and
+// both rows' cells, so the grid reflows to the remaining columns rather than leaving a gap.
+function setLiveStat(key, on) {
+  if (!(key in App.liveStats)) return;
+  App.liveStats[key] = !!on;
+  persistPref("cockpit.liveStats", JSON.stringify(App.liveStats));
   renderLive();
-  // renderLive() replaces cards.innerHTML wholesale, destroying the very button that was just
-  // activated — so keyboard focus would fall back to <body> and a user could neither toggle the
-  // same pin twice nor tab on from where they were. Unlike .focus-btn (whose click only fires a
-  // POST), this control's own action rebuilds the grid it lives in, so it has to put focus back.
-  // preventScroll: a pinned card jumps to the top of the grid, and scrolling the page to follow
-  // it would yank a mouse user who was reading further down.
-  const btn = [...$("cards").querySelectorAll(".pin-btn")].find(
-    (b) => b.dataset.pinSession === sessionId
-  );
-  if (btn) btn.focus({ preventScroll: true });
 }
 
-// Bound storage while shedding a DEAD id rather than a card the user can see: evict the oldest
-// id whose session is not currently live. The fallback — the plain oldest, when all MAX_PINS are
-// live — does unpin a visible card, which is accepted rather than prevented: it needs 50
-// concurrently live pinned sessions, far outside any working set, and the alternative (refusing
-// the new pin) would silently ignore a click. This is eviction ORDER, not pruning — nothing is
-// dropped while under the cap, so a pin still re-applies to a session resumed later (--resume
-// reuses the session_id).
-function evictIfOver() {
-  if (App.livePins.size <= MAX_PINS) return;
-  const live = new Set(((App.state && App.state.sessions) || []).map((x) => x.sessionId));
-  for (const id of App.livePins) {
-    // Set iteration is insertion-ordered (oldest first); deleting the CURRENT element
-    // mid-iteration is well-defined and does not skip the next one.
-    if (App.livePins.size <= MAX_PINS) break;
-    if (!live.has(id)) App.livePins.delete(id);
+// ---- Live card groups -------------------------------------------------------
+// A named group gathers session cards into a bounded box that leads the Live grid, growing
+// down ("v") or across ("h"). Per-browser (localStorage), NOT daemon config, so it never PUTs
+// and never pops a "Settings saved" toast — the same footing as the sort mode it modifies.
+// Replaces the flat pin set (docs/specs/2026-09-16-live-card-groups.md).
+const MAX_GROUPS = 12;
+const MAX_MEMBERS_PER_GROUP = 12;
+const MAX_GROUP_NAME = 40;
+
+function newGroupId() {
+  return "g-" + Math.random().toString(36).slice(2, 8);
+}
+
+// A member identifies a terminal SEAT, not a session: `/clear` keeps the owner pid and mints a
+// new session id, `--resume` keeps the session id and mints a new pid, so holding both keys
+// covers both. Neither key is ever rendered. Written once when the member is added and never
+// rewritten — an earlier design refreshed `sid` on a pid match, which guarded nothing (a
+// --resume of that session IS that session) while putting a write on the render path.
+function memberOf(s) {
+  return {
+    sid: s.sessionId || null,
+    pid: Number.isInteger(s.ownerPid) ? s.ownerPid : null,
+    root: s.repoRoot || null,
+  };
+}
+
+function memberMatchesBySid(m, s) {
+  return !!(m.sid && m.sid === s.sessionId);
+}
+
+// The pid half needs repoRoot to agree as well: the OS can reissue a dead pid, and on Windows an
+// unverified owner_pid is a throwaway per-hook shell (see the spec's Edge cases). Requiring the
+// repo to match bounds a wrong match to "a card in the wrong group", never a wrong action.
+function memberMatchesByPid(m, s) {
+  return m.pid != null && m.pid === s.ownerPid && !!m.root && m.root === s.repoRoot;
+}
+
+// sessionId -> { group, idx }. Three rules keep this one-to-one, which "one group per session"
+// requires: a session joins the FIRST group holding a matching member; a member binds AT MOST
+// one card (during the /clear overlap the old session matches by sid and the new one by pid,
+// and both are live until SessionEnd or the reaper lands — the sid match wins and the other
+// card falls through to the ungrouped remainder); and within a member, sid beats pid.
+function resolveGroupMembership(sessions) {
+  const out = new Map();
+  const taken = new Set();
+  for (const g of App.liveGroups) {
+    g.members.forEach((m, idx) => {
+      let pick = null;
+      for (const s of sessions) {
+        if (!taken.has(s.sessionId) && memberMatchesBySid(m, s)) { pick = s; break; }
+      }
+      if (!pick) {
+        for (const s of sessions) {
+          if (!taken.has(s.sessionId) && memberMatchesByPid(m, s)) { pick = s; break; }
+        }
+      }
+      if (pick) {
+        out.set(pick.sessionId, { group: g, idx });
+        taken.add(pick.sessionId);
+      }
+    });
   }
-  while (App.livePins.size > MAX_PINS) App.livePins.delete(App.livePins.values().next().value);
+  return out;
+}
+
+function findGroup(id) {
+  return App.liveGroups.find((g) => g.id === id) || null;
+}
+
+function persistGroups() {
+  persistPref("cockpit.liveGroups", JSON.stringify(App.liveGroups));
+}
+
+// Every mutation below persists and re-renders. Nothing is evicted automatically: membership is
+// explicit in and explicit out, bounded by the two caps rather than by an age rule (per-group
+// arrays have no global ordering, so a cross-group "oldest member" has no defined answer).
+function groupAddSession(gid, s) {
+  const g = findGroup(gid);
+  if (!g || !s) return;
+  // Already here: do nothing. Falling through would remove and re-push, silently moving the
+  // card to the END of the group — a no-op click must not reorder what you placed.
+  const a = App.groupAssign && App.groupAssign.get(s.sessionId);
+  if (a && a.group === g) return;
+  // Cap checked BEFORE the card leaves its current group. Removing first meant a refused move
+  // still stripped the old membership, dropping the card to the ungrouped grid with only a
+  // toast to explain it — a failed action must leave things as they were.
+  const already = g.members.some((m) => memberMatchesBySid(m, s) || memberMatchesByPid(m, s));
+  if (!already && g.members.length >= MAX_MEMBERS_PER_GROUP) {
+    toast("That group is full (" + MAX_MEMBERS_PER_GROUP + " sessions)", true);
+    return;
+  }
+  groupRemoveSession(s, true);
+  g.members.push(memberOf(s));
+  persistGroups();
+  renderLive();
+}
+
+// `quiet` suppresses the persist/render, for callers that are mid-mutation and will do both
+// themselves. Scans every group, so a session can never be left in two.
+function groupRemoveSession(s, quiet) {
+  if (!s) return;
+  let changed = false;
+  for (const g of App.liveGroups) {
+    const before = g.members.length;
+    g.members = g.members.filter((m) => !memberMatchesBySid(m, s) && !memberMatchesByPid(m, s));
+    if (g.members.length !== before) changed = true;
+  }
+  // Only write when something actually moved: a miss used to persist the unchanged array,
+  // which is the one path that could flush a REPAIRED load back to storage before the user
+  // had touched anything (repairGroup deliberately does not persist on its own).
+  if (!quiet && changed) {
+    persistGroups();
+    renderLive();
+  }
+}
+
+// The member indices of `g` that actually have a card on screen this render, ascending. Move
+// up/down step through THIS list, not the raw member array: a group keeps the seat of a session
+// that has ended (nothing prunes members), so a raw ±1 index shift can swap a visible card with
+// an invisible member — a click that persists a change and repaints nothing, i.e. a dead button.
+function boundMemberIndices(g) {
+  const out = [];
+  if (App.groupAssign) {
+    for (const a of App.groupAssign.values()) if (a.group === g) out.push(a.idx);
+  }
+  return out.sort((x, y) => x - y);
+}
+
+function groupMoveMember(s, delta) {
+  const a = App.groupAssign && App.groupAssign.get(s.sessionId);
+  if (!a) return;
+  const g = a.group;
+  const bound = boundMemberIndices(g);
+  const at = bound.indexOf(a.idx);
+  if (at < 0) return;
+  const to = bound[at + delta];
+  if (to == null) return;
+  // SWAP the two member records rather than splicing: any unbound members sitting between them
+  // keep their own places, so a seat that comes back lands where the user last left it.
+  const m = g.members[a.idx];
+  g.members[a.idx] = g.members[to];
+  g.members[to] = m;
+  persistGroups();
+  renderLive();
+}
+
+function groupCreateFor(s) {
+  if (App.liveGroups.length >= MAX_GROUPS) {
+    // An empty group isn't drawn, so "delete one" can point at a box that isn't on screen; the
+    // picker still lists it, and adding any card to it is what brings its delete button back.
+    toast("You have " + MAX_GROUPS + " groups — add a card to one and delete it to free a slot", true);
+    return;
+  }
+  groupRemoveSession(s, true);
+  // Named after the card's repo so there is never an empty-name state, and renamed inline in
+  // the group header. Vertical by default: the pair case reads better as a column, and a
+  // one-card group looks identical either way.
+  const g = { id: newGroupId(), name: (s.repoName || "Group").slice(0, MAX_GROUP_NAME), orient: "v", members: [memberOf(s)] };
+  App.liveGroups.push(g);
+  persistGroups();
+  renderLive();
+}
+
+function groupRename(gid, name) {
+  const g = findGroup(gid);
+  if (!g) return;
+  const clean = String(name || "").trim().slice(0, MAX_GROUP_NAME);
+  g.name = clean || g.name;
+  persistGroups();
+}
+
+function groupSetOrient(gid, orient) {
+  const g = findGroup(gid);
+  if (!g || (orient !== "v" && orient !== "h") || g.orient === orient) return;
+  g.orient = orient;
+  persistGroups();
+  renderLive();
+}
+
+async function groupDelete(gid) {
+  const g = findGroup(gid);
+  if (!g) return;
+  const ok = await showConfirm({
+    title: "Delete group",
+    bodyHTML:
+      `<p>Delete the group <b>${esc(g.name)}</b>?</p>` +
+      `<p>Its sessions return to the ungrouped grid. No session data is touched.</p>`,
+    confirmLabel: "Delete group",
+  });
+  if (!ok) return;
+  App.liveGroups = App.liveGroups.filter((x) => x.id !== gid);
+  persistGroups();
+  renderLive();
+}
+
+// Repair per FIELD rather than dropping a record: with pins this was a flat string array and
+// there was nothing to lose, but a nested group carries a name and a membership that a single
+// bad field would silently destroy with no way back. A group survives as long as it has a
+// usable name and members array. A load that repaired something is deliberately NOT persisted
+// back until the user next changes something, so a transient bad read can't overwrite a good
+// stored value.
+function repairMember(m) {
+  if (!m || typeof m !== "object") return null;
+  const sid = typeof m.sid === "string" && m.sid ? m.sid : null;
+  const pid = Number.isInteger(m.pid) ? m.pid : null;
+  const root = typeof m.root === "string" && m.root ? m.root : null;
+  if (!sid && pid == null) return null; // no usable key at all
+  return { sid, pid, root };
+}
+
+function repairGroup(g) {
+  if (!g || typeof g !== "object") return null;
+  const name = typeof g.name === "string" && g.name.trim() ? g.name.trim().slice(0, MAX_GROUP_NAME) : null;
+  if (name == null || !Array.isArray(g.members)) return null;
+  const members = g.members.map(repairMember).filter(Boolean).slice(0, MAX_MEMBERS_PER_GROUP);
+  return {
+    id: typeof g.id === "string" && g.id ? g.id : newGroupId(),
+    name,
+    orient: g.orient === "h" ? "h" : "v",
+    members,
+  };
+}
+
+// One-time upgrade from the pin set: the pins become a single horizontal group, because that is
+// how pinned cards read today. The old key is READ, never written or deleted — leaving it costs
+// nothing and keeps a downgrade working, per the retired-key precedent.
+function migrateLivePins() {
+  try {
+    const raw = loadPref("cockpit.livePins");
+    const v = raw ? JSON.parse(raw) : null;
+    if (!Array.isArray(v) || !v.length) return [];
+    const members = v
+      .filter((x) => typeof x === "string" && x)
+      .slice(0, MAX_MEMBERS_PER_GROUP)
+      .map((sid) => ({ sid, pid: null, root: null }));
+    if (!members.length) return [];
+    return [{ id: newGroupId(), name: "Pinned", orient: "h", members }];
+  } catch (_e) {
+    return [];
+  }
 }
 
 // Theme is a per-browser preference (localStorage), NOT daemon config — never PUT it (a config
@@ -2155,8 +2641,11 @@ function loadRepos() {
 // or any table re-render (renderReposTable calls closeMenu).
 let activeMenu = null;
 
+// Both menu openers are listed: a click on the button that owns the OPEN menu must not be
+// treated as an outside click, or the menu would close and immediately reopen. Was
+// `.repo-menu-btn` alone; `.pin-btn` (the Live card's group picker) is the second caller.
 function onDocClickForMenu(e) {
-  if (activeMenu && !activeMenu.contains(e.target) && !e.target.closest(".repo-menu-btn")) closeMenu();
+  if (activeMenu && !activeMenu.contains(e.target) && !e.target.closest(".repo-menu-btn, .pin-btn")) closeMenu();
 }
 
 function closeMenu() {
@@ -2166,6 +2655,8 @@ function closeMenu() {
   document.removeEventListener("click", onDocClickForMenu);
   window.removeEventListener("resize", closeMenu);
   window.removeEventListener("scroll", closeMenu, true);
+  // An open group picker blocks renderLive; releasing it re-applies whatever was deferred.
+  flushLiveRender();
 }
 
 function openRepoMenu(btn) {
@@ -2640,8 +3131,11 @@ function sw(id, checked) {
   return `<label class="switch"><input type="checkbox" id="${id}" ${checked ? "checked" : ""}><span class="switch__track"></span></label>`;
 }
 
-function fieldRow(title, sub, control) {
-  return `<div class="field"><div class="field__label"><b>${esc(title)}</b>${sub ? `<small>${esc(sub)}</small>` : ""}</div><div class="field__control">${control}</div></div>`;
+// `wide` stacks the control UNDER the label on its own full-width line, for a control too wide
+// to sit beside the description without squeezing it into a narrow ribbon (the stat-column
+// checkbox set). Everything else keeps the side-by-side row.
+function fieldRow(title, sub, control, wide) {
+  return `<div class="field${wide ? " field--stacked" : ""}"><div class="field__label"><b>${esc(title)}</b>${sub ? `<small>${esc(sub)}</small>` : ""}</div><div class="field__control">${control}</div></div>`;
 }
 
 function section(title, hint, inner) {
@@ -2711,9 +3205,27 @@ function settingsHTML(cfg) {
         sw("set-show-ctx", App.liveShow.ctx)
       ) +
       fieldRow(
-        "Show pin button",
-        "Pin control in each live card's head — pinned cards lead the grid. Hiding it keeps existing pins active (this browser only)",
+        "Show group button",
+        "Group control in each live card's head — grouped cards lead the grid. Hiding it keeps existing groups (this browser only)",
         sw("set-show-pin", App.liveShow.pin)
+      ) +
+      fieldRow(
+        "Show stats",
+        "Both stat rows on each live card \u2014 the per-session figures and the muted repo-wide totals beneath them (this browser only)",
+        sw("set-show-stats", App.liveShow.stats)
+      ) +
+      fieldRow(
+        "Stat columns",
+        "Which figures each live card shows when Show stats is on. Hiding one takes its heading and both rows with it, so cards get narrower and more fit across (this browser only)",
+        ["tokens", "cost", "chats", "tools", "agents", "active"]
+          .map(
+            (k) =>
+              `<label class="statbox"><input type="checkbox" id="set-stat-${k}" ${
+                App.liveStats[k] ? "checked" : ""
+              }><span>${k[0].toUpperCase() + k.slice(1)}</span></label>`
+          )
+          .join(""),
+        true
       ) +
       fieldRow(
         "Card title",
@@ -3138,21 +3650,39 @@ function init() {
         ctx: v.ctx !== false,
         color: v.color !== false,
         pin: v.pin !== false,
+        stats: v.stats !== false,
       };
     }
   } catch (_e) {
     /* malformed stored value — keep all lines shown */
   }
 
-  // Per-browser pinned session ids. A malformed/absent value leaves the empty default, the
-  // same guard shape as liveShow above. Stored as a JSON array in insertion order (oldest
-  // first) so evictIfOver can reach the oldest without a separate timestamp.
+  // Per-browser stat-COLUMN visibility, same guard shape: any key omitted or non-false stays
+  // shown, so a stored value written before this existed still defaults every column on.
   try {
-    const raw = loadPref("cockpit.livePins");
-    const v = raw ? JSON.parse(raw) : null;
-    if (Array.isArray(v)) App.livePins = new Set(v.filter((x) => typeof x === "string"));
+    const raw = loadPref("cockpit.liveStats");
+    if (raw) {
+      const v = JSON.parse(raw) || {};
+      for (const k of Object.keys(App.liveStats)) App.liveStats[k] = v[k] !== false;
+    }
   } catch (_e) {
-    /* malformed stored value — keep the empty set */
+    /* malformed stored value — keep all columns shown */
+  }
+
+  // Per-browser Live card groups. Repaired per field rather than dropped wholesale (repairGroup),
+  // so one bad value costs at most a member. When the key is ABSENT the old pin set is migrated
+  // into a single "Pinned" group; when it is present but unreadable we start empty rather than
+  // migrating, so a garbled read can't resurrect long-dead pins.
+  try {
+    const raw = loadPref("cockpit.liveGroups");
+    if (raw) {
+      const v = JSON.parse(raw);
+      App.liveGroups = Array.isArray(v) ? v.map(repairGroup).filter(Boolean).slice(0, MAX_GROUPS) : [];
+    } else {
+      App.liveGroups = migrateLivePins();
+    }
+  } catch (_e) {
+    App.liveGroups = []; // unreadable stored value — start empty, and don't persist until acted on
   }
 
   $("nav").addEventListener("click", (e) => {
@@ -3216,6 +3746,11 @@ function init() {
     // Live-card line-visibility switches are also per-browser prefs, not daemon config.
     if (e.target.id && e.target.id.startsWith("set-show-")) {
       setLiveShow(e.target.id.slice("set-show-".length), e.target.checked);
+      return;
+    }
+    // Ditto the stat-column checkboxes.
+    if (e.target.id && e.target.id.startsWith("set-stat-")) {
+      setLiveStat(e.target.id.slice("set-stat-".length), e.target.checked);
       return;
     }
     // The Data section (store size + cleanup) isn't part of the config, so its inputs
