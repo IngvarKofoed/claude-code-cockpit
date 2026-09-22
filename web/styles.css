@@ -1034,6 +1034,33 @@ body {
 .orient-btn svg { width: 13px; height: 13px; }
 .orient-btn:hover { color: var(--ink-2); }
 .orient-btn[aria-pressed="true"] { background: var(--surface-3); color: var(--ink); }
+/* Reorder the box among its peers. Deliberately NOT inside the .group__orient pill: a filled
+   slot there means "this is the current direction", so an action sitting in it would read as a
+   third selectable state. Bare, beside the delete button, the pair reads as the actions it is —
+   and the chevrons point LEFT/RIGHT because .groups is a wrapping flex row, so a box moves one
+   slot along the row (wrapping at an edge), never one row up. */
+.group__move {
+  flex: none;
+  display: flex;
+  gap: 2px;
+}
+.move-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--ink-muted);
+  padding: 3px 2px;
+  border-radius: 5px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+}
+.move-btn svg { width: 14px; height: 14px; }
+.move-btn:hover:not(:disabled) { background: var(--surface-2); color: var(--ink); }
+/* At an end the button stays in place rather than disappearing, so the cluster never reflows
+   the header (and the delete button never shifts) as a box travels along the row. */
+.move-btn:disabled { opacity: 0.32; cursor: default; }
+
 /* Same shape and weight as .pin-btn / .focus-btn — another card-level affordance, not a
    destructive-looking one: deleting a group only ungroups its cards. */
 .group__del {

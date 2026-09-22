@@ -458,6 +458,14 @@ const HORZ_SVG =
 const CLOSE_SVG =
   '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">' +
   '<path d="m4.5 4.5 7 7M11.5 4.5l-7 7"/></svg>';
+// Group ORDER, drawn as the direction the box actually travels: .groups is a wrapping flex ROW,
+// so "earlier" is one slot left (wrapping to the end of the row above), not one row up.
+const CHEV_L_SVG =
+  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" ' +
+  'stroke-linejoin="round"><path d="M10 3.5 5.5 8l4.5 4.5"/></svg>';
+const CHEV_R_SVG =
+  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" ' +
+  'stroke-linejoin="round"><path d="M6 3.5 10.5 8 6 12.5"/></svg>';
 const TICK_SVG =
   '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" ' +
   'stroke-linejoin="round"><path d="m3.5 8.4 3 3 6-6.8"/></svg>';
@@ -1633,7 +1641,8 @@ function renderLive() {
   // Split grouped from ungrouped BEFORE sorting: the selected sort orders the ungrouped
   // remainder only. It never orders cards within a group (placement order wins there, so the
   // card you put first stays first through every status change) and never reorders the boxes,
-  // which hold creation order so a named group keeps a stable screen position.
+  // which hold the order the user put them in (Move earlier / Move later in the group header),
+  // so a named group keeps a stable screen position.
   const bucket = new Map();
   const loose = [];
   for (const s of sessions) {
@@ -1698,13 +1707,20 @@ function renderLive() {
   // DELIBERATE: a grouped card leads a WAITING one — overriding aggregate.statusRank's
   // waiting-first rule, as pinning did before it. See docs/specs/2026-09-16-live-card-groups.md
   // (and 2026-09-09-live-card-pinning.md, which this supersedes); CONCEPT/ARCHITECTURE match.
-  const boxes = App.liveGroups.filter((g) => bucket.has(g.id));
+  const boxes = drawnGroups();
   if (boxes.length) {
     // #cards IS the card grid (its own display:grid + auto-fill tracks), so while groups exist
     // it drops to block flow and the nested regions lay themselves out. With no groups the
     // modifier is absent and the element renders byte-identically to before.
     cards.classList.add("cards--grouped");
-    let html = '<div class="groups">' + boxes.map((g) => groupHTML(g, bucket.get(g.id))).join("") + "</div>";
+    let html =
+      '<div class="groups">' +
+      // `|| []`: drawnGroups() derives the box set from App.groupAssign while `bucket` is built
+      // from the filtered session list, so the two agree only because a grouped session is exempt
+      // from the idle-and-zero-token filter. If that ever stops holding, an empty box is a
+      // survivable render; groupStatus(undefined) would throw out of renderLive and blank the view.
+      boxes.map((g, i) => groupHTML(g, bucket.get(g.id) || [], i, boxes.length)).join("") +
+      "</div>";
     if (ordered.length) {
       // The lane header is omitted when every live session is grouped — the same rule an empty
       // group follows, so the page ends with the last box rather than a header over nothing.
@@ -1776,7 +1792,9 @@ function groupStatus(list) {
 // A group box: a rail carrying the aggregate status (the same visual language as .card__rail),
 // a header, and the member cards in placement order. The rail is deliberately REDUNDANT with
 // the status badges on the cards inside it, so status is never carried by colour alone.
-function groupHTML(g, list) {
+// `pos`/`total` are this box's place among the boxes actually DRAWN this render, which is what
+// the reorder buttons step through — see drawnGroups().
+function groupHTML(g, list, pos, total) {
   const st = groupStatus(list);
   const alert = st === "waiting" || st === "error";
   const orient = g.orient === "h" ? "h" : "v";
@@ -1796,6 +1814,7 @@ function groupHTML(g, list) {
     orientBtn("v", VERT_SVG, "Stack downwards") +
     orientBtn("h", HORZ_SVG, "Run across") +
     "</div>" +
+    moveCluster(g, pos, total) +
     `<button class="group__del" type="button" data-group-del="${esc(g.id)}" ` +
     `title="Delete group" aria-label="Delete group">${CLOSE_SVG}</button>` +
     "</div>" +
@@ -1804,9 +1823,44 @@ function groupHTML(g, list) {
   );
 }
 
+// Two ACTIONS, so deliberately outside the .group__orient pill: a filled slot in that pill means
+// "this is the current direction", and a button living in it would read as a third such state.
+// Omitted below two boxes — there is nowhere to move, and the picker's Move up / Move down follow
+// the same rule (`bound.length > 1`) rather than offering a pair that can only be disabled.
+function moveCluster(g, pos, total) {
+  if (!(total > 1)) return "";
+  const btn = (dir, delta, svg, label) =>
+    `<button class="move-btn" type="button" data-group-move="${esc(g.id)}" data-dir="${dir}"` +
+    (pos + delta < 0 || pos + delta >= total ? " disabled" : "") +
+    ` title="${label}" aria-label="${label}">${svg}</button>`;
+  return (
+    '<div class="group__move" role="group" aria-label="Group order">' +
+    btn("prev", -1, CHEV_L_SVG, "Move group earlier") +
+    btn("next", 1, CHEV_R_SVG, "Move group later") +
+    "</div>"
+  );
+}
+
 function bindGroupControls(root) {
   root.querySelectorAll("[data-group-orient]").forEach((btn) =>
     btn.addEventListener("click", () => groupSetOrient(btn.dataset.groupOrient, btn.dataset.orient))
+  );
+  root.querySelectorAll("[data-group-move]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const gid = btn.dataset.groupMove;
+      const dir = btn.dataset.dir;
+      groupMoveBox(gid, dir === "next" ? 1 : -1);
+      // The re-render destroyed the clicked node, so focus would fall back to <body> and a
+      // keyboard user could not move the same box twice. Land on the same direction when it is
+      // still available, otherwise the opposite one — a box moved to either end disables the
+      // button that took it there. preventScroll: the box jumps, and following it would yank a
+      // reader further down the page. Same rule the group picker carries.
+      const same = [...$("cards").querySelectorAll("[data-group-move]")].filter(
+        (b) => b.dataset.groupMove === gid && !b.disabled
+      );
+      const again = same.find((b) => b.dataset.dir === dir) || same[0];
+      if (again) again.focus({ preventScroll: true });
+    })
   );
   root.querySelectorAll("[data-group-del]").forEach((btn) =>
     btn.addEventListener("click", () => groupDelete(btn.dataset.groupDel))
@@ -2141,6 +2195,36 @@ function groupMoveMember(s, delta) {
   const m = g.members[a.idx];
   g.members[a.idx] = g.members[to];
   g.members[to] = m;
+  persistGroups();
+  renderLive();
+}
+
+// The groups that actually have a box on screen this render, in render order. Move earlier /
+// Move later step through THIS list rather than the raw App.liveGroups array, for the same
+// reason boundMemberIndices exists: an EMPTY group is kept but not drawn, so a raw ±1 index
+// shift can swap a visible box with an invisible one — a click that persists a change and
+// repaints nothing. Derived from App.groupAssign, which renderLive resolves over the unfiltered
+// session list, so it is exactly the set renderLive buckets (a grouped session is exempt from
+// the idle-and-zero-token filter, so no assigned session can be missing from it).
+function drawnGroups() {
+  const live = new Set();
+  if (App.groupAssign) for (const a of App.groupAssign.values()) live.add(a.group.id);
+  return App.liveGroups.filter((g) => live.has(g.id));
+}
+
+function groupMoveBox(gid, delta) {
+  const drawn = drawnGroups();
+  const at = drawn.findIndex((g) => g.id === gid);
+  if (at < 0) return;
+  const other = drawn[at + delta];
+  if (!other) return;
+  const from = App.liveGroups.indexOf(drawn[at]);
+  const to = App.liveGroups.indexOf(other);
+  if (from < 0 || to < 0) return;
+  // SWAP rather than splice, mirroring groupMoveMember: an undrawn group sitting between the two
+  // keeps its own slot, so a group that gets a card back lands where it was left.
+  App.liveGroups[from] = other;
+  App.liveGroups[to] = drawn[at];
   persistGroups();
   renderLive();
 }
