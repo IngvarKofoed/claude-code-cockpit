@@ -1714,7 +1714,12 @@ body {
   border: 1px solid var(--border-strong);
   border-radius: var(--r-sm);
   box-shadow: var(--shadow);
+  /* max-height is set by placeMenu() to the room on the side it opens toward. */
+  overflow-y: auto;
 }
+/* Once capped, a flex column shrinks its children to fit — and the content-less separators
+   would collapse to 0px. Overflow must scroll, never squash. */
+.menu > * { flex-shrink: 0; }
 .menu__item {
   appearance: none;
   border: 0;

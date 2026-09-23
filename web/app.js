@@ -455,9 +455,11 @@ const VERT_SVG =
 const HORZ_SVG =
   '<svg viewBox="0 0 16 16" fill="currentColor"><rect x="2.5" y="3" width="4.6" height="10" rx="1.2"/>' +
   '<rect x="8.9" y="3" width="4.6" height="10" rx="1.2"/></svg>';
-const CLOSE_SVG =
-  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">' +
-  '<path d="m4.5 4.5 7 7M11.5 4.5l-7 7"/></svg>';
+// Delete-group glyph: a bin, not a close ×. On a bounded box an × reads as "close / collapse this
+// panel", which is how the only delete control went unnoticed.
+const TRASH_SVG =
+  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" ' +
+  'stroke-linejoin="round"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.5h5.8l.6-8.5M6.8 7v3.8M9.2 7v3.8"/></svg>';
 // Group ORDER, drawn as the direction the box actually travels: .groups is a wrapping flex ROW,
 // so "earlier" is one slot left (wrapping to the end of the row above), not one row up.
 const CHEV_L_SVG =
@@ -1816,7 +1818,7 @@ function groupHTML(g, list, pos, total) {
     "</div>" +
     moveCluster(g, pos, total) +
     `<button class="group__del" type="button" data-group-del="${esc(g.id)}" ` +
-    `title="Delete group" aria-label="Delete group">${CLOSE_SVG}</button>` +
+    `title="Delete group" aria-label="Delete group">${TRASH_SVG}</button>` +
     "</div>" +
     `<div class="group__cards">${list.map(cardHTML).join("")}</div>` +
     "</div></section>"
@@ -1905,8 +1907,8 @@ function openGroupMenu(btn) {
   const a = App.groupAssign && App.groupAssign.get(sid);
   const g = a && a.group;
 
-  const row = (act, label, extra, on) =>
-    `<button class="menu__item menu__item--pick${on ? " menu__item--on" : ""}" type="button" ` +
+  const row = (act, label, extra, on, danger) =>
+    `<button class="menu__item menu__item--pick${on ? " menu__item--on" : ""}${danger ? " menu__item--danger" : ""}" type="button" ` +
     `data-act="${act}"${extra || ""}>` +
     `<span class="menu__tick">${on ? TICK_SVG : ""}</span>${esc(label)}</button>`;
 
@@ -1928,6 +1930,7 @@ function openGroupMenu(btn) {
     }
     html += '<div class="menu__sep"></div>';
     html += row("remove", "Remove from group");
+    html += row("delete", `Delete group “${g.name}”…`, "", false, true);
   }
   html += '<div class="menu__sep"></div>';
   html += row("new", "New group");
@@ -1938,10 +1941,7 @@ function openGroupMenu(btn) {
   menu.innerHTML = html;
   document.body.appendChild(menu);
   activeMenu = menu;
-  const mw = menu.offsetWidth;
-  const left = clamp(r.right - mw, 8, Math.max(8, window.innerWidth - mw - 8));
-  menu.style.top = Math.round(r.bottom + 4) + "px";
-  menu.style.left = Math.round(left) + "px";
+  placeMenu(menu, r);
 
   menu.addEventListener("click", (e) => {
     const item = e.target.closest(".menu__item");
@@ -1956,13 +1956,18 @@ function openGroupMenu(btn) {
     // Each action rebuilds the grid this button lives in, so focus would fall back to <body>.
     // preventScroll: a newly grouped card jumps to the top, and following it would yank a
     // reader further down the page. Same rule the pin toggle carried.
-    const again = [...$("cards").querySelectorAll(".pin-btn")].find((b) => b.dataset.pinSession === sid);
-    if (again) again.focus({ preventScroll: true });
+    const refocus = () => {
+      const again = [...$("cards").querySelectorAll(".pin-btn")].find((b) => b.dataset.pinSession === sid);
+      if (again) again.focus({ preventScroll: true });
+    };
+    // Delete opens a modal; refocus once it closes (confirmed or cancelled), not now.
+    if (act === "delete") groupDelete(g.id).then(refocus);
+    else refocus();
   });
 
   setTimeout(() => document.addEventListener("click", onDocClickForMenu), 0);
   window.addEventListener("resize", closeMenu);
-  window.addEventListener("scroll", closeMenu, true);
+  window.addEventListener("scroll", onScrollForMenu, true);
 }
 
 // Why a focus attempt failed, in the user's terms. The daemon returns a stable reason
@@ -2755,15 +2760,41 @@ function onDocClickForMenu(e) {
   if (activeMenu && !activeMenu.contains(e.target) && !e.target.closest(".repo-menu-btn, .pin-btn")) closeMenu();
 }
 
+// Page scrolls close the menu (its fixed position would drift off its button), but a scroll
+// INSIDE it must not: placeMenu caps its height, so a long picker scrolls itself, and the
+// capture-phase listener sees that scroll too.
+function onScrollForMenu(e) {
+  if (activeMenu && e.target instanceof Node && activeMenu.contains(e.target)) return;
+  closeMenu();
+}
+
 function closeMenu() {
   if (!activeMenu) return;
   activeMenu.remove();
   activeMenu = null;
   document.removeEventListener("click", onDocClickForMenu);
   window.removeEventListener("resize", closeMenu);
-  window.removeEventListener("scroll", closeMenu, true);
+  window.removeEventListener("scroll", onScrollForMenu, true);
   // An open group picker blocks renderLive; releasing it re-applies whatever was deferred.
   flushLiveRender();
+}
+
+// Anchor a floating .menu to a button rect: right edges aligned, clamped into the viewport
+// horizontally, opening BELOW the button unless it only fits above — a card near the bottom of
+// the page otherwise opened its picker off-screen, and a scroll to reach it closes the menu.
+// When neither side fits, it takes the roomier one and scrolls inside a capped height.
+function placeMenu(menu, r) {
+  const GAP = 4, EDGE = 8;
+  const mw = menu.offsetWidth;
+  const left = clamp(r.right - mw, EDGE, Math.max(EDGE, window.innerWidth - mw - EDGE));
+  const below = window.innerHeight - r.bottom - GAP - EDGE;
+  const above = r.top - GAP - EDGE;
+  const mh = menu.offsetHeight;
+  const up = mh > below && above > below;
+  menu.style.maxHeight = Math.max(80, Math.floor(up ? above : below)) + "px";
+  const top = up ? r.top - GAP - menu.offsetHeight : r.bottom + GAP;
+  menu.style.top = Math.round(Math.max(EDGE, top)) + "px";
+  menu.style.left = Math.round(left) + "px";
 }
 
 function openRepoMenu(btn) {
@@ -2777,11 +2808,7 @@ function openRepoMenu(btn) {
   document.body.appendChild(menu);
   activeMenu = menu;
   // Anchor under the button, right edges aligned, clamped into the viewport.
-  const r = btn.getBoundingClientRect();
-  const mw = menu.offsetWidth;
-  const left = clamp(r.right - mw, 8, Math.max(8, window.innerWidth - mw - 8));
-  menu.style.top = Math.round(r.bottom + 4) + "px";
-  menu.style.left = Math.round(left) + "px";
+  placeMenu(menu, btn.getBoundingClientRect());
   menu.querySelector(".menu__item--danger").addEventListener("click", () => {
     closeMenu();
     confirmDeleteRepo(repoRoot, repoName);
@@ -2789,7 +2816,7 @@ function openRepoMenu(btn) {
   // Defer so the click that opened the menu doesn't immediately close it.
   setTimeout(() => document.addEventListener("click", onDocClickForMenu), 0);
   window.addEventListener("resize", closeMenu);
-  window.addEventListener("scroll", closeMenu, true);
+  window.addEventListener("scroll", onScrollForMenu, true);
 }
 
 // In-app confirm (never a native confirm()). Resolves true on confirm, false on
