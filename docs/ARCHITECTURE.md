@@ -311,7 +311,7 @@ Mitigations, all concentrated in `transcript.js` behind a stable internal interf
 
 ## Cost estimation (`pricing.js`)
 
-A pure function over a **configurable pricing table**: `model → { input, output, cacheRead, cacheWrite, cacheWrite1h? }` in USD per million tokens. `cost = Σ tokens × rate`, always labelled an **estimate**. Cache writes are billed **per TTL** — `cacheWrite` is the 5-minute rate (1.25× input), `cacheWrite1h` the 1-hour one (2× input) — because Claude Code writes a large share (~41% measured) of its cache at 1h, and one blended rate materially understates cost. `cacheWrite1h` is **optional** in a rate and falls back to `cacheWrite`: making it required would fail the completeness check for every rates map written before it existed and render everything unpriced, while defaulting it to 0 would price 1-hour writes free. A model id's **variant and dated-snapshot suffixes are stripped** to find a rate (`claude-opus-5[1m]` and `claude-haiku-4-5-20251001` price at their base id — 1M context carries no long-context premium on Opus 4.7+/Sonnet 5, and a snapshot always bills at its alias's rate), with an explicit variant entry still winning. Config can override rates, change currency, or disable cost display entirely. An **unknown model** renders as `—` (never `$0`) with a "no rate configured" note, so missing rates are visible rather than silently wrong.
+A pure function over a **configurable pricing table**: `model → { input, output, cacheRead, cacheWrite, cacheWrite1h? }` in USD per million tokens. `cost = Σ tokens × rate`, always labelled an **estimate**. Cache writes are billed **per TTL** — `cacheWrite` is the 5-minute rate (1.25× input), `cacheWrite1h` the 1-hour one (2× input) — because Claude Code writes a large share (~41% measured) of its cache at 1h, and one blended rate materially understates cost. `cacheWrite1h` is **optional** in a rate and falls back to `cacheWrite`: making it required would fail the completeness check for every rates map written before it existed and render everything unpriced, while defaulting it to 0 would price 1-hour writes free. A model id's **variant and dated-snapshot suffixes are stripped** to find a rate (`claude-opus-5[1m]` and `claude-haiku-4-5-20251001` price at their base id — 1M context carries no long-context premium on Opus 4.7+/Sonnet 5, and a snapshot always bills at its alias's rate), with an explicit variant entry still winning. A **point release is its own key**: `claude-opus-5-5` never falls back to `claude-opus-5`, and must not — the two bill differently, and cache reads are not a uniform 0.1× input (0.05× on Opus 5.5, 0.025× on Fable/Mythos 5.1), so a new model's rate is copied from the pricing page rather than derived from its input price. Config can override rates, change currency, or disable cost display entirely. An **unknown model** renders as `—` (never `$0`) with a "no rate configured" note, so missing rates are visible rather than silently wrong.
 
 ## Rate-limit usage bars (live-account, freshest-reading-wins) + the per-session context gauge
 
@@ -414,7 +414,7 @@ Reuses the notifier's `paths.js` / `config.js` pattern with `APP_NAME = "claude-
     "enabled": true,
     "currency": "USD",
     "rates": {
-      "claude-sonnet-5": { "input": 3, "output": 15, "cacheRead": 0.3, "cacheWrite": 3.75, "cacheWrite1h": 6 }
+      "claude-sonnet-5": { "input": 2, "output": 10, "cacheRead": 0.2, "cacheWrite": 2.5, "cacheWrite1h": 4 }
     }
   },
   "subscriptionLabelPattern": "\\(([^)]+)\\)",

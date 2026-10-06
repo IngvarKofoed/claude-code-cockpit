@@ -12,7 +12,7 @@ const paths = require('./paths');
 // Schema version for one-time config migrations (see migrateRawConfig). Bump
 // this when a shipped default changes in a way that must reach users who have
 // already persisted the old value, and add the matching migration below.
-const CONFIG_VERSION = 3;
+const CONFIG_VERSION = 4;
 
 // The palette slots a modelColors value may take. Mirrors the --mc-* tokens in
 // web/styles.css (and MODEL_COLOR_SLOTS in web/app.js — the browser bundle is an ES
@@ -75,12 +75,24 @@ const DEFAULT_CONFIG = {
     rates: {
       // USD per 1,000,000 tokens. cacheWrite is the 5-minute-TTL cache-write rate
       // (1.25x input) and cacheWrite1h the 1-hour one (2x input); cacheRead is 0.1x
-      // input. Both TTLs occur in normal Claude Code use — roughly 40% of cache
-      // writes are 1h — so pricing them at one rate materially understates cost.
-      // cacheWrite1h is OPTIONAL in a rate and falls back to cacheWrite (see
-      // pricing.RATE_FALLBACK), which is what keeps an older saved map working.
+      // input — EXCEPT Fable/Mythos 5.1 (0.025x) and Opus 5.5 (0.05x), so a new
+      // model's rate is never derivable from its input price alone; copy the row
+      // from the pricing page. Both TTLs occur in normal Claude Code use — roughly
+      // 40% of cache writes are 1h — so pricing them at one rate materially
+      // understates cost. cacheWrite1h is OPTIONAL in a rate and falls back to
+      // cacheWrite (see pricing.RATE_FALLBACK), which is what keeps an older saved
+      // map working.
+      //
+      // A point release is its own key: baseModelId strips only a "[1m]" variant
+      // and a dated snapshot, so "claude-opus-5-5" never falls back to
+      // "claude-opus-5" — correctly, since the two bill differently.
+      'claude-fable-5-1': { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5, cacheWrite1h: 20 },
+      'claude-mythos-5-1': { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5, cacheWrite1h: 20 },
       'claude-fable-5': { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5, cacheWrite1h: 20 },
       'claude-mythos-5': { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5, cacheWrite1h: 20 },
+      // Opus 5.5 is cheaper than Opus 5. Fast mode ($8/$40) shares the model id,
+      // so a fast-mode turn is under-estimated — the same accepted gap as Opus 5.
+      'claude-opus-5-5': { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5, cacheWrite1h: 8 },
       // Opus 5 prices at the Opus 4.5+ tier, and its 1M context is the default
       // with no long-context premium — so the "[1m]" variant id bills the same
       // (priced via pricing.js's base-id fallback, not a second entry here).
@@ -91,9 +103,11 @@ const DEFAULT_CONFIG = {
       'claude-opus-4-7': { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
       'claude-opus-4-6': { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
       'claude-opus-4-5': { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25, cacheWrite1h: 10 },
-      // Sonnet 5 has an intro rate of $2/$10 through 2026-08-31; this is the
-      // standard post-intro rate it reverts to (see docs/CHANGELOG.md).
-      'claude-sonnet-5': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, cacheWrite1h: 6 },
+      'claude-sonnet-5-5': { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5, cacheWrite1h: 4 },
+      // Sonnet 5's launch "intro" $2/$10 became its standard price; the scheduled
+      // rise to $3/$15 on 2026-09-01 was cancelled. It shipped here at $3/$15 in
+      // anticipation of that rise — see PRE_V4_DEFAULT_RATES for the correction.
+      'claude-sonnet-5': { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5, cacheWrite1h: 4 },
       'claude-sonnet-4-6': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, cacheWrite1h: 6 },
       'claude-sonnet-4-5': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, cacheWrite1h: 6 },
       'claude-haiku-4-5': { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25, cacheWrite1h: 2 },
@@ -142,6 +156,26 @@ const RATE_MODELS_ADDED_IN_V2 = [
   'claude-3-5-haiku',
 ];
 deepFreeze(RATE_MODELS_ADDED_IN_V2);
+
+// Rate keys that FIRST shipped as defaults in configVersion 4 — re-added to a
+// persisted map on exactly the RATE_MODELS_ADDED_IN_V2 reasoning.
+const RATE_MODELS_ADDED_IN_V4 = [
+  'claude-fable-5-1',
+  'claude-mythos-5-1',
+  'claude-opus-5-5',
+  'claude-sonnet-5-5',
+];
+deepFreeze(RATE_MODELS_ADDED_IN_V4);
+
+// The v3 shipped default that v4 corrects: Sonnet 5 at $3/$15, priced for a rise
+// that never happened. Matched by value like PRE_V1_DEFAULT_RATES (same accepted
+// trade-off: $3/$15 is never a deliberate Sonnet 5 rate), but on all FIVE classes
+// where the saved rate carries a 1h rate — a user who customized only cacheWrite1h
+// edited the rate, and keeps it.
+const PRE_V4_DEFAULT_RATES = {
+  'claude-sonnet-5': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, cacheWrite1h: 6 },
+};
+deepFreeze(PRE_V4_DEFAULT_RATES);
 
 // ---- small helpers -----------------------------------------------------
 
@@ -405,6 +439,17 @@ function validateConfig(input) {
 
 // ---- one-time migrations -----------------------------------------------
 
+// Add the shipped default rate for each model the persisted map lacks. Only ever
+// used with a RATE_MODELS_ADDED_IN_Vn list: a key that first shipped in that
+// version can't be absent by deliberate Settings removal. A present entry, at any
+// value, is left untouched.
+function addMissingDefaultRates(rates, models) {
+  for (const model of models) {
+    const current = DEFAULT_CONFIG.cost.rates[model];
+    if (current && !(model in rates)) rates[model] = clone(current);
+  }
+}
+
 // Apply schema migrations to a RAW on-disk config object (before validation,
 // so the true stored configVersion is visible). Returns { config, changed };
 // `changed` is true when anything — a rate or the version stamp — was updated,
@@ -435,10 +480,7 @@ function migrateRawConfig(raw) {
   // (see RATE_MODELS_ADDED_IN_V2 for why re-adding these can't undo a delete).
   // An entry the user already has — at any value — is left untouched.
   if (from < 2 && isPlainObject(out.cost) && isPlainObject(out.cost.rates)) {
-    for (const model of RATE_MODELS_ADDED_IN_V2) {
-      const current = DEFAULT_CONFIG.cost.rates[model];
-      if (current && !(model in out.cost.rates)) out.cost.rates[model] = clone(current);
-    }
+    addMissingDefaultRates(out.cost.rates, RATE_MODELS_ADDED_IN_V2);
   }
   // v2 -> v3: fill in the new cacheWrite1h (1-hour cache-write) rate — but ONLY on
   // an entry whose four required classes still equal the current shipped default,
@@ -453,6 +495,20 @@ function migrateRawConfig(raw) {
       if (!current || current.cacheWrite1h == null) continue; // no default 1h rate to apply
       if (!isPlainObject(saved) || saved.cacheWrite1h != null) continue; // absent only
       if (ratesEqual(saved, current)) saved.cacheWrite1h = current.cacheWrite1h;
+    }
+  }
+  // v3 -> v4: price the 5.1 / 5.5 point releases (absent keys only, as in v1 -> v2),
+  // and correct a Sonnet 5 rate still at its v3 default. A v2 config's Sonnet 5 was
+  // skipped by the 1h fill above (it no longer equals the current default), so here
+  // an ABSENT cacheWrite1h also counts as matching — that is the same old default.
+  if (from < 4 && isPlainObject(out.cost) && isPlainObject(out.cost.rates)) {
+    addMissingDefaultRates(out.cost.rates, RATE_MODELS_ADDED_IN_V4);
+    for (const model of Object.keys(PRE_V4_DEFAULT_RATES)) {
+      const old = PRE_V4_DEFAULT_RATES[model];
+      const saved = out.cost.rates[model];
+      if (!DEFAULT_CONFIG.cost.rates[model] || !ratesEqual(saved, old)) continue;
+      if (saved.cacheWrite1h != null && toNum(saved.cacheWrite1h) !== old.cacheWrite1h) continue;
+      out.cost.rates[model] = clone(DEFAULT_CONFIG.cost.rates[model]);
     }
   }
   out.configVersion = CONFIG_VERSION;

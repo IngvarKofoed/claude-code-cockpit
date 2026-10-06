@@ -396,6 +396,70 @@ test('migrateRawConfig: an explicit cacheWrite1h is never overwritten', () => {
   assert.strictEqual(config.cost.rates['claude-opus-4-8'].cacheWrite1h, 99);
 });
 
+// ---- v3 -> v4 migration: 5.1 / 5.5 point releases + the Sonnet 5 correction ----
+
+const OLD_SONNET_5 = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, cacheWrite1h: 6 };
+const NEW_SONNET_5 = DEFAULT_CONFIG.cost.rates['claude-sonnet-5'];
+const V4_MODELS = ['claude-fable-5-1', 'claude-mythos-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5'];
+
+test('migrateRawConfig: a v3 config gains every rate key first shipped in v4', () => {
+  const raw = { configVersion: 3, cost: { rates: { 'claude-opus-5': { ...DEFAULT_CONFIG.cost.rates['claude-opus-5'] } } } };
+  const { config, changed } = migrateRawConfig(raw);
+  assert.strictEqual(changed, true);
+  assert.strictEqual(config.configVersion, CONFIG_VERSION);
+  for (const m of V4_MODELS) assert.deepStrictEqual(config.cost.rates[m], DEFAULT_CONFIG.cost.rates[m], m);
+});
+
+test('migrateRawConfig: an existing v4-model rate is never overwritten', () => {
+  const custom = { input: 9, output: 9, cacheRead: 9, cacheWrite: 9 };
+  const raw = { configVersion: 3, cost: { rates: { 'claude-opus-5-5': { ...custom } } } };
+  assert.deepStrictEqual(migrateRawConfig(raw).config.cost.rates['claude-opus-5-5'], custom);
+});
+
+test('migrateRawConfig: Sonnet 5 still at its v3 default ($3/$15) is corrected to $2/$10', () => {
+  const raw = { configVersion: 3, cost: { rates: { 'claude-sonnet-5': { ...OLD_SONNET_5 } } } };
+  assert.deepStrictEqual(migrateRawConfig(raw).config.cost.rates['claude-sonnet-5'], NEW_SONNET_5);
+});
+
+test('migrateRawConfig: a v2 Sonnet 5 at the old default (no 1h class yet) is corrected too', () => {
+  // The v2->v3 1h fill compares against the CURRENT default, which no longer matches,
+  // so this rate reaches the v4 step without cacheWrite1h — still the old default.
+  const { cacheWrite1h: _drop, ...v2Saved } = OLD_SONNET_5;
+  const raw = { configVersion: 2, cost: { rates: { 'claude-sonnet-5': v2Saved } } };
+  assert.deepStrictEqual(migrateRawConfig(raw).config.cost.rates['claude-sonnet-5'], NEW_SONNET_5);
+});
+
+test('migrateRawConfig: a customized Sonnet 5 rate is kept, including a custom 1h rate alone', () => {
+  const custom = { input: 2.5, output: 12, cacheRead: 0.25, cacheWrite: 3 };
+  const a = migrateRawConfig({ configVersion: 3, cost: { rates: { 'claude-sonnet-5': { ...custom } } } });
+  assert.deepStrictEqual(a.config.cost.rates['claude-sonnet-5'], custom);
+  const only1h = { ...OLD_SONNET_5, cacheWrite1h: 7 };
+  const b = migrateRawConfig({ configVersion: 3, cost: { rates: { 'claude-sonnet-5': { ...only1h } } } });
+  assert.deepStrictEqual(b.config.cost.rates['claude-sonnet-5'], only1h);
+});
+
+test('migrateRawConfig: a removed Sonnet 5 stays removed', () => {
+  const raw = { configVersion: 3, cost: { rates: { 'claude-opus-5': { ...DEFAULT_CONFIG.cost.rates['claude-opus-5'] } } } };
+  assert.strictEqual('claude-sonnet-5' in migrateRawConfig(raw).config.cost.rates, false);
+});
+
+test('default rates price the 5.1 / 5.5 ids Claude Code emits, at their own cache-read rate', () => {
+  // A point release never falls back to its x.0 sibling (baseModelId strips only
+  // "[1m]" and a dated snapshot), so each needs its own key — and the cache-read
+  // multiplier differs per model, which is where most Claude Code spend lands.
+  const pricing = require('./pricing');
+  const read = (model) => pricing.estimateCost({ [model]: { cacheRead: 1_000_000 } }, DEFAULT_CONFIG.cost.rates);
+  for (const [model, usd] of [
+    ['claude-opus-5-5', 0.2], ['claude-opus-5-5[1m]', 0.2],
+    ['claude-fable-5-1', 0.25], ['claude-mythos-5-1', 0.25],
+    ['claude-sonnet-5-5', 0.2], ['claude-sonnet-5', 0.2],
+  ]) {
+    const res = read(model);
+    assert.deepStrictEqual(res.unpriced, [], model);
+    assert.ok(Math.abs(res.total - usd) < 1e-9, `${model}: ${res.total} != ${usd}`);
+  }
+});
+
 test('validateConfig: cacheWrite1h survives validation; absent stays absent (fallback applies)', () => {
   const withIt = validateConfig({ cost: { rates: { m: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1.25, cacheWrite1h: 2 } } } });
   assert.strictEqual(withIt.config.cost.rates.m.cacheWrite1h, 2);
