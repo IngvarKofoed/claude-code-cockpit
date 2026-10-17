@@ -494,6 +494,297 @@ test('bgAgents absent (older emit.js) falls back to bgTasks, preserving past beh
   assert.strictEqual(atRest(s), false);
 });
 
+// --- Shell waits: a background shell the turn ENDED on launching is work -----------------
+
+// The main thread launches background shell `id` (a Bash run_in_background / Monitor) at `ts`.
+function launch(id, ts, over = {}) {
+  return [
+    ev('PreToolUse', { ts, tool_name: 'Bash', ...over }),
+    ev('PostToolUse', { ts, tool_name: 'Bash', bg_launch: id, ...over }),
+  ];
+}
+
+const T0 = Date.parse('2026-07-02T10:00:00.000Z');
+const MIN = 60000;
+
+test('a turn that ENDS on launching a background shell keeps the session engaged until it exits', () => {
+  // The test-run shape: launch the suite, end the turn, be woken by its completion.
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ...launch('b1', '2026-07-02T10:00:04.000Z'),
+    ev('Stop', { ts: '2026-07-02T10:00:05.000Z', bg_tasks: 1, bg_agents: 0, bg_shell_ids: ['b1'] }),
+  ]);
+  const s = state.sessions.s1;
+  assert.strictEqual(s.status, 'idle'); // the turn is over...
+  assert.ok(s.engagedStartedAt); // ...but the session is still working
+  assert.strictEqual(s.disengagedNow, false); // no "finished" while the tests run
+  assert.strictEqual(atRest(s, T0 + 2 * MIN), false); // closing the laptop would kill the run
+  assert.deepStrictEqual(Object.keys(s.shellWait), ['b1']);
+
+  // the shell exits; Claude Code wakes the session with a fresh prompt five minutes later
+  applyEvent(state, ev('UserPromptSubmit', { ts: '2026-07-02T10:05:05.000Z', prompt_id: 'p2' }));
+  assert.strictEqual(s.activeMs, 305000); // 5s turn + the 5-minute wait
+  applyEvent(state, ev('Stop', { ts: '2026-07-02T10:05:10.000Z', bg_tasks: 0, bg_agents: 0, bg_shell_ids: [] }));
+  assert.deepStrictEqual(s.shellWait, {});
+  assert.strictEqual(s.disengagedNow, true); // "finished" lands at the real end
+  assert.strictEqual(s.activeMs, 310000);
+});
+
+test('a shell launched and then used in the same turn (a dev server) is not waited on', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ...launch('srv', '2026-07-02T10:00:02.000Z'),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:06.000Z', tool_name: 'Bash' }), // curl it
+    ev('PostToolUse', { ts: '2026-07-02T10:00:07.000Z', tool_name: 'Bash' }),
+    ev('Stop', { ts: '2026-07-02T10:00:10.000Z', bg_tasks: 1, bg_agents: 0, bg_shell_ids: ['srv'] }),
+  ]);
+  const s = state.sessions.s1;
+  assert.deepStrictEqual(s.shellWait, {});
+  assert.strictEqual(s.engagedStartedAt, null);
+  assert.strictEqual(s.disengagedNow, true); // finished, as before
+  applyEvent(state, ev('UserPromptSubmit', { ts: '2026-07-02T14:00:00.000Z', prompt_id: 'p2' }));
+  assert.strictEqual(s.activeMs, 10000); // the server's hours are not billed
+});
+
+test('every shell in the final batch is waited on; one that already exited is not', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    // parallel batch: the suite, a Monitor on its output, and a quick command that is done by Stop
+    ev('PreToolUse', { ts: '2026-07-02T10:00:02.000Z', tool_name: 'Bash' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:02.000Z', tool_name: 'Monitor' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:02.000Z', tool_name: 'Bash' }),
+    ev('PostToolUse', { ts: '2026-07-02T10:00:03.000Z', tool_name: 'Bash', bg_launch: 'b1' }),
+    ev('PostToolUse', { ts: '2026-07-02T10:00:03.000Z', tool_name: 'Monitor', bg_launch: 'm1' }),
+    ev('PostToolUse', { ts: '2026-07-02T10:00:03.000Z', tool_name: 'Bash', bg_launch: 'quick' }),
+    ev('Stop', { ts: '2026-07-02T10:00:05.000Z', bg_tasks: 2, bg_agents: 0, bg_shell_ids: ['b1', 'm1'] }),
+  ]);
+  const s = state.sessions.s1;
+  assert.deepStrictEqual(Object.keys(s.shellWait).sort(), ['b1', 'm1']);
+  assert.strictEqual(snapshot(state, T0).sessions[0].shellWaitCount, 2);
+});
+
+test("a subagent's tool calls neither end the main thread's turn nor launch its waits", () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ...launch('b1', '2026-07-02T10:00:02.000Z'),
+    // a background workflow's subagent works on the parent session after the launch...
+    ev('PreToolUse', { ts: '2026-07-02T10:00:03.000Z', tool_name: 'Read', subagent: true }),
+    ev('PostToolUse', { ts: '2026-07-02T10:00:03.000Z', tool_name: 'Read', subagent: true }),
+    // ...and launches a shell of its own
+    ...launch('sub', '2026-07-02T10:00:04.000Z', { subagent: true }),
+    ev('Stop', { ts: '2026-07-02T10:00:05.000Z', bg_tasks: 2, bg_agents: 0, bg_shell_ids: ['b1', 'sub'] }),
+  ]);
+  assert.deepStrictEqual(Object.keys(state.sessions.s1.shellWait), ['b1']);
+});
+
+test('a tool-less turn carries the wait; a turn that does other work drops it', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ...launch('b1', '2026-07-02T10:00:02.000Z'),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:02.000Z', tool_name: 'Monitor' }),
+    ev('PostToolUse', { ts: '2026-07-02T10:00:02.000Z', tool_name: 'Monitor', bg_launch: 'm1' }),
+    ev('Stop', { ts: '2026-07-02T10:00:05.000Z', bg_tasks: 2, bg_agents: 0, bg_shell_ids: ['b1', 'm1'] }),
+  ]);
+  const s = state.sessions.s1;
+  assert.deepStrictEqual(Object.keys(s.shellWait), ['m1']); // the Monitor was the last batch
+
+  // a Monitor event wakes Claude, which only acknowledges it: still waiting
+  applyEvent(state, ev('UserPromptSubmit', { ts: '2026-07-02T10:03:00.000Z', prompt_id: 'p2' }));
+  applyEvent(state, ev('Stop', { ts: '2026-07-02T10:03:02.000Z', bg_tasks: 2, bg_agents: 0, bg_shell_ids: ['b1', 'm1'] }));
+  assert.deepStrictEqual(Object.keys(s.shellWait), ['m1']);
+  assert.strictEqual(s.shellWait.m1, Date.parse('2026-07-02T10:00:05.000Z')); // cap anchor kept
+  assert.strictEqual(s.disengagedNow, false);
+
+  // the run reports; Claude reads the results and ends without launching anything. The Monitor
+  // (a tail -f) is still registered, but the session is done and waiting on the user now.
+  applyEvent(state, ev('UserPromptSubmit', { ts: '2026-07-02T10:09:00.000Z', prompt_id: 'p3' }));
+  applyEvent(state, ev('PreToolUse', { ts: '2026-07-02T10:09:01.000Z', tool_name: 'Read' }));
+  applyEvent(state, ev('PostToolUse', { ts: '2026-07-02T10:09:02.000Z', tool_name: 'Read' }));
+  applyEvent(state, ev('Stop', { ts: '2026-07-02T10:09:05.000Z', bg_tasks: 1, bg_agents: 0, bg_shell_ids: ['m1'] }));
+  assert.deepStrictEqual(s.shellWait, {});
+  assert.strictEqual(s.disengagedNow, true);
+});
+
+test('a SubagentStop prunes exited shells from the wait but never adds one', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ...launch('b1', '2026-07-02T10:00:02.000Z'),
+    ev('Stop', { ts: '2026-07-02T10:00:05.000Z', bg_tasks: 2, bg_agents: 1, bg_shell_ids: ['b1'] }),
+    ev('SubagentStop', { ts: '2026-07-02T10:01:00.000Z', bg_tasks: 1, bg_agents: 0, bg_shell_ids: ['b1', 'x'] }),
+  ]);
+  const s = state.sessions.s1;
+  assert.deepStrictEqual(Object.keys(s.shellWait), ['b1']);
+  assert.strictEqual(s.disengagedNow, false); // the agent is done but the tests are not
+  applyEvent(state, ev('SubagentStop', { ts: '2026-07-02T10:02:00.000Z', bg_tasks: 1, bg_agents: 0, bg_shell_ids: ['x'] }));
+  assert.deepStrictEqual(s.shellWait, {});
+  assert.strictEqual(s.disengagedNow, true);
+});
+
+test('a shell wait stops counting at the hour cap, identically live and on replay', () => {
+  const events = [
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ...launch('hang', '2026-07-02T10:00:04.000Z'),
+    ev('Stop', { ts: '2026-07-02T10:00:05.000Z', bg_tasks: 1, bg_agents: 0, bg_shell_ids: ['hang'] }),
+    // the shell never exits; the user comes back three hours later
+    ev('UserPromptSubmit', { ts: '2026-07-02T13:00:00.000Z', prompt_id: 'p2' }),
+    ev('Stop', { ts: '2026-07-02T13:00:10.000Z', bg_tasks: 1, bg_agents: 0, bg_shell_ids: ['hang'] }),
+  ];
+  const state = createState();
+  for (const e of events.slice(0, 5)) applyEvent(state, e);
+  const s = state.sessions.s1;
+  const until = Date.parse('2026-07-02T11:00:05.000Z');
+  assert.strictEqual(snapshot(state, T0).sessions[0].shellWaitUntil, until);
+  assert.strictEqual(atRest(s, until - 1), false);
+  assert.strictEqual(atRest(s, until), true); // the cap passes with no event marking it
+  assert.strictEqual(snapshot(state, until).sessions[0].shellWaitUntil, until); // client compares
+
+  for (const e of events.slice(5)) applyEvent(state, e);
+  const expected = 5000 + 3600000 + 10000; // turn + one capped hour + the second turn
+  assert.strictEqual(s.activeMs, expected);
+  // a tool-less turn carried the wait, but its cap anchor did not move — it stays expired
+  assert.strictEqual(atRest(s, Date.parse('2026-07-02T13:00:10.000Z')), true);
+
+  const rollup = accumulateActiveFromEvents(createRollup('2026-07-02'), events);
+  assert.strictEqual(rollup.repos['/code/acme-api'].activeMs, expected);
+});
+
+test('re-engaging after a silently expired wait restarts the working timer; a bad ts never reads the wait as live', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ...launch('hang', '2026-07-02T10:00:04.000Z'),
+    ev('Stop', { ts: '2026-07-02T10:00:05.000Z', bg_tasks: 1, bg_agents: 0, bg_shell_ids: ['hang'] }),
+  ]);
+  const s = state.sessions.s1;
+  assert.strictEqual(require('./aggregate').shellWaitLive(s, 0), false);
+  applyEvent(state, ev('UserPromptSubmit', { ts: '2026-07-02T13:00:00.000Z', prompt_id: 'p2' }));
+  assert.strictEqual(s.engagedStartedAt, '2026-07-02T13:00:00.000Z');
+});
+
+test('the card sort ranks a session waiting on its shell as running', () => {
+  const state = createState();
+  applyEvent(state, ev('SessionStart', { session_id: 'idle' }));
+  applyEvent(state, ev('Stop', { session_id: 'idle', ts: '2026-07-02T10:00:09.000Z' }));
+  applyEvent(state, ev('SessionStart', { session_id: 'tests' }));
+  for (const e of launch('b1', '2026-07-02T10:00:04.000Z', { session_id: 'tests' })) applyEvent(state, e);
+  applyEvent(
+    state,
+    ev('Stop', { session_id: 'tests', ts: '2026-07-02T10:00:05.000Z', bg_tasks: 1, bg_agents: 0, bg_shell_ids: ['b1'] })
+  );
+  // statusRank reads the wall clock, so these 2026-07 fixtures are long past their cap: pin it
+  const realNow = Date.now;
+  try {
+    Date.now = () => T0 + MIN;
+    assert.deepStrictEqual(snapshot(state, 0).sessions.map((c) => c.sessionId), ['tests', 'idle']);
+    Date.now = () => T0 + 2 * 3600000;
+    assert.deepStrictEqual(snapshot(state, 0).sessions.map((c) => c.sessionId), ['idle', 'tests']);
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+test('a test-run shell is waited on however the turn ended, until it leaves the registry', () => {
+  // The suite was launched mid-turn and Claude carried on working, so the turn did NOT end on
+  // it — but its command reads as a test run (bg_test_ids, classified in the hook).
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ...launch('suite', '2026-07-02T10:00:02.000Z'),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:04.000Z', tool_name: 'Read' }),
+    ev('PostToolUse', { ts: '2026-07-02T10:00:05.000Z', tool_name: 'Read' }),
+    ev('Stop', {
+      ts: '2026-07-02T10:00:10.000Z',
+      bg_tasks: 2,
+      bg_agents: 0,
+      bg_shell_ids: ['suite', 'srv'],
+      bg_test_ids: ['suite'],
+    }),
+  ]);
+  const s = state.sessions.s1;
+  assert.deepStrictEqual(Object.keys(s.shellWait), ['suite']); // the dev server stays out
+  assert.strictEqual(s.disengagedNow, false);
+
+  // the user asks something else; Claude uses tools and ends on no launch — still running
+  applyEvent(state, ev('UserPromptSubmit', { ts: '2026-07-02T10:02:00.000Z', prompt_id: 'p2' }));
+  applyEvent(state, ev('PreToolUse', { ts: '2026-07-02T10:02:01.000Z', tool_name: 'Grep' }));
+  applyEvent(state, ev('PostToolUse', { ts: '2026-07-02T10:02:02.000Z', tool_name: 'Grep' }));
+  applyEvent(
+    state,
+    ev('Stop', {
+      ts: '2026-07-02T10:02:05.000Z',
+      bg_tasks: 2,
+      bg_agents: 0,
+      bg_shell_ids: ['suite', 'srv'],
+      bg_test_ids: ['suite'],
+    })
+  );
+  assert.strictEqual(s.shellWait.suite, Date.parse('2026-07-02T10:00:10.000Z')); // first-seen anchor kept
+  assert.strictEqual(s.disengagedNow, false);
+
+  // the suite exits; the server keeps running
+  applyEvent(state, ev('UserPromptSubmit', { ts: '2026-07-02T10:06:00.000Z', prompt_id: 'p3' }));
+  applyEvent(
+    state,
+    ev('Stop', { ts: '2026-07-02T10:06:05.000Z', bg_tasks: 1, bg_agents: 0, bg_shell_ids: ['srv'], bg_test_ids: [] })
+  );
+  assert.deepStrictEqual(s.shellWait, {});
+  assert.strictEqual(s.disengagedNow, true);
+  assert.strictEqual(s.activeMs, 365000); // nothing idle: the suite covered every gap
+});
+
+test('a test-run shell first seen at a SubagentStop joins the wait there', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('Stop', { ts: '2026-07-02T10:00:05.000Z', bg_tasks: 1, bg_agents: 1, bg_shell_ids: [] }),
+    ev('SubagentStop', {
+      ts: '2026-07-02T10:01:00.000Z',
+      bg_tasks: 1,
+      bg_agents: 0,
+      bg_shell_ids: ['sub-suite'],
+      bg_test_ids: ['sub-suite'],
+    }),
+  ]);
+  const s = state.sessions.s1;
+  assert.strictEqual(s.shellWait['sub-suite'], Date.parse('2026-07-02T10:01:00.000Z'));
+  assert.strictEqual(s.disengagedNow, false); // the agent is done, its test run is not
+});
+
+test('events from an older emit.js (no bg_shell_ids) never start a wait', () => {
+  // Replays of history written before the field must re-derive exactly the numbers they had.
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ev('PreToolUse', { ts: '2026-07-02T10:00:04.000Z', tool_name: 'Bash' }),
+    ev('PostToolUse', { ts: '2026-07-02T10:00:04.000Z', tool_name: 'Bash' }),
+    ev('Stop', { ts: '2026-07-02T10:00:05.000Z', bg_tasks: 1, bg_agents: 0 }),
+  ]);
+  const s = state.sessions.s1;
+  assert.deepStrictEqual(s.shellWait, {});
+  assert.strictEqual(s.engagedStartedAt, null);
+});
+
+test('SessionEnd drops the wait, and the card never carries task ids', () => {
+  const state = run([
+    ev('SessionStart'),
+    ev('UserPromptSubmit', { ts: '2026-07-02T10:00:00.000Z', prompt_id: 'p1' }),
+    ...launch('b1', '2026-07-02T10:00:04.000Z'),
+    ev('Stop', { ts: '2026-07-02T10:00:05.000Z', bg_tasks: 1, bg_agents: 0, bg_shell_ids: ['b1'] }),
+  ]);
+  const card = snapshot(state, T0).sessions[0];
+  assert.strictEqual('shellWait' in card, false);
+  assert.strictEqual('shellLaunches' in card, false);
+  applyEvent(state, ev('SessionEnd', { ts: '2026-07-02T10:01:00.000Z', reason: 'exit' }));
+  assert.deepStrictEqual(state.sessions.s1.shellWait, {});
+});
+
 test('background completion: the final SubagentStop settles residual running to idle and signals finished', () => {
   const state = run([
     ev('SessionStart'),

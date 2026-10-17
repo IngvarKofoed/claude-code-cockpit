@@ -493,7 +493,15 @@ const STATUS_LABEL = {
 function effectiveStatus(s) {
   const raw = s.status || "idle";
   if (raw === "waiting" || raw === "error") return raw;
-  return raw === "running" || backgroundWork(s) > 0 ? "running" : "idle";
+  return raw === "running" || backgroundWork(s) > 0 || shellWaitLive(s) ? "running" : "idle";
+}
+
+// A background shell the session ENDED ITS TURN waiting on — a test run it launched and will be
+// woken by — is work too, until the daemon's deadline (s.shellWaitUntil: the shell left the
+// registry, or the hour cap). Read against the drift-corrected clock; the daemon broadcasts the
+// moment the cap passes, so the card flips without waiting for the next session event.
+function shellWaitLive(s) {
+  return num(s.shellWaitUntil) > estNow();
 }
 
 // Background work that means the session is WORKING: the registry minus run_in_background
@@ -526,7 +534,15 @@ function activityText(s) {
   const status = displayStatus(s);
   switch (status) {
     case "running": {
-      const base = s.currentActivity ? "Running " + s.currentActivity : "Working…";
+      // Held running only by a shell it is waiting on (its turn is over, nothing else in
+      // flight): name that, rather than a generic "Working…" that reads as a live turn.
+      const shellOnly = s.status !== "running" && backgroundWork(s) === 0 && shellWaitLive(s);
+      const n = num(s.shellWaitCount);
+      const base = s.currentActivity
+        ? "Running " + s.currentActivity
+        : shellOnly && n > 0
+          ? "Running " + n + " background shell" + (n === 1 ? "" : "s")
+          : "Working…";
       // Still finishing a tool that passed the gate before the pause was clicked — not yet
       // parked (s.atRest false). A subtle hint distinguishes "pausing" from ordinary running.
       const pausing = App.state && App.state.paused && App.state.paused.active && !s.atRest;

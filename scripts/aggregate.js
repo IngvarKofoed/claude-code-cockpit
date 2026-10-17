@@ -106,6 +106,16 @@ function newSession(event) {
     // reader falls back to bgTasks so historical replays keep their existing numbers rather
     // than silently re-deriving a different past.
     bgAgents: null,
+    // Background shells the session is WAITING on — { taskId: sinceMs } — the exception to
+    // "a shell is not work". A shell joins when the main thread ENDS its turn on launching it
+    // (a test run: launch, end the turn, be woken by its completion) and leaves when it drops
+    // out of the registry. See foldShellWait for the rules and SHELL_WAIT_CAP_MS for the cap.
+    shellWait: {},
+    // Shell task ids launched by the main thread's latest batch of tool calls in the open
+    // turn. Every main-thread PreToolUse resets it to [], so at Stop it holds exactly what the
+    // turn ended on — a dev server started and then used never survives to the Stop. null
+    // means the turn has made no main-thread tool call at all (reset at each turn end).
+    shellLaunches: null,
     // Set by applyEvent to true on exactly the event that ENDS the engaged period (turn done
     // AND no background work left) — the daemon fires "session finished" on this, so a Stop that
     // only handed off to a background workflow doesn't notify and the real completion does.
@@ -232,19 +242,48 @@ function currentSubscription(state) {
 // permission prompt) or `idle` with nothing backgrounded. "Background work in flight" comes
 // from Claude Code's AUTHORITATIVE task registry (session.bgTasks — the length of the Stop/
 // SubagentStop `background_tasks` array, v2.1.145+), NOT the ±unreliable SubagentStart/
-// SubagentStop counter. This is what keeps a background workflow / subagent / run_in_background
-// shell counting after the launching turn's Stop, while ensuring a dropped SubagentStop can no
-// longer strand the session "engaged" forever (the count self-heals on the next carrying event).
-// Background work that counts as the session WORKING: the registry minus run_in_background
-// shells (see emit.js `bg_agents`). Falls back to the full count when bgAgents is unknown —
+// SubagentStop counter. This is what keeps a background workflow / subagent counting after the
+// launching turn's Stop, while ensuring a dropped SubagentStop can no longer strand the session
+// "engaged" forever (the count self-heals on the next carrying event). A background shell counts
+// only while the session is waiting on it (shellWait, below) — never just for being registered.
+// Background work that counts as the session WORKING: the registry minus background shells
+// (see emit.js `bg_agents`). Falls back to the full count when bgAgents is unknown —
 // an older emit.js, or a replay of events written before the field existed — so historical
 // numbers stay exactly as they were rather than being silently re-derived.
 function backgroundWork(session) {
   return session.bgAgents == null ? num(session.bgTasks) : num(session.bgAgents);
 }
 
-function isEngaged(session) {
-  return session.status === 'running' || backgroundWork(session) > 0;
+// How long a shell the session is waiting on may hold it engaged. The wait normally ends
+// on its own — the shell exits, Claude Code wakes the session, and the next Stop's registry
+// no longer lists it — so this only bounds the cases where it never does: a hung wait loop,
+// or a dev server that happened to be the turn's last launch. An hour covers the longest
+// waits observed (hour-long browser passes; Monitor's own timeout tops out there too).
+const SHELL_WAIT_CAP_MS = 60 * 60 * 1000;
+
+// Epoch ms the session's shell wait expires (its newest member's start + the cap), or 0
+// when it is waiting on nothing. Tolerates a session restored from a snapshot that predates
+// the field.
+function shellWaitUntil(session) {
+  const w = session && session.shellWait;
+  if (!w || typeof w !== 'object') return 0;
+  let newest = 0;
+  for (const id of Object.keys(w)) newest = Math.max(newest, num(w[id]));
+  return newest ? newest + SHELL_WAIT_CAP_MS : 0;
+}
+
+// An unknown time (applyEvent's nowMs is 0 on a missing/unparseable ts) is not inside the
+// wait: otherwise every bad-ts event would read any wait — even one long expired — as live,
+// breaking the clock's rule that a bad ts stops the span rather than extending it.
+function shellWaitLive(session, nowMs) {
+  const until = shellWaitUntil(session);
+  return until > 0 && nowMs > 0 && nowMs < until;
+}
+
+// nowMs defaults to the wall clock for live callers; applyEvent passes the event's own ts so
+// a replay re-derives the same answer.
+function isEngaged(session, nowMs = Date.now()) {
+  return session.status === 'running' || backgroundWork(session) > 0 || shellWaitLive(session, nowMs);
 }
 
 // A tool whose PreToolUse hands control back to the USER and blocks until they respond — currently
@@ -277,8 +316,43 @@ const SETTLING_EVENTS = new Set(['Stop', 'StopFailure', 'SubagentStop', 'Session
 // same as idle. NOT at rest iff waiting, OR running/engaged (still finishing a pre-pause tool)
 // with gatedSince null. No timestamp math: the `Gated` marker's presence IS the parked signal.
 // Pure; the daemon rolls this up into paused.allAtRest and the safe-to-close cue.
-function atRest(session) {
-  return session.status !== 'waiting' && (session.gatedSince != null || !isEngaged(session));
+function atRest(session, nowMs = Date.now()) {
+  return session.status !== 'waiting' && (session.gatedSince != null || !isEngaged(session, nowMs));
+}
+
+// Fold a registry reading (the `bg_shell_ids` a Stop / SubagentStop carries) into the shell
+// wait. Members that left the registry are done and always drop out. A Stop — the main thread
+// ending its turn — then decides what the session is waiting on:
+//   - the turn made main-thread tool calls: exactly the shells its LAST batch launched that
+//     are still running. Ending on a launch is how a test wait looks; a turn that went on to
+//     do other work (read the results, use the dev server) is no longer waiting on anything,
+//     which is also what drops a still-running watcher once the run it watched has reported.
+//   - the turn made none (a tool-less reply — typically Claude acknowledging a Monitor event
+//     or a finished shell): the wait carries, since nothing in it changed what was pending.
+// The trade is deliberate: a turn that uses tools mid-wait (checking progress, answering an
+// unrelated prompt) and doesn't end on a launch drops a wait that was real. Showing idle
+// there is the old behaviour; the opposite error would show a session that is done and
+// waiting on YOU as still working, which hides the one signal the cockpit exists to give.
+// The exception is a shell whose command reads as a test run (`bg_test_ids`, classified in
+// the hook — see bg-tasks.looksLikeTestRun): it is in the wait on EVERY registry reading
+// while it runs, however the turn ended, keeping the anchor of when it was first seen.
+function foldShellWait(session, event, nowMs) {
+  if (!Array.isArray(event.bg_shell_ids)) return;
+  const live = new Set(event.bg_shell_ids);
+  const prev = session.shellWait && typeof session.shellWait === 'object' ? session.shellWait : {};
+  const launches = event.event === 'Stop' ? session.shellLaunches : null;
+  const next = {};
+  if (Array.isArray(launches)) {
+    if (nowMs) for (const id of launches) if (live.has(id)) next[id] = nowMs;
+  } else {
+    for (const id of Object.keys(prev)) if (live.has(id)) next[id] = prev[id];
+  }
+  for (const id of Array.isArray(event.bg_test_ids) ? event.bg_test_ids : []) {
+    if (!live.has(id) || next[id] != null) continue;
+    if (prev[id] != null) next[id] = prev[id];
+    else if (nowMs) next[id] = nowMs;
+  }
+  session.shellWait = next;
 }
 
 // Fold one event into state, mutating and returning the same object. Unknown
@@ -296,11 +370,16 @@ function applyEvent(state, event) {
   if (typeof event.ts === 'string') session.lastActivityAt = event.ts;
   updateMeta(session, event);
 
+  const nowMs = tsMs(event.ts);
   // Pre-event engaged state, captured BEFORE this event's status/bgTasks changes, so the
   // re-anchor below can detect the engaged→idle transition (the true "finished" moment).
-  const wasEngaged = isEngaged(session);
+  const wasEngaged = isEngaged(session, nowMs);
   // Pre-event status, so the waiting anchor below is set only on ENTERING waiting.
   const prevStatus = session.status;
+  // What held the span about to be settled open. When it was ONLY a shell wait, that span
+  // ended at the wait's cap even though no event marked it — see the settle below.
+  const shellWaitOnly = session.status !== 'running' && backgroundWork(session) === 0;
+  const waitUntil = shellWaitUntil(session);
 
   // Absorb Claude Code's authoritative background-task count when this event carries it
   // (Stop / SubagentStop). A present value — INCLUDING 0 — is authoritative; an absent field
@@ -317,14 +396,17 @@ function applyEvent(state, event) {
   // presence alone means the [engagedSince, now] interval counts — no need to
   // re-check isEngaged here. num() guards a session restored from an older snapshot
   // that lacks the field. activeDelta exposes this event's settled ms to the daemon
-  // (for per-repo/day rollup attribution) and is recomputed every event.
-  const nowMs = tsMs(event.ts);
+  // (for per-repo/day rollup attribution) and is recomputed every event. A span held open
+  // only by a shell wait is clipped at the wait's cap: it is derived from the event stream
+  // alone, so a replay clips it identically and the daemon's expiry sweep never has to.
   session.activeDelta = 0;
-  if (session.engagedSince && nowMs > session.engagedSince) {
-    const d = nowMs - session.engagedSince;
+  const spanEnd = shellWaitOnly && waitUntil ? Math.min(nowMs, waitUntil) : nowMs;
+  if (session.engagedSince && spanEnd > session.engagedSince) {
+    const d = spanEnd - session.engagedSince;
     session.activeMs = num(session.activeMs) + d;
     session.activeDelta = d;
   }
+  foldShellWait(session, event, nowMs);
 
   switch (event.event) {
     case 'SessionStart':
@@ -368,6 +450,9 @@ function applyEvent(state, event) {
       // background shell is not work and correctly stops the clock — see backgroundWork.)
       session.status = USER_BLOCKING_TOOLS.has(event.tool_name) ? 'waiting' : 'running';
       if (event.tool_name != null) session.currentActivity = event.tool_name;
+      // A new main-thread batch starts: whatever the previous one launched is not what this
+      // turn ends on. A subagent's tool calls say nothing about the main thread's turn.
+      if (!event.subagent) session.shellLaunches = [];
       // num() coercion is required: loadSnapshot restores sessions straight from
       // JSON without running newSession, so a session live across a daemon upgrade
       // has no toolCount key and a bare += 1 would poison it to NaN (same guard the
@@ -382,6 +467,11 @@ function applyEvent(state, event) {
       // permission Notification's 'waiting' would wrongly persist after approval.
       session.currentActivity = null;
       session.status = 'running';
+      if (event.bg_launch != null && !event.subagent) {
+        const launches = Array.isArray(session.shellLaunches) ? session.shellLaunches : [];
+        if (!launches.includes(event.bg_launch)) launches.push(event.bg_launch);
+        session.shellLaunches = launches;
+      }
       break;
 
     case 'Notification':
@@ -422,6 +512,7 @@ function applyEvent(state, event) {
       session.currentActivity = null; // the turn's tool is no longer running; don't leave a
       // stale "Running <tool>" showing while the card reads idle (or while background work runs)
       session.status = 'idle';
+      session.shellLaunches = null; // foldShellWait (above) has read what the turn ended on
       break;
 
     case 'StopFailure':
@@ -430,6 +521,7 @@ function applyEvent(state, event) {
       // whose turn is already over.
       session.currentPrompt = null;
       session.currentActivity = null;
+      session.shellLaunches = null;
       session.status = 'error';
       if (event.stop_reason != null) session.errorReason = event.stop_reason;
       break;
@@ -459,6 +551,8 @@ function applyEvent(state, event) {
     case 'SessionEnd':
       session.status = 'ended';
       session.gatedSince = null; // session gone; drop any parked anchor
+      session.shellWait = {};
+      session.shellLaunches = null;
       if (event.reason != null) session.endedReason = event.reason;
       break;
 
@@ -503,7 +597,7 @@ function applyEvent(state, event) {
   }
 
   // Re-anchor the engaged clock based on the POST-event state.
-  const engagedNow = isEngaged(session);
+  const engagedNow = isEngaged(session, nowMs);
   if (engagedNow) {
     // Advance the anchor to now, but NEVER move it backward on an out-of-order or
     // clock-skewed ts — that would make the next span over-count. A missing/bad ts
@@ -513,7 +607,12 @@ function applyEvent(state, event) {
     // engaged transition, or when restored engaged without the field). It persists
     // as the session stays engaged — including across a Stop while background work
     // keeps running — so the card's timer counts the whole engaged period, not just the turn.
-    if (!session.engagedStartedAt && typeof event.ts === 'string') session.engagedStartedAt = event.ts;
+    // A shell wait can expire with no event to clear the stamp, so a not-engaged→engaged
+    // transition re-stamps even when an old one lingers — else the card's "working" timer
+    // would count from a period that already ended at the cap.
+    if ((!wasEngaged || !session.engagedStartedAt) && typeof event.ts === 'string') {
+      session.engagedStartedAt = event.ts;
+    }
   } else {
     // No longer engaged (turn ended / idle): stop the clock. Do this even with a bad
     // ts, so a Stop whose ts is unparseable can't leave a stale anchor that the next
@@ -544,6 +643,13 @@ function toCard(s) {
   // spread (unlike the internal anchors above — the client renders the honest paused badge
   // from card.atRest and freezes the timer at card.gatedSince).
   card.atRest = atRest(s);
+  // The shell wait reaches the browser as one deadline (epoch ms, null when not waiting):
+  // the client reads the card as running until then, by its own drift-corrected clock. The
+  // task ids themselves are bookkeeping, as is the open turn's launch list.
+  card.shellWaitUntil = shellWaitUntil(s) || null;
+  card.shellWaitCount = s.shellWait && typeof s.shellWait === 'object' ? Object.keys(s.shellWait).length : 0;
+  delete card.shellWait;
+  delete card.shellLaunches;
   // Whether the Live card can offer "focus this session's terminal". Both targets stay
   // server-side — the client posts a sessionId and the daemon re-derives them, so the
   // browser can never name the window it wants raised.
@@ -565,10 +671,11 @@ function toCard(s) {
 // ranks as running — it IS working, and the client colours/ticks it as running — so
 // its grid position agrees with its appearance (mirrors effectiveStatus). It must read
 // backgroundWork, not bgTasks: a session whose only registry entry is a shell badges
-// idle client-side, so ranking it as running would sort a card above its own appearance.
-function statusRank(card) {
+// idle client-side, so ranking it as running would sort a card above its own appearance —
+// unless it is a shell the session is waiting on, which badges running (card.shellWaitUntil).
+function statusRank(card, nowMs = Date.now()) {
   if (card.status === 'waiting') return 0;
-  if (card.status === 'running' || backgroundWork(card) > 0) return 1;
+  if (card.status === 'running' || backgroundWork(card) > 0 || num(card.shellWaitUntil) > nowMs) return 1;
   return 2;
 }
 
@@ -878,6 +985,10 @@ module.exports = {
   applyEvent,
   atRest,
   backgroundWork,
+  isEngaged,
+  shellWaitUntil,
+  shellWaitLive,
+  SHELL_WAIT_CAP_MS,
   snapshot,
   subBaseName,
   currentSubscription,

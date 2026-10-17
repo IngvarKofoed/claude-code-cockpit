@@ -46,6 +46,7 @@ const SNAPSHOT_MS = 5000;
 const IDLE_CHECK_MS = 60000;
 const SSE_COALESCE_MS = 250; // ≤ ~4 state pushes / second
 const PAUSE_POLL_MS = 2000; // control-file backstop: surface a direct edit / missed nudge in the UI within ~2s
+const SHELL_WAIT_NOTIFY_WINDOW_MS = 60000; // a shell-wait expiry older than this (daemon was down) stays silent
 const REAP_IDLE_FALLBACK_MS = 6 * 3600 * 1000; // reap PID-less sessions after 6h idle
 const LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate daemon.log once it passes ~5MB (keep one .1 backup, ~10MB cap)
 const LOG_ROTATE_MS = 3600 * 1000; // check the log size hourly (plus once at boot)
@@ -579,7 +580,11 @@ function loadSnapshot() {
       // a lingering `tty` would reach the browser, which must never learn the device.
       if (s.focusTarget == null && typeof s.tty === 'string') s.focusTarget = s.tty;
       delete s.tty;
-      if (staleDay) s.engagedSince = null;
+      if (staleDay) {
+        s.engagedSince = null;
+        s.shellWait = {}; // as rolloverDay: the day's re-derivation starts with no wait
+        s.shellLaunches = null; // ...and no launch list carried from the previous day
+      }
     }
   }
   if (snap.extra && typeof snap.extra === 'object') {
@@ -1219,8 +1224,15 @@ function rolloverDay(today) {
   // active total matches the fresh per-day re-derivation (which starts each day with
   // no carried anchor). Without this, a span crossing midnight is folded whole into
   // the new day live but vanishes when that day is later re-derived — the same day's
-  // active figure would change on rollover/restart.
-  for (const sid of Object.keys(state.sessions)) state.sessions[sid].engagedSince = null;
+  // active figure would change on rollover/restart. A shell wait is dropped for the same
+  // reason: the re-derivation replays the new day from fresh state, where no wait exists —
+  // and no launch list either, so a turn whose last launch was before midnight must not
+  // start a wait at its post-midnight Stop live when the re-derivation would not.
+  for (const sid of Object.keys(state.sessions)) {
+    state.sessions[sid].engagedSince = null;
+    state.sessions[sid].shellWait = {};
+    state.sessions[sid].shellLaunches = null;
+  }
 }
 
 // Read and apply any complete lines appended to a given day's event log since its
@@ -1390,6 +1402,7 @@ function evalAutoPause(curFivePct, curWeeklyPct) {
 function isIdleEmptySession(s) {
   if (s.status === 'running' || s.status === 'waiting' || s.status === 'error') return false;
   if (aggregate.backgroundWork(s) > 0) return false; // shells excluded — a dev server isn't work
+  if (aggregate.shellWaitLive(s, Date.now())) return false; // ...unless the session is waiting on it
   const t = s.tokens;
   if (t == null) return false; // unknown tokens -> keep, never filter on a wrong zero
   return sumTokens(t) === 0;
@@ -3479,6 +3492,34 @@ function checkLongRunning() {
   }
 }
 
+// A shell wait ends silently at its cap (aggregate.SHELL_WAIT_CAP_MS) — no event marks it —
+// so nothing else would repaint the card, release "safe to close", or fire "finished" for a
+// session that had been held running by it. This watches for that edge. It is bookkeeping on
+// `extra` only: session state is untouched, and the active-time span is clipped at the cap by
+// applyEvent on the next event, exactly as a replay clips it.
+function checkShellWaitExpiry() {
+  const now = Date.now();
+  let changed = false;
+  for (const sid of Object.keys(state.sessions)) {
+    const s = state.sessions[sid];
+    const until = aggregate.shellWaitUntil(s);
+    if (!until || now < until) continue;
+    const x = extra.get(sid) || {};
+    if (x.shellWaitExpired === until) continue;
+    x.shellWaitExpired = until;
+    extra.set(sid, x);
+    changed = true;
+    // Only a FRESH expiry notifies: one that passed while the daemon was down is old news.
+    if (now - until < SHELL_WAIT_NOTIFY_WINDOW_MS && s.status === 'idle' && !aggregate.isEngaged(s, now)) {
+      maybeNotify('sessionFinished', s);
+    }
+  }
+  if (changed) {
+    refreshPauseSafe();
+    markDirty();
+  }
+}
+
 // Finalize sessions whose owning Claude Code process is gone (handles a missing
 // SessionEnd after a force-quit). Keyed off the OWNER PID, not silence, so a
 // long quiet build is never falsely reaped.
@@ -3545,6 +3586,7 @@ function startLoops() {
   setInterval(tailOnce, TAIL_MS);
   setInterval(pollTokens, TOKEN_POLL_MS);
   setInterval(checkLongRunning, LONGRUN_MS);
+  setInterval(checkShellWaitExpiry, LONGRUN_MS);
   setInterval(reapStale, REAPER_MS);
   setInterval(heartbeat, HEARTBEAT_MS);
   setInterval(saveSnapshot, SNAPSHOT_MS);
