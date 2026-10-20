@@ -925,14 +925,15 @@ body {
 
 /* One wrapping flex flow, so a VERTICAL group (one card track) and a HORIZONTAL one (a band)
    sit side by side rather than each claiming a row. The bases carry .cards' documented 420px
-   card floor PLUS this box's own chrome (4px rail + 2×12px padding + 2×1px border = 30px), so a
-   grouped card is never narrower than an ungrouped one and the stat row holds. */
+   card floor PLUS this box's own chrome (18px — see .group__main), so a grouped card is never
+   narrower than an ungrouped one and the stat row holds. */
 .groups {
   display: flex;
   flex-wrap: wrap;
   gap: 12px;
   align-items: flex-start;
   margin-bottom: 16px;
+  container-type: inline-size; /* the track-count queries on .group--v below */
 }
 .group {
   position: relative;
@@ -943,7 +944,18 @@ body {
   border-radius: var(--r);
   overflow: hidden;
 }
-.group--v { flex: 0 1 min(438px, 100%); }
+/* A vertical group GROWS to one track of the column, so a full row of them ends flush with the
+   ribbon and usage rows above (and on the ungrouped grid's tracks) instead of stopping short at
+   its 438px basis. The cap is what keeps a lone vertical group — or the last one on a wrapped row
+   — at one track rather than stretched across the column. A track is the width N boxes share, N
+   being how many 438px boxes fit; .main's 1400px max holds the column to 1356px, so three is the
+   most there can be. A horizontal group needs no cap: it is a band, and already grows.
+   The query widths are hand-derived from the 438px basis and .groups' 12px gap — 888 = 2×438 + 12,
+   1338 = 3×438 + 2×12 — since a container condition cannot read a var(); change either and
+   recompute both, or a box will cap to a track count that no longer fits on its row. */
+.group--v { flex: 1 1 min(438px, 100%); }
+@container (min-width: 888px) { .group--v { max-width: calc((100% - 12px) / 2); } }
+@container (min-width: 1338px) { .group--v { max-width: calc((100% - 24px) / 3); } }
 .group--h { flex: 1 1 min(870px, 100%); }
 /* A VERTICAL group stacks cards that each carry their own left rail, so a group rail on the same
    edge runs parallel to them — two colour bars a few px apart, competing to mean status. Turning
