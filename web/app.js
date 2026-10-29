@@ -505,9 +505,10 @@ function shellWaitLive(s) {
 }
 
 // Background work that means the session is WORKING: the registry minus run_in_background
-// shells (daemon-side `bgAgents`; see emit.js). A dev server or watcher shell lives in the
-// registry for hours and must not badge an otherwise-idle card as Running. Falls back to the
-// full count when bgAgents is absent, so a card from an older daemon behaves exactly as before.
+// shells and monitors (daemon-side `bgAgents`; see emit.js and bg-tasks.countsAsWork). A dev
+// server, watcher shell or artifact watch lives in the registry for hours and must not badge an
+// otherwise-idle card as Running. Falls back to the full count when bgAgents is absent, so a
+// card from an older daemon behaves exactly as before.
 function backgroundWork(s) {
   return s.bgAgents == null ? num(s.bgTasks) : num(s.bgAgents);
 }

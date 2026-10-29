@@ -15,7 +15,14 @@
 
 const fs = require('fs');
 const { resolveRepo } = require('./repo');
-const { MAX_TASK_IDS, isTaskId, bgLaunchId, looksLikeTestRun } = require('./bg-tasks');
+const {
+  MAX_TASK_IDS,
+  isTaskId,
+  isShellTask,
+  countsAsWork,
+  bgLaunchId,
+  looksLikeTestRun,
+} = require('./bg-tasks');
 // The account/subscription reader is shared with the daemon (which re-reads it as the
 // LIVE account); see scripts/account.js.
 const { readSubscription } = require('./account');
@@ -102,12 +109,12 @@ function buildRecord(payload) {
   // boundary. A present array (including empty) is authoritative; absent (older Claude Code)
   // leaves the daemon's last known count intact.
   //
-  // bg_agents is the same count MINUS `type: 'shell'` entries — a background Bash or a
-  // Monitor. A shell is in the registry but is not, by itself, the session working: a dev
-  // server or file watcher sits there for hours, and counting every shell held the session
-  // engaged for its whole lifetime, inflating active time and reporting a parked session as
-  // not-at-rest. Shells stay in bg_tasks so the card's "N in flight" readout remains honest.
-  // Denylist, not allowlist: an unrecognised future type keeps counting, as it does today.
+  // bg_agents is the same count MINUS the entries that are not the session working
+  // (bg-tasks.countsAsWork): `shell` — a background Bash or shell Monitor, where a dev server
+  // or file watcher sits for hours — and `monitor`, the WebSocket watch an Artifact publish
+  // opens, which never ends. Counting either held the session engaged for its whole lifetime,
+  // inflating active time and reporting a parked session as not-at-rest. Both stay in
+  // bg_tasks so the card's "N in flight" readout remains honest.
   //
   // bg_shell_ids is the one exception to "counts only": the opaque ids of those shell
   // entries. A shell the session ended its turn waiting on (see bg_launch below) is work
@@ -115,10 +122,9 @@ function buildRecord(payload) {
   // subset whose command reads as a test run — work while it runs, however the turn ended.
   // Both hold random tokens, never the command or description.
   if (Array.isArray(payload.background_tasks)) {
-    const isShell = (t) => t && typeof t === 'object' && t.type === 'shell';
-    const shells = payload.background_tasks.filter(isShell).filter((t) => isTaskId(t.id));
+    const shells = payload.background_tasks.filter(isShellTask).filter((t) => isTaskId(t.id));
     record.bg_tasks = payload.background_tasks.length;
-    record.bg_agents = payload.background_tasks.filter((t) => !isShell(t)).length;
+    record.bg_agents = payload.background_tasks.filter(countsAsWork).length;
     record.bg_shell_ids = shells.map((t) => t.id).slice(0, MAX_TASK_IDS);
     record.bg_test_ids = shells
       .filter((t) => looksLikeTestRun(t.command))

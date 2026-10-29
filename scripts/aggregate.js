@@ -99,9 +99,10 @@ function newSession(event) {
     // v2.1.145+). The reliable "is this session still working after its turn's Stop" signal;
     // drives isEngaged. 0 when nothing is backgrounded (or on older Claude Code that omits it).
     bgTasks: 0,
-    // Same registry, MINUS `type: 'shell'` entries (a run_in_background Bash) — see emit.js.
-    // This, not bgTasks, is what drives engagement: a dev server or watcher shell sits in the
-    // registry for hours without the session doing anything. null means UNKNOWN (an older
+    // Same registry, MINUS the types that are not work (`shell` — a run_in_background Bash —
+    // and `monitor`, e.g. an Artifact's live watch) — see bg-tasks.countsAsWork. This, not
+    // bgTasks, is what drives engagement: a dev server, watcher shell or artifact watch sits
+    // in the registry for hours without the session doing anything. null means UNKNOWN (an older
     // emit.js that only sent bg_tasks, or a replay of events predating the field), and the
     // reader falls back to bgTasks so historical replays keep their existing numbers rather
     // than silently re-deriving a different past.
@@ -247,9 +248,9 @@ function currentSubscription(state) {
 // "engaged" forever (the count self-heals on the next carrying event). A background shell counts
 // only while the session is waiting on it (shellWait, below) — never just for being registered.
 // Background work that counts as the session WORKING: the registry minus background shells
-// (see emit.js `bg_agents`). Falls back to the full count when bgAgents is unknown —
-// an older emit.js, or a replay of events written before the field existed — so historical
-// numbers stay exactly as they were rather than being silently re-derived.
+// and monitors (see emit.js `bg_agents`, bg-tasks.countsAsWork). Falls back to the full count
+// when bgAgents is unknown — an older emit.js, or a replay of events written before the field
+// existed — so historical numbers stay exactly as they were rather than being silently re-derived.
 function backgroundWork(session) {
   return session.bgAgents == null ? num(session.bgTasks) : num(session.bgAgents);
 }

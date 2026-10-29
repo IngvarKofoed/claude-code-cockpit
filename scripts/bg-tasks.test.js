@@ -2,7 +2,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { isTaskId, bgLaunchId, looksLikeTestRun } = require('./bg-tasks');
+const { isTaskId, isShellTask, countsAsWork, bgLaunchId, looksLikeTestRun } = require('./bg-tasks');
 
 test('looksLikeTestRun: test runners and e2e scripts count', () => {
   for (const cmd of [
@@ -82,4 +82,26 @@ test('bgLaunchId reads Bash backgroundTaskId and non-persistent Monitor taskId',
   assert.strictEqual(bgLaunchId(post('Bash', { backgroundTaskId: 'not an id!' })), null);
   assert.strictEqual(bgLaunchId({ hook_event_name: 'PreToolUse', tool_response: { backgroundTaskId: 'b1' } }), null);
   assert.strictEqual(bgLaunchId(undefined), null);
+});
+
+test('countsAsWork: shells and monitors are watches, not the session working', () => {
+  // Real registry entries as the Stop hook reports them (Claude Code 2.1.312). The `monitor` one
+  // is the WebSocket watch an Artifact publish opens: it never ends, so counting it read the
+  // session as Running for good.
+  assert.strictEqual(countsAsWork({ id: 'b1', type: 'shell', status: 'running', command: 'npm run dev' }), false);
+  assert.strictEqual(countsAsWork({ id: 'w1', type: 'monitor', status: 'running', description: 'x' }), false);
+  for (const type of ['subagent', 'workflow', 'teammate', 'cloud session', 'MCP task', 'dream']) {
+    assert.strictEqual(countsAsWork({ id: 'a1', type, status: 'running' }), true, type);
+  }
+  // Denylist: a type a later Claude Code adds keeps counting, as does a malformed entry.
+  assert.strictEqual(countsAsWork({ id: 'n1', type: 'something new', status: 'running' }), true);
+  assert.strictEqual(countsAsWork({ id: 'n2' }), true);
+  assert.strictEqual(countsAsWork(null), true);
+});
+
+test('isShellTask: only `shell` entries carry an id the shell wait can track', () => {
+  assert.strictEqual(isShellTask({ id: 'b1', type: 'shell' }), true);
+  assert.strictEqual(isShellTask({ id: 'w1', type: 'monitor' }), false);
+  assert.strictEqual(isShellTask(null), false);
+  assert.strictEqual(isShellTask('shell'), false);
 });

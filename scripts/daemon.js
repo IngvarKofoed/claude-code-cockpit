@@ -1401,7 +1401,7 @@ function evalAutoPause(curFivePct, curWeeklyPct) {
 // Used so the pause "N of M at rest" count stays in step with the cards the user actually sees.
 function isIdleEmptySession(s) {
   if (s.status === 'running' || s.status === 'waiting' || s.status === 'error') return false;
-  if (aggregate.backgroundWork(s) > 0) return false; // shells excluded — a dev server isn't work
+  if (aggregate.backgroundWork(s) > 0) return false; // shells/monitors excluded — not work
   if (aggregate.shellWaitLive(s, Date.now())) return false; // ...unless the session is waiting on it
   const t = s.tokens;
   if (t == null) return false; // unknown tokens -> keep, never filter on a wrong zero

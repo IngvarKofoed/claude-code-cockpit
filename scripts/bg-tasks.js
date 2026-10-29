@@ -14,6 +14,22 @@ function isTaskId(v) {
   return typeof v === 'string' && TASK_ID_RE.test(v);
 }
 
+// Registry types that sit in background_tasks without being the session working, so they never
+// count toward bg_agents. `shell` is a background Bash or a shell Monitor: a dev server or file
+// watcher runs for hours (the turn-ended-on and test-run cases are handled by their ids, not the
+// count). `monitor` is a WebSocket or MCP watch, most often the one an Artifact publish opens to
+// follow its page: it lives as long as the session and never finishes, so counting it read the
+// session as Running for good. A denylist, so an unrecognised future type keeps counting.
+const NON_WORK_TYPES = new Set(['shell', 'monitor']);
+
+function isShellTask(t) {
+  return !!t && typeof t === 'object' && t.type === 'shell';
+}
+
+function countsAsWork(t) {
+  return !(t && typeof t === 'object' && NON_WORK_TYPES.has(t.type));
+}
+
 // The task id a PostToolUse just put in the background, or null. Bash reports it as
 // `backgroundTaskId` however the shell got there — run_in_background, Ctrl+B, or Claude
 // Code auto-backgrounding a long foreground command — so the tool result is read rather
@@ -49,4 +65,12 @@ function looksLikeTestRun(command) {
   return words.some((w) => !/[/.=]/.test(w) && /e2e|test/i.test(w.replace(/latest/gi, '')));
 }
 
-module.exports = { TASK_ID_RE, MAX_TASK_IDS, isTaskId, bgLaunchId, looksLikeTestRun };
+module.exports = {
+  TASK_ID_RE,
+  MAX_TASK_IDS,
+  isTaskId,
+  isShellTask,
+  countsAsWork,
+  bgLaunchId,
+  looksLikeTestRun,
+};
