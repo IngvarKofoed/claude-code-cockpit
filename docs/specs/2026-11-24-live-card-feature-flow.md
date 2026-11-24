@@ -113,12 +113,15 @@ handler is generic.
   started another, and an abandoned pending file next to a resumed worktree feature, since the
   skill only deletes a pending file when a worktree adopts it. A session id is used in a path
   only when it matches a strict id pattern (letters, digits, `-`, `_`), in the manner of
-  `emit.js`'s `TASK_ID_RE`; any other id skips the lookup.
+  `bg-tasks.js`'s `TASK_ID_RE`; any other id skips the lookup.
 - **Tolerance.** Missing or unparseable files are skipped, unknown fields are ignored, and a file
   whose `session_id` doesn't match its lookup key is ignored. A file with `version` ≥ 2 is read,
   and a field the module doesn't find just drops its line from the block rather than hiding the
   feature. A missing or lower `version` is ignored. A missing or unparseable `updated_at` gives
-  `updatedAt: null` and `quiet: false`, and loses any tie.
+  `updatedAt: null` and `quiet: false`, and loses any tie. An exact `updated_at` tie goes to the
+  worktree file, the one the skill has adopted. A state file over 64 KB is skipped. A worktree
+  file whose checkout was deleted by hand still shows, because the lookup never follows a path
+  read out of the file.
 - **The format belongs to the skill.** The cockpit tracks it, it doesn't own it. If the skill's
   format drifts past what the module can read, the block disappears; nothing breaks.
 - **Projection**, the only thing that leaves the module, sent as `card.featureFlow` or `null`:
@@ -168,7 +171,10 @@ show the feature's title. It stacks three lines, each one dropped when it has no
    `.telemetry__value`. It is omitted when either number is missing.
 
 Lines 1 and 2 are single lines that ellipsize when too long, so a long `doing` text never
-changes the card's height. A tooltip on the block gives the feature's title and its started
+changes the card's height. Sizes: the step name is 17px semibold, line 2 is 12px muted, and the
+counter is 38px mono with its `/10` part muted. "Your turn" is semibold in the same muted ink,
+and reads `Your turn` alone, with no colon, when `waitingFor` is empty. The counter carries an
+`aria-label` ("step 4 of 10"). A tooltip on the block gives the feature's title and its started
 and last-updated times.
 
 Mockup: https://claude.ai/artifact/V7BhZjFhYkbxre7E1xCkhE (version 5: three lines above the

@@ -31,6 +31,7 @@ const usageLib = require('./usage');
 const account = require('./account');
 const pause = require('./pause');
 const focusTerminal = require('./focus-terminal');
+const featureFlow = require('./feature-flow');
 
 const VERSION = require('../package.json').version;
 const PLUGIN_PATH = process.env.CLAUDE_PLUGIN_ROOT || path.join(__dirname, '..');
@@ -46,6 +47,7 @@ const SNAPSHOT_MS = 5000;
 const IDLE_CHECK_MS = 60000;
 const SSE_COALESCE_MS = 250; // ≤ ~4 state pushes / second
 const PAUSE_POLL_MS = 2000; // control-file backstop: surface a direct edit / missed nudge in the UI within ~2s
+const FLOW_POLL_MS = 3000; // re-read each live session's /feature-flow state file (only while a dashboard is connected)
 const SHELL_WAIT_NOTIFY_WINDOW_MS = 60000; // a shell-wait expiry older than this (daemon was down) stays silent
 const REAP_IDLE_FALLBACK_MS = 6 * 3600 * 1000; // reap PID-less sessions after 6h idle
 const LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate daemon.log once it passes ~5MB (keep one .1 backup, ~10MB cap)
@@ -103,6 +105,13 @@ let todayRollup = aggregate.createRollup(currentDate);
 const offsets = {}; // dateStr -> processed byte offset in that day's event log
 const seenIds = new Map(); // session_id -> Set(transcript message id) already ingested
 const extra = new Map(); // session_id -> { transcriptPath, longRunPromptId }
+// session_id -> the /feature-flow projection (feature-flow.js), for live sessions that have one.
+// LIVE-ONLY by design: the feature's title and status text are served on the session name's
+// footing — shown, never stored. So this map is never in saveSnapshot, never in `extra`, never
+// appended to any log, and never logged; it is rebuilt from the files by pollFeatureFlow.
+let flowBySession = new Map();
+let flowKeys = new Map(); // session_id -> JSON of its projection, for change detection
+let flowPolledAt = 0; // epoch ms of the last pollFeatureFlow (0 = never)
 const ingesting = new Set(); // session_ids with an in-flight ingestTurn retry chain
 const pendingIngest = new Map(); // session_id -> { stopEvent } queued mid-ingest
 const primedSeen = new Set(); // session_ids whose seenIds have been seeded from the usage logs
@@ -2008,11 +2017,49 @@ function usagePayload(now) {
   return out;
 }
 
+// ---- feature-flow status ----------------------------------------------------
+
+// Re-read every live session's /feature-flow state file (feature-flow.js) and rebuild
+// flowBySession. A projection that changed, or a session gaining or losing one, marks the state
+// dirty through the coalesced broadcast. `quiet` is part of the compared projection, so a flow
+// crossing its one-hour mark re-broadcasts on its own, with no other event. Runs on the
+// FLOW_POLL_MS timer only while an SSE client is connected, once synchronously when one connects
+// (serveStream), and from GET /api/state when the map is older than FLOW_POLL_MS. Never throws,
+// and never logs an error's message: a parse error can quote the file, which is exactly the
+// text that must not reach daemon.log.
+function pollFeatureFlow() {
+  flowPolledAt = Date.now();
+  try {
+    const live = [];
+    for (const sid of Object.keys(state.sessions)) {
+      const s = state.sessions[sid];
+      if (s && s.status !== 'ended') live.push({ sessionId: sid, repoRoot: s.repoRoot });
+    }
+    const next = featureFlow.lookupFlows(live, flowPolledAt);
+    const nextKeys = new Map();
+    let changed = next.size !== flowKeys.size;
+    for (const [sid, proj] of next) {
+      const key = JSON.stringify(proj);
+      nextKeys.set(sid, key);
+      if (flowKeys.get(sid) !== key) changed = true;
+    }
+    flowBySession = next;
+    flowKeys = nextKeys;
+    if (changed) markDirty();
+  } catch (_e) {
+    log('feature-flow poll failed'); // fixed text only, see above
+  }
+}
+
 function buildStatePayload() {
   const now = Date.now();
+  const sessions = aggregate.snapshot(state, now).sessions;
+  // Each card is a fresh copy from toCard, so attaching here never touches session state (and so
+  // never reaches the snapshot). null when the session has no feature flow.
+  for (const card of sessions) card.featureFlow = flowBySession.get(card.sessionId) || null;
   return {
     now,
-    sessions: aggregate.snapshot(state, now).sessions,
+    sessions,
     repos: reposSummary(),
     repoTotals: repoTotalsAllTime(),
     // The active account → { id, label }, or null when it is unknown. Read from the cached
@@ -2465,6 +2512,9 @@ function serveStream(req, res) {
   res.write('retry: 3000\n\n');
   sseClients.add(res);
   lastBusyAt = Date.now();
+  // The feature-flow poll idles while no dashboard is connected, so bring its map current
+  // before the first frame — a fresh tab never shows a missing or stale block for a tick.
+  pollFeatureFlow();
   // Send an immediate full snapshot so a fresh client renders without waiting.
   sseId += 1;
   res.write(`event: state\nid: ${sseId}\ndata: ${JSON.stringify(buildStatePayload())}\n\n`);
@@ -3297,7 +3347,12 @@ function handleRequest(req, res) {
       return;
     }
 
-    if (req.method === 'GET' && pathname === '/api/state') return json(res, buildStatePayload());
+    if (req.method === 'GET' && pathname === '/api/state') {
+      // A fetch made with no stream open must not serve a feature-flow step from the last time
+      // a dashboard was connected: re-read when the map is older than one poll.
+      if (Date.now() - flowPolledAt >= FLOW_POLL_MS) pollFeatureFlow();
+      return json(res, buildStatePayload());
+    }
     if (req.method === 'GET' && pathname === '/api/stream') return serveStream(req, res);
     if (req.method === 'GET' && pathname === '/api/history') return json(res, buildHistory(url.searchParams.get('range')));
     if (req.method === 'GET' && pathname === '/api/storage') return json(res, computeStorage());
@@ -3591,6 +3646,10 @@ function startLoops() {
   setInterval(heartbeat, HEARTBEAT_MS);
   setInterval(saveSnapshot, SNAPSHOT_MS);
   setInterval(checkIdleShutdown, IDLE_CHECK_MS);
+  // Feature-flow status is only ever shown on a dashboard, so it isn't read while none is open.
+  setInterval(() => {
+    if (sseClients.size > 0) pollFeatureFlow();
+  }, FLOW_POLL_MS);
   rotateLogIfLarge(); // bound daemon.log at boot, then hourly
   setInterval(rotateLogIfLarge, LOG_ROTATE_MS);
   // Control-file backstop: a direct file edit or a missed slash-command nudge surfaces in

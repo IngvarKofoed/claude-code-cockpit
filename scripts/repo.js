@@ -76,4 +76,6 @@ function resolveRepo(cwd) {
   return { ...result };
 }
 
-module.exports = { resolveRepo };
+// gitDirFor is shared with feature-flow.js, which follows the same `gitdir:` pointer to a
+// session's common git dir. It throws on an unreadable entry; callers catch.
+module.exports = { resolveRepo, gitDirFor };

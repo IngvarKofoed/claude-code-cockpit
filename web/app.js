@@ -20,7 +20,7 @@ const App = {
   liveSort: "status", // "status" (server waiting-first) | "name" (alpha) | "context" (fullest first); set from localStorage in init
   liveTitle: "repo", // what each Live card's head shows; see LIVE_TITLES / cardQualifier. Per-browser localStorage pref, set in init
   theme: "dark", // "dark" (default) | "light"; per-browser localStorage pref, set in init
-  liveShow: { title: true, branch: true, path: true, ctx: true, color: true, pin: true, stats: true }, // which optional Live-card rows/controls to show (3 location lines + the context gauge + the /color dot + the card-head group button + the whole stats block, BOTH rows); per-browser localStorage pref, set in init
+  liveShow: { title: true, branch: true, path: true, ctx: true, color: true, pin: true, stats: true, activity: true, flow: false }, // which optional Live-card rows/controls to show (3 location lines + the context gauge + the /color dot + the card-head group button + the whole stats block, BOTH rows + the activity line + the /feature-flow block, the one key that defaults OFF); per-browser localStorage pref, set in init
   liveStats: { tokens: true, cost: true, chats: true, tools: true, agents: true, active: true }, // which stat COLUMNS each live card shows; hiding one takes its heading and both rows' cells; per-browser localStorage pref, set in init
   liveGroups: [], // named card groups — [{ id, name, orient:"v"|"h", members:[{sid,pid,root}] }]; per-browser localStorage pref, set in init
   groupAssign: null, // Map sessionId -> { group, idx } for the CURRENT render; cardHTML reads it
@@ -531,6 +531,51 @@ function displayStatus(s) {
   return eff;
 }
 
+// ---- Feature-flow block (docs/specs/2026-11-24-live-card-feature-flow.md) --------
+// `ff` is the daemon's allowlisted projection (or null). Every field may be null and every
+// string is free text, so everything goes through esc(). Built once per render from absolute
+// timestamps: nothing here is touched by the 1s tick, so "no update since HH:MM" never repaints.
+// Local 24-hour "14:02", with the day-first date in front when it isn't today ("22 Nov 14:02") —
+// the same clock and month names as the usage bars' absolute reset time (fmtResetAt).
+function ffClock(ms) {
+  if (!Number.isFinite(ms)) return null;
+  const d = new Date(ms);
+  const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  return sameLocalDay(ms, Date.now()) ? hm : `${d.getDate()} ${RESET_MONTHS[d.getMonth()]} ${hm}`;
+}
+function featureFlowHTML(ff) {
+  if (!ff || typeof ff !== "object") return "";
+  const str = (v) => (typeof v === "string" && v.trim() ? v.trim() : null);
+  const int = (v) => (Number.isInteger(v) ? v : null);
+  const label = str(ff.stepLabel);
+  const sub = str(ff.subStep);
+  let line2;
+  if (ff.waitingForUser) {
+    const w = str(ff.waitingFor);
+    line2 = `<b>Your turn</b>${w ? ": " + esc(w) : ""}`;
+  } else {
+    const doing = ff.quiet ? "no update since " + (ffClock(ff.updatedAt) || "a while") : str(ff.doing);
+    const parts = [sub, doing].filter(Boolean);
+    line2 = parts.length ? esc(parts.join(" \u00b7 ")) : "";
+  }
+  const n = int(ff.stepNumber);
+  const total = int(ff.stepTotal);
+  const count = n !== null && total !== null ? `<div class="card__flow-count" role="img" aria-label="step ${n} of ${total}">${n}<small>/${total}</small></div>` : "";
+  if (!label && !line2 && !count) return "";
+  const tip = [
+    str(ff.title),
+    Number.isFinite(ff.startedAt) ? "started " + ffClock(ff.startedAt) : null,
+    Number.isFinite(ff.updatedAt) ? "updated " + ffClock(ff.updatedAt) : null,
+  ].filter(Boolean);
+  return (
+    `<div class="card__flow${ff.quiet && !ff.waitingForUser ? " card__flow--quiet" : ""}"${tip.length ? ` title="${esc(tip.join(" \u00b7 "))}"` : ""}>` +
+    (label ? `<div class="card__flow-step">${esc(label)}</div>` : "") +
+    (line2 ? `<div class="card__flow-status">${line2}</div>` : "") +
+    count +
+    `</div>`
+  );
+}
+
 function activityText(s) {
   const status = displayStatus(s);
   switch (status) {
@@ -836,7 +881,8 @@ function cardHTML(s) {
       </div>
       ${contextGaugeHTML(s)}
       ${title}${where}
-      <div class="card__activity"><span class="spark"></span><span>${esc(activityText(s))}</span></div>
+      ${show.activity ? `<div class="card__activity"><span class="spark"></span><span>${esc(activityText(s))}</span></div>` : ""}
+      ${show.flow ? featureFlowHTML(s.featureFlow) : ""}
       <div class="telemetry">
         <span class="telemetry__value" ${tickMs ? `data-timer="dur" data-start="${tickMs}"` : ""}>${tickMs ? "0s" : hasFrozen ? esc(fmtDuration(waitFrozenMs)) : "—"}</span>
         <span class="telemetry__label">${timerLabel}</span>
@@ -3386,6 +3432,16 @@ function settingsHTML(cfg) {
       fieldRow("Show branch", "Git branch line on each live card (this browser only)", sw("set-show-branch", App.liveShow.branch)) +
       fieldRow("Show folder path", "Working-directory path line on each live card (this browser only)", sw("set-show-path", App.liveShow.path)) +
       fieldRow(
+        "Show activity line",
+        "The status line with its dot on each live card \u2014 also the current tool, \u201cWaiting for your input\u201d and a failed turn\u2019s reason, which the badge alone doesn\u2019t spell out (this browser only)",
+        sw("set-show-activity", App.liveShow.activity)
+      ) +
+      fieldRow(
+        "Show feature flow",
+        "The /feature-flow step on cards whose session is running one (this browser only)",
+        sw("set-show-flow", App.liveShow.flow)
+      ) +
+      fieldRow(
         "Show context gauge",
         "Context-window meter on each live card (this browser only)",
         sw("set-show-ctx", App.liveShow.ctx)
@@ -3873,6 +3929,8 @@ function init() {
         color: v.color !== false,
         pin: v.pin !== false,
         stats: v.stats !== false,
+        activity: v.activity !== false,
+        flow: v.flow === true, // default OFF: a value stored before the key existed reads as off
       };
     }
   } catch (_e) {
